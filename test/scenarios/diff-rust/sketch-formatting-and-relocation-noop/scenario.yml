@@ -1,0 +1,42 @@
+version: 1
+coverage:
+- behavior.diff.noop.sketch.formatting
+- behavior.diff.noop.sketch.relocation
+steps:
+- type: overlay
+  source: output/sentinel.txt
+  destination: /output/sentinel.txt
+- type: remove
+  path: /input/contracts/main.yml
+- type: overlay
+  source: assets/noop-sketch/relocated.yaml
+  destination: /input/contracts/relocated.yaml
+- type: run
+  argv:
+  - conkit
+  - diff
+  - --contracts
+  - /input/contracts
+  - --archive
+  - /input/archives/mixed-v1.gzip
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        contracts unchanged
+    stderr:
+      kind: empty
+- type: remove
+  path: /input/contracts/relocated.yaml
+- type: overlay
+  source: input/contracts/main.yml
+  destination: /input/contracts/main.yml
+- type: assert_tree
+  actual: /input
+  expected: input
+  contents: bytes
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: bytes

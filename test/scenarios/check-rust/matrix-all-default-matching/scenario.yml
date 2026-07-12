@@ -1,0 +1,30 @@
+version: 1
+coverage:
+- behavior.check.matrix.all.default.matching
+- behavior.check.report.all.json
+- behavior.check.report.extension.json
+steps:
+- type: run
+  argv:
+  - conkit
+  - check
+  - all
+  - --source
+  - /input/src
+  - --contracts
+  - /input/contracts
+  - --output
+  - /output/report.json
+  - --default
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        contract check passed: 1 signatures, 1 sketches
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: text

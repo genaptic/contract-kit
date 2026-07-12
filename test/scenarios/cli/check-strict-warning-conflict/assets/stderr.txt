@@ -1,0 +1,5 @@
+error: the argument '--strict' cannot be used with '--warning'
+
+Usage: conkit check all --source <DIR> --contracts <DIR> --output <FILE> --strict
+
+For more information, try '--help'.

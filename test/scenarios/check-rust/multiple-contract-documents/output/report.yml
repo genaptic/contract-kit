@@ -1,0 +1,8 @@
+passed: true
+counts:
+  source_file_count: 2
+  contract_file_count: 2
+  sketch_count: 2
+  matched_sketch_count: 2
+  failed_sketch_count: 0
+diagnostics: []

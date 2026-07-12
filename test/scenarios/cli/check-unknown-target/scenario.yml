@@ -1,0 +1,16 @@
+version: 1
+coverage:
+- grammar.error.check.unknown-target
+steps:
+- type: run
+  argv:
+  - conkit
+  - check
+  - definitely-not-a-target
+  expect:
+    exit_code: 2
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact_file
+      value: assets/stderr.txt

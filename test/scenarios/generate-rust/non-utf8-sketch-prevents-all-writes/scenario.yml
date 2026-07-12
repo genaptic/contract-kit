@@ -1,0 +1,54 @@
+version: 1
+coverage:
+- behavior.generate.error.non-utf8-sketch-source
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - signatures
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 signature contracts
+    stderr:
+      kind: empty
+- type: overlay
+  source: assets/linked/main.yml
+  destination: /output/contracts/main.yml
+- type: overlay
+  source: assets/linked/generated-files.json
+  destination: /output/contracts/.contract-kit/generated-files.json
+- type: overlay
+  source: assets/overlays/non-utf8/raw.bin
+  destination: /input/source/nested/lib.rs
+- type: run
+  argv:
+  - conkit
+  - generate
+  - sketches
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        failed to resolve linked sketch source
+
+        Caused by:
+            failed to parse nested/lib.rs: invalid utf-8 sequence of 1 bytes from index 0
+- type: assert_tree
+  actual: /output/contracts
+  expected: output
+  contents: text

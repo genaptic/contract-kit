@@ -1,0 +1,10 @@
+[package]
+name = "basic-rust-runner"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "basic-rust-runner"
+path = "src/main.rs"
+
+[workspace]

@@ -1,0 +1,45 @@
+version: 1
+coverage:
+- behavior.generate.error.modified-owned-output
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - all
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 signature contracts and 0 sketch contracts
+    stderr:
+      kind: empty
+- type: overlay
+  source: assets/overlays/modified/main.yml
+  destination: /output/contracts/main.yml
+- type: run
+  argv:
+  - conkit
+  - generate
+  - all
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        owned generated output was modified outside Contract Kit: /output/contracts/main.yml
+- type: assert_tree
+  actual: /output/contracts
+  expected: output
+  contents: text

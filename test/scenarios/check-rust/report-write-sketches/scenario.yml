@@ -1,0 +1,32 @@
+version: 1
+coverage:
+- behavior.check.error.report-write.sketches
+steps:
+- type: overlay
+  source: output
+  destination: /output
+- type: run
+  argv:
+  - conkit
+  - check
+  - sketches
+  - --source
+  - /input/src
+  - --contracts
+  - /input/contracts
+  - --output
+  - /output/blocked/report.yml
+  - --strict
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: contains_in_order
+      value:
+      - failed to resolve report path /output/blocked/report.yml
+      - failed to canonicalize path `/output/blocked/report.yml`
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: text

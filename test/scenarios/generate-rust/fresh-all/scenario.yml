@@ -1,0 +1,27 @@
+version: 1
+coverage:
+- behavior.generate.fresh.all
+- behavior.generate.ownership.lock
+- behavior.generate.ownership.manifest
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - all
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 signature contracts and 0 sketch contracts
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /output/contracts
+  expected: output
+  contents: text

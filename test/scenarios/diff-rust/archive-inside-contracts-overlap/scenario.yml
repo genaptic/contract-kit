@@ -1,0 +1,31 @@
+version: 1
+coverage:
+- behavior.diff.error.overlap.archive-inside-contracts
+steps:
+- type: overlay
+  source: output/sentinel.txt
+  destination: /output/sentinel.txt
+- type: run
+  argv:
+  - conkit
+  - diff
+  - --contracts
+  - /input/contracts
+  - --archive
+  - /input/contracts/main.yml
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        contracts path /input/contracts overlaps archive file path /input/contracts/main.yml
+- type: assert_tree
+  actual: /input
+  expected: input
+  contents: bytes
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: bytes

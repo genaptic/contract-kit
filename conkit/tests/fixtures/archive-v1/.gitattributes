@@ -1,0 +1,2 @@
+*.gzip -text
+*.yml text eol=lf

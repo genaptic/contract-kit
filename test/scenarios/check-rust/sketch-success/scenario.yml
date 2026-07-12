@@ -1,0 +1,33 @@
+version: 1
+cargo_workspace: true
+coverage:
+- behavior.check.alias.sketch
+- surface.command.check
+- surface.alias.check.sketch
+- surface.mode.check.strict
+- surface.format.check.yaml
+steps:
+- type: run
+  argv:
+  - conkit
+  - check
+  - sketch
+  - --source
+  - /input/src
+  - --contracts
+  - /input/contracts
+  - --output
+  - /output/output.yml
+  - --strict
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        sketch check passed: 1 matched sketches, 0 failed sketches
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: text

@@ -1,0 +1,8 @@
+error: the following required arguments were not provided:
+  --source <DIR>
+  --contracts <DIR>
+  --output <FILE>
+
+Usage: conkit check all --source <DIR> --contracts <DIR> --output <FILE>
+
+For more information, try '--help'.

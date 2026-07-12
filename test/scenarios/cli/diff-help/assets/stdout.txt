@@ -1,0 +1,8 @@
+Compare current contracts with an archived catalog
+
+Usage: conkit diff --contracts <DIR> --archive <FILE>
+
+Options:
+      --contracts <DIR>  Root directory containing the current contract files
+      --archive <FILE>   Archive file to compare against the current contract catalog
+  -h, --help             Print help

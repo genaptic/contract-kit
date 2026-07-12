@@ -1,0 +1,18 @@
+version: 1
+coverage:
+- grammar.help.generate.signatures
+- surface.target.generate.signatures
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - signatures
+  - --help
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact_file
+      value: assets/stdout.txt
+    stderr:
+      kind: empty

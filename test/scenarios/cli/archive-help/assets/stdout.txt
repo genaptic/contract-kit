@@ -1,0 +1,9 @@
+Archive the current contract catalog
+
+Usage: conkit archive [OPTIONS] --contracts <DIR> --archive <DIR>
+
+Options:
+      --contracts <DIR>  Root directory containing the current contract files
+      --archive <DIR>    Directory where a timestamped archive file should be created
+      --gzip             Select gzip archive output
+  -h, --help             Print help

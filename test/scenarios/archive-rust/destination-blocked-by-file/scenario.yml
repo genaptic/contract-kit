@@ -1,0 +1,31 @@
+version: 1
+coverage:
+- behavior.archive.error.destination-blocked
+steps:
+- type: overlay
+  source: output
+  destination: /output
+- type: run
+  argv:
+  - conkit
+  - archive
+  - --contracts
+  - /input/contracts
+  - --archive
+  - /output/blocked
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: contains_in_order
+      value:
+      - failed to create directory `/output/blocked`
+- type: assert_tree
+  actual: /input
+  expected: input
+  contents: bytes
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: bytes

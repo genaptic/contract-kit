@@ -1,0 +1,5 @@
+root: ../src
+files:
+  - lib.rs
+signatures: []
+sketches: []

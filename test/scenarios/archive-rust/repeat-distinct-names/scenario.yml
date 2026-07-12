@@ -1,0 +1,96 @@
+version: 1
+coverage:
+- behavior.archive.repeat.distinct-names
+steps:
+- type: overlay
+  source: output/sentinel.txt
+  destination: /output/sentinel.txt
+- type: run
+  argv:
+  - conkit
+  - archive
+  - --contracts
+  - /input/contracts
+  - --archive
+  - /output/archives
+  expect:
+    exit_code: 0
+    stdout:
+      kind: contains_in_order
+      value:
+      - archived contracts to /output/archives/
+      - |
+        -archive.gzip
+    stderr:
+      kind: empty
+- type: capture
+  name: first
+  directory: /output/archives
+  selector:
+    kind: only_file
+- type: run
+  argv:
+  - conkit
+  - diff
+  - --contracts
+  - /input/contracts
+  - --archive
+  - ${capture.first}
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        contracts unchanged
+    stderr:
+      kind: empty
+- type: run
+  argv:
+  - conkit
+  - archive
+  - --contracts
+  - /input/contracts
+  - --archive
+  - /output/archives
+  expect:
+    exit_code: 0
+    stdout:
+      kind: contains_in_order
+      value:
+      - archived contracts to /output/archives/
+      - |
+        -archive.gzip
+    stderr:
+      kind: empty
+- type: capture
+  name: second
+  directory: /output/archives
+  selector:
+    kind: uncaptured_file_name_suffix
+    value: -archive.gzip
+- type: run
+  argv:
+  - conkit
+  - diff
+  - --contracts
+  - /input/contracts
+  - --archive
+  - ${capture.second}
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        contracts unchanged
+    stderr:
+      kind: empty
+- type: remove
+  path: /output/archives
+- type: assert_tree
+  actual: /input
+  expected: input
+  contents: bytes
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: bytes

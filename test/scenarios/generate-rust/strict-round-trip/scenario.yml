@@ -1,0 +1,45 @@
+version: 1
+coverage:
+- behavior.generate.round-trip.strict-check
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - all
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 4 signature contracts and 0 sketch contracts
+    stderr:
+      kind: empty
+- type: run
+  argv:
+  - conkit
+  - check
+  - all
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  - --output
+  - /output/report.yml
+  - --strict
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        contract check passed: 4 signatures, 0 sketches
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: text

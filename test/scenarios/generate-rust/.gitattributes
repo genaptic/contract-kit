@@ -1,0 +1,7 @@
+*.bin -text
+*.json text eol=lf
+*.rs text eol=lf
+*.txt text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+scenario.yml text eol=lf

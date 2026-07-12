@@ -1,0 +1,41 @@
+version: 1
+coverage:
+- behavior.diff.error.archive.invalid-gzip
+steps:
+- type: overlay
+  source: output/sentinel.txt
+  destination: /output/sentinel.txt
+- type: overlay
+  source: assets
+  destination: /input/archives
+- type: run
+  argv:
+  - conkit
+  - diff
+  - --contracts
+  - /input/contracts
+  - --archive
+  - /input/archives/invalid-gzip.gzip
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: contains_in_order
+      value:
+      - failed to decode contract archive
+      - 'failed to process archive: invalid-gzip.gzip: failed to decode gzip payload:'
+- type: assert_tree
+  actual: /input/archives
+  expected: assets
+  contents: bytes
+- type: remove
+  path: /input/archives
+- type: assert_tree
+  actual: /input
+  expected: input
+  contents: bytes
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: bytes

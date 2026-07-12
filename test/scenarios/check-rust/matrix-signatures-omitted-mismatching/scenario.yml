@@ -1,0 +1,27 @@
+version: 1
+coverage:
+- behavior.check.matrix.signatures.omitted.mismatching
+steps:
+- type: run
+  argv:
+  - conkit
+  - check
+  - signatures
+  - --source
+  - /input/src
+  - --contracts
+  - /input/contracts
+  - --output
+  - /output/report.yaml
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        contract check failed for Signatures
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: text

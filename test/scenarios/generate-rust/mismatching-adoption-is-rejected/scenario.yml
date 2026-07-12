@@ -1,0 +1,48 @@
+version: 1
+coverage:
+- behavior.generate.adoption.mismatching-rejected
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - all
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 signature contracts and 0 sketch contracts
+    stderr:
+      kind: empty
+- type: remove
+  path: /output/contracts/.contract-kit
+- type: overlay
+  source: assets/overlays/modified/main.yml
+  destination: /output/contracts/main.yml
+- type: run
+  argv:
+  - conkit
+  - generate
+  - all
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  - --adopt-existing
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        refusing to overwrite unowned generated output: /output/contracts/main.yml
+- type: assert_tree
+  actual: /output/contracts
+  expected: output
+  contents: text

@@ -1,0 +1,19 @@
+root: ../src
+files:
+  - a.rs
+signatures:
+  - a_signature:
+      file: a.rs
+      signature_type: function
+      name: a
+      visibility: public
+      parameters: []
+      return_type: u8
+      sketch: a_body
+sketches:
+  - a_body:
+    signature_type: function
+    code: |
+      pub fn a() -> u8 {
+          1
+      }

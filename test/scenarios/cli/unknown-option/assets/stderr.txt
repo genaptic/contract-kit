@@ -1,0 +1,5 @@
+error: unexpected argument '--definitely-not-an-option' found
+
+Usage: conkit <COMMAND>
+
+For more information, try '--help'.

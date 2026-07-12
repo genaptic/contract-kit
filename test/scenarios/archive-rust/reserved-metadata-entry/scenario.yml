@@ -1,0 +1,36 @@
+version: 1
+coverage:
+- behavior.archive.error.reserved-metadata
+steps:
+- type: overlay
+  source: output/sentinel.txt
+  destination: /output/sentinel.txt
+- type: overlay
+  source: assets/reserved-metadata/unexpected.txt
+  destination: /input/contracts/.contract-kit/unexpected.txt
+- type: run
+  argv:
+  - conkit
+  - archive
+  - --contracts
+  - /input/contracts
+  - --archive
+  - /output/archives
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        reserved generated-file metadata namespace contains unsupported entry: /input/contracts/.contract-kit/unexpected.txt
+- type: remove
+  path: /input/contracts/.contract-kit
+- type: assert_tree
+  actual: /input
+  expected: input
+  contents: bytes
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: bytes

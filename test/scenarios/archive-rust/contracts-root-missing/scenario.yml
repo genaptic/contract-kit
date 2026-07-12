@@ -1,0 +1,34 @@
+version: 1
+coverage:
+- behavior.archive.error.contracts-root-missing
+steps:
+- type: overlay
+  source: output
+  destination: /input
+- type: overlay
+  source: output
+  destination: /output
+- type: run
+  argv:
+  - conkit
+  - archive
+  - --contracts
+  - /input/missing
+  - --archive
+  - /output/archives
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        Contracts root is not a directory: /input/missing
+- type: assert_tree
+  actual: /input
+  expected: output
+  contents: bytes
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: bytes

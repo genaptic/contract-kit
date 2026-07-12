@@ -1,0 +1,22 @@
+version: 1
+coverage:
+- surface.option.generate.adopt-existing.present
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - all
+  - --source
+  - /input/missing
+  - --contracts
+  - /output/contracts
+  - --adopt-existing
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        Source root is not a directory: /input/missing

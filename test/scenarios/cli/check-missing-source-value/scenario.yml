@@ -1,0 +1,20 @@
+version: 1
+coverage:
+- grammar.error.check.missing-value
+steps:
+- type: run
+  argv:
+  - conkit
+  - check
+  - all
+  - --source
+  expect:
+    exit_code: 2
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        error: a value is required for '--source <DIR>' but none was supplied
+
+        For more information, try '--help'.

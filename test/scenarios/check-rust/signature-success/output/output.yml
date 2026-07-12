@@ -1,0 +1,6 @@
+passed: true
+counts:
+  source_signature_count: 25
+  contract_signature_count: 25
+inventory_digest: f14dcd00356b8a8f415a9a8ff2831441f381a07ed2f40ad7e2e6532181feec8b
+diagnostics: []

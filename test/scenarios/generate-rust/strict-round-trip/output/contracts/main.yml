@@ -1,0 +1,45 @@
+root: ../../input/source
+files:
+- nested/extra.rs
+- nested/lib.rs
+signatures:
+- explicit_rust_function:
+    file: nested/extra.rs
+    signature_type: function
+    name: explicit_rust
+    visibility: public
+    abi: Rust
+- extra_function:
+    file: nested/extra.rs
+    signature_type: function
+    name: extra
+    visibility: public
+    return_type: bool
+- answer_function:
+    file: nested/lib.rs
+    signature_type: function
+    name: answer
+    visibility: public
+    return_type: u8
+- declarationorder_struct:
+    file: nested/lib.rs
+    signature_type: struct
+    name: DeclarationOrder
+    visibility: public
+    fields:
+      zeta:
+        type: u8
+        visibility: public
+      alpha:
+        type: u16
+        visibility: public
+      middle:
+        type: u32
+        visibility: public
+    methods:
+    - signature_type: method
+      name: total
+      receiver: ref
+      visibility: public
+      return_type: u32
+sketches: []

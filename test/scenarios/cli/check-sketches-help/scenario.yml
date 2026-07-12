@@ -1,0 +1,18 @@
+version: 1
+coverage:
+- grammar.help.check.sketches
+- surface.target.check.sketches
+steps:
+- type: run
+  argv:
+  - conkit
+  - check
+  - sketches
+  - --help
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact_file
+      value: assets/stdout.txt
+    stderr:
+      kind: empty

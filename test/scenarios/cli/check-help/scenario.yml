@@ -1,0 +1,17 @@
+version: 1
+coverage:
+- grammar.help.check
+- surface.command.check
+steps:
+- type: run
+  argv:
+  - conkit
+  - check
+  - --help
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact_file
+      value: assets/stdout.txt
+    stderr:
+      kind: empty

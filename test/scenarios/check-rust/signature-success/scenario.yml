@@ -1,0 +1,33 @@
+version: 1
+cargo_workspace: true
+coverage:
+- behavior.check.alias.signature
+- surface.command.check
+- surface.alias.check.signature
+- surface.mode.check.strict
+- surface.format.check.yaml
+steps:
+- type: run
+  argv:
+  - conkit
+  - check
+  - signature
+  - --source
+  - /input/src
+  - --contracts
+  - /input/contracts
+  - --output
+  - /output/output.yml
+  - --strict
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        signature check passed: 25 source signatures, 25 contract signatures
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: text

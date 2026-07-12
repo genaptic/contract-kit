@@ -1,0 +1,15 @@
+version: 1
+coverage:
+- grammar.error.archive.missing-required
+steps:
+- type: run
+  argv:
+  - conkit
+  - archive
+  expect:
+    exit_code: 2
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact_file
+      value: assets/stderr.txt

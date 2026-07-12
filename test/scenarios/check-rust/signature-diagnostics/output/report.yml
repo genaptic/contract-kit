@@ -1,0 +1,14 @@
+passed: false
+counts:
+  source_signature_count: 2
+  contract_signature_count: 2
+inventory_digest: 58d9f80e24c99ea0364c3c14b8e1204382b826c529de51ff62b47e8bf78aed1d
+diagnostics:
+- !Mismatched
+  signature_id: answer
+  expected_digest: b4fe3f35e4835e39508ce338b09407d0dfcac82935f67b854a404f5315a1330b
+  actual_digest: d7db0211e2f6b6694a9c1a3e84695ea8b225c241fc9fdbd70ad08020e829e5d2
+- !Missing
+  signature_id: expected_only
+- !Extra
+  signature_id: rust:lib.rs:function:actual_only

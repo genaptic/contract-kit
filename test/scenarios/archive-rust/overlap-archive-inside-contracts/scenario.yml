@@ -1,0 +1,31 @@
+version: 1
+coverage:
+- behavior.archive.error.overlap.archive-inside-contracts
+steps:
+- type: overlay
+  source: output/sentinel.txt
+  destination: /output/sentinel.txt
+- type: run
+  argv:
+  - conkit
+  - archive
+  - --contracts
+  - /input/contracts
+  - --archive
+  - /input/contracts/archives
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        contracts path /input/contracts overlaps archive directory path /input/contracts/archives
+- type: assert_tree
+  actual: /input
+  expected: input
+  contents: bytes
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: bytes

@@ -1,0 +1,7 @@
+error: the following required arguments were not provided:
+  --contracts <DIR>
+  --archive <DIR>
+
+Usage: conkit archive --contracts <DIR> --archive <DIR>
+
+For more information, try '--help'.

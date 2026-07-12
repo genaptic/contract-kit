@@ -1,0 +1,63 @@
+version: 1
+coverage:
+- behavior.check.error.signature-contract-malformed
+steps:
+- type: overlay
+  source: output/sentinel.txt
+  destination: /output/sentinel.txt
+- type: overlay
+  source: assets/overlays/malformed/main.yml
+  destination: /input/contracts/main.yml
+- type: run
+  argv:
+  - conkit
+  - check
+  - signatures
+  - --source
+  - /input/src
+  - --contracts
+  - /input/contracts
+  - --output
+  - /output/report.yml
+  - --strict
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        failed to check signature contracts
+
+        Caused by:
+            failed to parse main.yml: signatures: invalid type: string "not-a-named-signature", expected a map at line 5 column 3
+- type: overlay
+  source: assets/overlays/inapplicable-field/main.yml
+  destination: /input/contracts/main.yml
+- type: run
+  argv:
+  - conkit
+  - check
+  - signatures
+  - --source
+  - /input/src
+  - --contracts
+  - /input/contracts
+  - --output
+  - /output/report.yml
+  - --strict
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        failed to check signature contracts
+
+        Caused by:
+            failed to parse main.yml: signatures: field fields is not allowed for signature_type function at line 5 column 3
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: text

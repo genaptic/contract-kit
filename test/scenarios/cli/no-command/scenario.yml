@@ -1,0 +1,14 @@
+version: 1
+coverage:
+- grammar.error.no-command
+steps:
+- type: run
+  argv:
+  - conkit
+  expect:
+    exit_code: 2
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact_file
+      value: assets/stderr.txt
