@@ -69,10 +69,12 @@ From the Actions tab, run the `Release` workflow on `main`:
 The workflow re-runs the checked, locked workspace gates and package dry-runs,
 builds and smoke-tests each native executable, creates checksummed archives,
 and waits for the `release` environment approval. The protected job creates a
-draft GitHub Release, publishes any library version that is not already on
-crates.io, and makes the GitHub Release public only after both publishes
-succeed. Docs.rs automatically queues versioned documentation for each
-published library.
+lightweight tag at the validated release commit, verifies that the remote tag
+resolves to that exact commit, and creates the draft GitHub Release only from
+the verified tag. It then publishes any library version that is not already on
+crates.io and makes the GitHub Release public only after both publishes succeed.
+Docs.rs automatically queues versioned documentation for each published
+library.
 
 The publish step is safe to retry after a partial crates.io publication. It
 packages each library locally, then accepts an existing version only when the
@@ -89,6 +91,15 @@ package is yanked, a maintainer must explicitly run
 terminal for that version because crates.io versions are immutable: investigate,
 delete the abandoned draft and its tag, and prepare a higher version. Never move
 an existing release tag or dispatch the same version from a newer commit.
+
+GitHub may represent a draft created without an existing tag with an
+`untagged-*` URL while deferring creation of the Git ref. The release workflow
+therefore creates and verifies the tag before asking GitHub to create the draft,
+and `--verify-tag` prevents draft creation from silently relying on a deferred
+tag. If an older workflow left an untagged draft, first confirm that neither
+library was published, then delete the abandoned draft, merge the workflow fix,
+and dispatch the version again from the fixed `main`. Re-running the older run
+would reuse its original workflow definition.
 
 ## Expected artifacts
 

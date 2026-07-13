@@ -108,6 +108,11 @@ jobs:
               echo "A public GitHub Release already exists for $tag." >&2
               exit 1
             fi
+            if [[ -z "$remote_tag" ]]; then
+              echo "Draft release $tag exists without refs/tags/$tag." >&2
+              echo "Delete the abandoned untagged draft before dispatching again." >&2
+              exit 1
+            fi
             echo "Resuming the existing draft release for $tag."
           fi
 
@@ -285,6 +290,36 @@ jobs:
         with:
           subject-path: release-artifacts/*
 
+      - name: Create and verify the release tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          remote_tag="$(git ls-remote origin "refs/tags/$TAG")"
+          if [[ -z "$remote_tag" ]]; then
+            if ! gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              --raw-field "ref=refs/tags/$TAG" \
+              --raw-field "sha=$GITHUB_SHA" \
+              >/dev/null; then
+              remote_tag="$(git ls-remote origin "refs/tags/$TAG")"
+              if [[ -z "$remote_tag" ]]; then
+                echo "Unable to create refs/tags/$TAG at $GITHUB_SHA." >&2
+                exit 1
+              fi
+              echo "refs/tags/$TAG appeared concurrently; verifying it before continuing."
+            fi
+          fi
+
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          tag_commit="$(git rev-list -n 1 "$TAG")"
+          if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+            echo "$TAG points to $tag_commit, not $GITHUB_SHA." >&2
+            exit 1
+          fi
+
       - name: Create or update the draft GitHub Release
         shell: bash
         env:
@@ -301,17 +336,10 @@ jobs:
             gh release upload "$TAG" release-artifacts/* --clobber
           else
             gh release create "$TAG" release-artifacts/* \
-              --target "$GITHUB_SHA" \
               --title "$TAG" \
               --generate-notes \
+              --verify-tag \
               --draft
-          fi
-
-          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
-          tag_commit="$(git rev-list -n 1 "$TAG")"
-          if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
-            echo "$TAG points to $tag_commit, not $GITHUB_SHA." >&2
-            exit 1
           fi
 
       - name: Authenticate with crates.io trusted publishing
