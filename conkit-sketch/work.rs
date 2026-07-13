@@ -108,13 +108,13 @@ impl AsyncWorkPool {
         let (sender, receiver) = oneshot::channel();
 
         self.pool.spawn(move || {
-            let _permit = permit;
-
             if sender.is_canceled() {
                 return;
             }
 
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            // Release admission before making completion observable.
+            drop(permit);
             let _ = sender.send(outcome);
         });
 

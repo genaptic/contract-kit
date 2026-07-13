@@ -57,7 +57,8 @@ impl ResolvedPath {
     /// # Errors
     ///
     /// Returns an error if the current directory or an existing ancestor cannot
-    /// be resolved, or if an unresolved existing component is a symlink.
+    /// be resolved, if a missing suffix begins below a non-directory ancestor,
+    /// or if an unresolved existing component is a symlink.
     pub(crate) fn new(role: PathRole, path: PathBuf) -> Result<Self, CliError> {
         let absolute = if path.is_absolute() {
             path.clone()
@@ -72,10 +73,27 @@ impl ResolvedPath {
         };
         let mut existing = absolute;
         let mut missing_suffix = Vec::<OsString>::new();
+        let mut missing_source = None;
 
         let resolved_ancestor = loop {
             match fs_err::canonicalize(&existing) {
-                Ok(resolved) => break resolved,
+                Ok(resolved) => {
+                    if let Some(source) = missing_source.take() {
+                        // Windows can report a child below a file as not found,
+                        // so verify the ancestor before restoring the suffix.
+                        let metadata = fs_err::metadata(&resolved).map_err(|source| {
+                            CliError::PathResolution {
+                                role,
+                                path: path.clone(),
+                                source,
+                            }
+                        })?;
+                        if !metadata.is_dir() {
+                            return Err(CliError::PathResolution { role, path, source });
+                        }
+                    }
+                    break resolved;
+                }
                 Err(source) if source.kind() == ErrorKind::NotFound => {
                     if Self::entry_exists_without_symlink(role, &existing)? {
                         return Err(CliError::PathResolution {
@@ -96,6 +114,7 @@ impl ResolvedPath {
                                 "no existing path ancestor",
                             ),
                         })?;
+                    missing_source.get_or_insert(source);
                     missing_suffix.push(component);
                     if !existing.pop() {
                         return Err(CliError::PathResolution {
@@ -411,6 +430,8 @@ mod tests {
     use assert_fs::prelude::*;
     use conkit_signature::CatalogPath;
 
+    use crate::error::CliError;
+
     use super::{CatalogDirectory, PathRole, PortableCatalogPathKey, ResolvedPath};
 
     #[test]
@@ -524,6 +545,26 @@ mod tests {
         let root_path =
             ResolvedPath::new(PathRole::Source, root.path().to_path_buf()).expect("resolved root");
         assert!(ResolvedPath::ensure_disjoint(&[root_path, sibling_path]).is_ok());
+        temp.close().expect("close temporary root");
+    }
+
+    #[test]
+    fn resolved_paths_reject_a_missing_suffix_below_a_file() {
+        let temp = assert_fs::TempDir::new().expect("temporary root");
+        let blocking_file = temp.child("blocked");
+        blocking_file
+            .write_str("not a directory")
+            .expect("blocking file");
+        let report = blocking_file.path().join("report.yml");
+
+        let error = ResolvedPath::new(PathRole::Report, report.clone())
+            .expect_err("a file cannot be a path ancestor");
+        let CliError::PathResolution { role, path, .. } = error else {
+            panic!("expected path resolution error, got {error}");
+        };
+
+        assert_eq!(role, PathRole::Report);
+        assert_eq!(path, report);
         temp.close().expect("close temporary root");
     }
 

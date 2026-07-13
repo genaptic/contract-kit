@@ -1,4 +1,4 @@
-use super::{HarnessRepository, Scenario, Suite, TempDir};
+use super::{HarnessRepository, Scenario, Suite};
 
 #[test]
 fn suite_discovers_one_scenario_per_leaf_in_stable_relative_order() {
@@ -77,25 +77,26 @@ fn discovery_rejects_empty_roots_and_aggregates_invalid_leaf_manifests() {
     assert!(error.contains("no scenario.yml files found"), "{error}");
 
     let repository = HarnessRepository::new();
-    repository.write_scenario("a-invalid", "version: 2\nsteps: []\n");
-    repository.write_scenario("b-invalid", "version: 3\nsteps: []\n");
+    let a_manifest = repository
+        .write_scenario("a-invalid", "version: 2\nsteps: []\n")
+        .join("scenario.yml");
+    let b_manifest = repository
+        .write_scenario("b-invalid", "version: 3\nsteps: []\n")
+        .join("scenario.yml");
     let Err(aggregated) = Suite::discover(repository.path()) else {
         panic!("all invalid leaves should be reported");
     };
     let aggregated = aggregated.to_string();
-    assert!(
-        aggregated.contains("a-invalid/scenario.yml"),
-        "{aggregated}"
-    );
-    assert!(
-        aggregated.contains("b-invalid/scenario.yml"),
-        "{aggregated}"
-    );
+    let a_manifest = a_manifest.display().to_string();
+    let b_manifest = b_manifest.display().to_string();
+    assert!(aggregated.contains(a_manifest.as_str()), "{aggregated}");
+    assert!(aggregated.contains(b_manifest.as_str()), "{aggregated}");
 }
 
 #[cfg(unix)]
 #[test]
 fn implicit_input_and_scenario_assets_reject_symlinks() {
+    use super::TempDir;
     use std::os::unix::fs::symlink;
 
     let input_repository = HarnessRepository::new();
