@@ -119,8 +119,30 @@ validation commands here.
 
 ## Async, Structure, And Determinism
 
-- Keep the public future runtime-neutral. Submit finite CPU work to the private
-  Rayon pool and return results through futures oneshot channels.
+- Keep public futures runtime-neutral. Direct `.await` is the normal
+  integration. A spawned task must own its request and kit, normally by moving
+  an `Arc` clone into an `async move` block; the owning future and its output
+  must remain `Send + 'static`. Do not promise that a method future borrowing a
+  local kit is itself `'static`.
+- Use exactly one `AsyncWorkPool::execute` call around each complete top-level
+  operation. Await an owned semaphore permit asynchronously, submit the job to
+  the private Rayon pool, move the permit into the closure, and return the
+  outcome through a futures oneshot channel.
+- Derive root-operation admission from the built worker count:
+  `WorkParallelism::Fixed(n)` sets both budgets to `n`, while
+  `RuntimeDefault` uses Rayon's selected count. Do not add another public
+  `WorkOptions` field.
+- Preserve drop semantics: dropping before admission prevents submission;
+  cancellation of a submitted but not-yet-started job is a best-effort skip;
+  finite work which has started runs to completion and may discard its result.
+  A host timeout bounds waiting, not CPU execution.
+- Keep the permit with queued and running work. Hosts must independently bound
+  the pending tasks and owned catalogs they create. Do not promise FIFO or
+  starvation freedom.
+- Catch worker-job panics only to forward them through the oneshot outcome and
+  resume unwinding on the polling thread. Keep recoverable failures typed.
+  Domain operations remain side-effect-free transformations of owned catalogs,
+  so discarded results cannot leave partial external state.
 - Do not add Tokio, `async_trait`, `spawn_blocking`, `block_in_place`, or an
   internal `block_on`. Runtime entry belongs to the caller.
 - Put production behavior on cohesive structs, data-carrying enums, builders,
@@ -158,6 +180,13 @@ validation commands here.
 - Keep unit tests beside the private behavior they exercise.
 - Keep public API, async behavior, serialization, and source-boundary scanners
   under `conkit-sketch/tests`.
+- Keep compile-time direct-future and owning-spawn `Send` contracts in
+  `tests/public_api.rs`; retain the executor-neutral behavioral tests there.
+- Keep deterministic admission, pre-start and post-start cancellation, maximum
+  active-work, panic-forwarding, and worker-loss tests in the local `work.rs`
+  test module. Coordinate them with channels, atomics, manual polling, real
+  wake notifications, and bounded receive guards—never sleeps or production
+  test seams.
 - Preserve boundary coverage rejecting `conkit_signature::`, `clap`, Tokio,
   `async_trait`, filesystem IO, process exits, OS-path DTOs, and production
   `#[cfg(test)]` shims.

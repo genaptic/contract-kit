@@ -125,9 +125,11 @@ domains or back into `conkit`.
   target configuration only for real platform differences.
 - Keep archive file names Windows-safe. The current archive names use Unix
   nanoseconds plus `-archive.gzip` and collision suffixes.
-- Read an existing archive through one verified regular-file handle. Treat
-  metadata length only as an early rejection and enforce the compressed-byte
-  limit while reading; never reopen the archive path for decoding.
+- Open an existing archive with atomic final-component no-follow behavior so
+  symlink or reparse-point traversal is refused. Verify any opened handle is a
+  regular file and read through that same handle. Treat metadata length only as
+  an early rejection, enforce the compressed-byte limit while reading, and
+  never reopen the archive path for decoding.
 - Do not describe multi-file catalog persistence as one atomic transaction.
   Report and generated-file writes are individually atomic, generation uses a
   locked, digest-backed journal persisted by the ownership model and

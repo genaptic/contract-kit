@@ -69,10 +69,17 @@
 //! cross-domain orchestration belong to callers such as the `conkit` crate.
 //!
 //! Start with [`SketchContractKit::builder`] to configure the local kit and call
-//! the async operations. The futures are runtime-neutral; the crate uses a
-//! reusable Rayon-backed work pool internally for CPU-bound work. Catalogs,
-//! diagnostics, generated entries, and rendered output remain deterministic
-//! regardless of worker scheduling.
+//! its operations directly with `.await`. The futures are executor-neutral: the
+//! crate does not select the executor that polls them. To place an operation in
+//! a spawned task, that task must own both its request and the kit, commonly by
+//! moving an [`Arc`](std::sync::Arc) clone into an `async move` block. That
+//! owning future and its output satisfy `Send + 'static`; a method future which
+//! still borrows a local kit is not promised to be `'static`.
+//!
+//! CPU work runs on a reusable Rayon-backed pool. [`WorkOptions`] documents the
+//! complete worker-budget, root-admission, cancellation, and caller-deadline
+//! contract. Catalogs, diagnostics, generated entries, and rendered output
+//! remain deterministic regardless of worker scheduling.
 //!
 //! # Examples
 //!

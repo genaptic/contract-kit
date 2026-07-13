@@ -6,11 +6,16 @@ use crate::inventory::{
 use crate::languages::{SignatureParser, SignatureParserBackend};
 use crate::work::{AsyncWorkPool, WorkOptions};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Public handle for signature contract operations.
 ///
 /// Build a kit with [`SignatureContractKit::builder`], then call the async
-/// methods with in-memory catalog requests.
+/// methods with in-memory catalog requests. Each handle owns and reuses one
+/// local Rayon pool for complete CPU-bound workflows; the returned futures
+/// remain independent of any particular async runtime. The selected worker
+/// count also bounds admitted root operations. See [`WorkOptions`] for the
+/// complete admission, cancellation, caller-deadline, and scheduling contract.
 ///
 /// # Examples
 ///
@@ -19,6 +24,40 @@ use serde::{Deserialize, Serialize};
 ///
 /// let kit = SignatureContractKit::builder().build()?;
 /// # let _ = kit;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// An operation placed in a spawned task must own its request and kit. A
+/// runtime may spawn the owning `async move` future below; this executor-neutral
+/// example polls it directly.
+///
+/// ```
+/// use conkit_signature::{
+///     CatalogPath, ContractScope, FileCatalog, GenerateDocument, GenerateRequest,
+///     GenerateTarget, SignatureContractKit,
+/// };
+/// use std::sync::Arc;
+///
+/// let kit = Arc::new(SignatureContractKit::builder().build()?);
+/// let mut source_files = FileCatalog::new();
+/// source_files.insert(
+///     CatalogPath::new("lib.rs")?,
+///     b"pub fn answer() -> u8 { 42 }\n".to_vec(),
+/// )?;
+/// let request = GenerateRequest {
+///     source_files,
+///     target: GenerateTarget::New(GenerateDocument {
+///         contract_file: CatalogPath::new("main.yml")?,
+///         root: "../src".to_owned(),
+///         files: vec![CatalogPath::new("lib.rs")?],
+///     }),
+///     scope: ContractScope::Signatures,
+/// };
+/// let task_kit = Arc::clone(&kit);
+/// let task = async move { task_kit.generate(request).await };
+/// let response = futures_executor::block_on(task)?;
+///
+/// assert_eq!(response.signature_count, 1);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct SignatureContractKit {
@@ -31,6 +70,14 @@ enum SignatureContractKitInner {
 
 #[derive(Default)]
 /// Builder for [`SignatureContractKit`].
+///
+/// The default builder uses
+/// [`WorkParallelism::RuntimeDefault`](crate::WorkParallelism::RuntimeDefault),
+/// deriving root-operation admission from Rayon's selected worker count. Use
+/// [`SignatureContractKitBuilder::with_work_options`] with
+/// [`WorkParallelism::Fixed`](crate::WorkParallelism::Fixed) to select one
+/// explicit non-zero value for both worker count and admitted root operations.
+/// See [`WorkOptions`] for the complete scheduling contract.
 ///
 /// # Examples
 ///
@@ -52,6 +99,11 @@ pub struct SignatureContractKitBuilder {
 
 impl SignatureContractKitBuilder {
     /// Configures CPU work scheduling for the kit.
+    ///
+    /// This replaces the builder's current [`WorkOptions`]. Fixed parallelism
+    /// sets both the Rayon worker count and per-kit root-operation admission
+    /// capacity; [`WorkOptions`] documents runtime independence, cancellation,
+    /// caller deadlines, host-side task bounds, and scheduling guarantees.
     ///
     /// # Examples
     ///
@@ -118,7 +170,13 @@ impl SignatureContractKit {
     /// # Errors
     ///
     /// Returns [`SignatureContractKitError`] when source parsing, contract
-    /// parsing, comparison, or optional report rendering fails.
+    /// parsing, comparison, or optional report rendering fails, or when
+    /// background work does not complete.
+    ///
+    /// # Panics
+    ///
+    /// If the background operation panics on a Rayon worker, its panic payload
+    /// resumes unwinding on the thread that polls this future to completion.
     ///
     /// # Examples
     ///
@@ -178,6 +236,11 @@ impl SignatureContractKit {
     /// output bytes cannot be rendered; or when background work does not
     /// complete.
     ///
+    /// # Panics
+    ///
+    /// If the background operation panics on a Rayon worker, its panic payload
+    /// resumes unwinding on the thread that polls this future to completion.
+    ///
     /// # Examples
     ///
     /// ```
@@ -214,6 +277,11 @@ impl SignatureContractKit {
 
     /// Resolves every explicitly linked sketch to its exact Rust source item.
     ///
+    /// Item macros with the same file, module path, and semantic name are
+    /// distinguished by one-based declaration occurrence. Contract signature
+    /// order reconstructs those occurrences, so each link selects the exact
+    /// corresponding macro item text.
+    ///
     /// # Errors
     ///
     /// Returns [`SignatureContractKitError`] when Rust source bytes cannot be
@@ -221,6 +289,11 @@ impl SignatureContractKit {
     /// layout, ownership, or link validation; when linked source files, exact
     /// Rust items, or valid source spans cannot be found; or when background
     /// work does not complete.
+    ///
+    /// # Panics
+    ///
+    /// If the background operation panics on a Rayon worker, its panic payload
+    /// resumes unwinding on the thread that polls this future to completion.
     ///
     /// # Examples
     ///
@@ -238,32 +311,45 @@ impl SignatureContractKit {
     /// let kit = SignatureContractKit::builder().build()?;
     /// let response = futures_executor::block_on(kit.resolve_sketches(
     ///     ResolveSketchesRequest {
-    ///         source_files: catalog("main.rs", b"fn main() {\n    run();\n}\n")?,
+    ///         source_files: catalog(
+    ///             "lib.rs",
+    ///             b"include!(\"first.rs\");\ninclude!(\"second.rs\");\n",
+    ///         )?,
     ///         contract_files: catalog(
     ///             "main.yml",
     ///             br#"root: ../src
-    /// files: [main.rs]
+    /// files: [lib.rs]
     /// signatures:
-    ///   - main:
-    ///       file: main.rs
-    ///       signature_type: main_method
-    ///       sketch: main
+    ///   - first_include:
+    ///       file: lib.rs
+    ///       signature_type: macro
+    ///       name: include
+    ///       sketch: first
+    ///   - second_include:
+    ///       file: lib.rs
+    ///       signature_type: macro
+    ///       name: include
+    ///       sketch: second
     /// sketches:
-    ///   - main:
-    ///     signature_type: main_method
-    ///     code: |
-    ///       fn main() {}
+    ///   - first:
+    ///     signature_type: macro
+    ///     code: old
+    ///   - second:
+    ///     signature_type: macro
+    ///     code: old
     /// "#,
     ///         )?,
     ///     },
     /// ))?;
     ///
-    /// let seed = &response.seeds[0];
-    /// assert_eq!(seed.contract_file.as_str(), "main.yml");
-    /// assert_eq!(seed.sketch_id, "main");
-    /// assert_eq!(seed.signature_type, "main_method");
-    /// assert_eq!(seed.file.as_str(), "main.rs");
-    /// assert_eq!(seed.code, "fn main() {\n    run();\n}");
+    /// assert_eq!(response.seeds.len(), 2);
+    /// assert_eq!(response.seeds[0].contract_file.as_str(), "main.yml");
+    /// assert_eq!(response.seeds[0].sketch_id, "first");
+    /// assert_eq!(response.seeds[0].signature_type, "macro");
+    /// assert_eq!(response.seeds[0].file.as_str(), "lib.rs");
+    /// assert_eq!(response.seeds[0].code, "include!(\"first.rs\");");
+    /// assert_eq!(response.seeds[1].sketch_id, "second");
+    /// assert_eq!(response.seeds[1].code, "include!(\"second.rs\");");
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub async fn resolve_sketches(
@@ -278,7 +364,12 @@ impl SignatureContractKit {
     /// # Errors
     ///
     /// Returns [`SignatureContractKitError`] when contract parsing or inventory
-    /// diffing fails.
+    /// diffing fails, or when background work does not complete.
+    ///
+    /// # Panics
+    ///
+    /// If the background operation panics on a Rayon worker, its panic payload
+    /// resumes unwinding on the thread that polls this future to completion.
     ///
     /// # Examples
     ///
@@ -376,15 +467,72 @@ impl SignatureContractKitBackend for SignatureContractKit {
     }
 }
 
+struct SignatureCheck {
+    parser: Arc<SignatureParser>,
+    request: CheckRequest,
+}
+
+impl SignatureCheck {
+    fn new(parser: Arc<SignatureParser>, request: CheckRequest) -> Self {
+        Self { parser, request }
+    }
+
+    fn run(self) -> Result<CheckResponse, SignatureContractKitError> {
+        let CheckRequest {
+            source_files,
+            contract_files,
+            report,
+            scope: _,
+            mode,
+        } = self.request;
+        let (source, contract) = self
+            .parser
+            .parse_check_inventories(source_files, contract_files)?;
+        let comparison = source.compare_against(&contract)?;
+        let mut response = CheckResponse::from_inventory_comparison(comparison, mode);
+
+        response.report_files = ReportFiles::new(report).render(&response)?;
+        Ok(response)
+    }
+}
+
+struct SignatureDiff {
+    parser: Arc<SignatureParser>,
+    request: DiffRequest,
+}
+
+impl SignatureDiff {
+    fn new(parser: Arc<SignatureParser>, request: DiffRequest) -> Self {
+        Self { parser, request }
+    }
+
+    fn run(self) -> Result<DiffResponse, SignatureContractKitError> {
+        let DiffRequest {
+            current_contract_files,
+            previous_contract_files,
+        } = self.request;
+        let current = self
+            .parser
+            .parse_contract_inventory(current_contract_files)?;
+        let previous = self
+            .parser
+            .parse_contract_inventory(previous_contract_files)?;
+
+        Ok(DiffResponse::from_inventory_diff(
+            current.diff_against(&previous)?,
+        ))
+    }
+}
+
 struct LocalSignatureContractKit {
-    parser: SignatureParser,
+    parser: Arc<SignatureParser>,
     work: AsyncWorkPool,
 }
 
 impl LocalSignatureContractKit {
     fn new(work: WorkOptions) -> Result<Self, SignatureContractKitError> {
         Ok(Self {
-            parser: SignatureParser::default(),
+            parser: Arc::new(SignatureParser::default()),
             work: AsyncWorkPool::new(work)?,
         })
     }
@@ -395,60 +543,48 @@ impl SignatureContractKitBackend for LocalSignatureContractKit {
         &self,
         request: CheckRequest,
     ) -> Result<CheckResponse, SignatureContractKitError> {
-        let CheckRequest {
-            source_files,
-            contract_files,
-            report,
-            scope: _,
-            mode,
-        } = request;
-        let (source, contract) = self
-            .parser
-            .parse_check_inventories(source_files, contract_files, self.work.clone())
-            .await?;
-        let comparison = source.compare_against(&contract)?;
-        let mut response = CheckResponse::from_inventory_comparison(comparison, mode);
+        let parser = Arc::clone(&self.parser);
 
-        response.report_files = ReportFiles::new(report).render(&response)?;
-        Ok(response)
+        self.work
+            .execute(move || SignatureCheck::new(parser, request).run())
+            .await?
     }
 
     async fn generate(
         &self,
         request: GenerateRequest,
     ) -> Result<GenerateResponse, SignatureContractKitError> {
-        let GenerateRequest {
-            source_files,
-            target,
-            scope,
-        } = request;
-        self.parser
-            .generate_contract_files(source_files, target, scope, self.work.clone())
-            .await
+        let parser = Arc::clone(&self.parser);
+
+        self.work
+            .execute(move || {
+                let GenerateRequest {
+                    source_files,
+                    target,
+                    scope,
+                } = request;
+                parser.generate_contract_files(source_files, target, scope)
+            })
+            .await?
     }
 
     async fn resolve_sketches(
         &self,
         request: ResolveSketchesRequest,
     ) -> Result<ResolveSketchesResponse, SignatureContractKitError> {
-        self.parser
-            .resolve_sketches(request, self.work.clone())
-            .await
+        let parser = Arc::clone(&self.parser);
+
+        self.work
+            .execute(move || parser.resolve_sketches(request))
+            .await?
     }
 
     async fn diff(&self, request: DiffRequest) -> Result<DiffResponse, SignatureContractKitError> {
-        let current = self
-            .parser
-            .parse_contract_inventory(request.current_contract_files, self.work.clone())
-            .await?;
-        let previous = self
-            .parser
-            .parse_contract_inventory(request.previous_contract_files, self.work.clone())
-            .await?;
+        let parser = Arc::clone(&self.parser);
 
-        Ok(DiffResponse::from_inventory_diff(
-            current.diff_against(&previous)?,
-        ))
+        self.work
+            .execute(move || SignatureDiff::new(parser, request).run())
+            .await?
     }
 }
 
@@ -865,6 +1001,10 @@ pub struct GenerateRequest {
 pub enum GenerateTarget {
     /// Update existing combined contract documents and retain stable labels for
     /// structurally unchanged Rust items.
+    ///
+    /// Repeated item macros with the same file, module path, and semantic name
+    /// retain labels by one-based declaration occurrence, even when their token
+    /// text changes.
     ///
     /// Only direct root-level `.yml` and `.yaml` entries are considered and
     /// returned. Nested YAML and non-YAML catalog entries are ignored and

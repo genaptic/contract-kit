@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 /// Build a kit with [`SketchContractKit::builder`], then call the async
 /// methods with in-memory catalog requests. Each handle owns and reuses one
 /// local Rayon pool for CPU-bound work; the returned futures remain independent
-/// of any particular async runtime.
+/// of any particular async runtime. The configured worker count also bounds
+/// the number of admitted root operations. See [`WorkOptions`] for the complete
+/// admission, cancellation, caller-deadline, and scheduling contract.
 ///
 /// # Examples
 ///
@@ -22,6 +24,31 @@ use serde::{Deserialize, Serialize};
 ///
 /// let kit = SketchContractKit::builder().build()?;
 /// # let _ = kit;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// An operation placed in a spawned task must own its request and kit. A
+/// runtime may spawn the owning `async move` future below; this executor-neutral
+/// example polls it directly.
+///
+/// ```
+/// use conkit_sketch::{
+///     CheckMode, CheckRequest, FileCatalog, ReportRequest, SketchContractKit,
+/// };
+/// use std::sync::Arc;
+///
+/// let kit = Arc::new(SketchContractKit::builder().build()?);
+/// let task_kit = Arc::clone(&kit);
+/// let request = CheckRequest {
+///     source_files: FileCatalog::new(),
+///     contract_files: FileCatalog::new(),
+///     report: ReportRequest::None,
+///     mode: CheckMode::Default,
+/// };
+/// let task = async move { task_kit.check(request).await };
+/// let response = futures_executor::block_on(task)?;
+///
+/// assert!(response.passed);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct SketchContractKit {
@@ -34,9 +61,13 @@ enum SketchContractKitInner {
 
 /// Builder for [`SketchContractKit`].
 ///
-/// The default builder uses [`WorkParallelism::RuntimeDefault`](crate::WorkParallelism::RuntimeDefault).
-/// Use [`SketchContractKitBuilder::with_work_options`] to select a fixed,
-/// non-zero worker count instead.
+/// The default builder uses
+/// [`WorkParallelism::RuntimeDefault`](crate::WorkParallelism::RuntimeDefault),
+/// deriving root-operation admission from Rayon's selected worker count. Use
+/// [`SketchContractKitBuilder::with_work_options`] with
+/// [`WorkParallelism::Fixed`](crate::WorkParallelism::Fixed) to select one
+/// explicit non-zero value for both worker count and admitted root operations.
+/// See [`WorkOptions`] for the complete scheduling contract.
 ///
 /// # Examples
 ///
@@ -60,7 +91,10 @@ pub struct SketchContractKitBuilder {
 impl SketchContractKitBuilder {
     /// Configures CPU work scheduling for the kit.
     ///
-    /// This replaces the builder's current [`WorkOptions`].
+    /// This replaces the builder's current [`WorkOptions`]. Fixed parallelism
+    /// sets both the Rayon worker count and per-kit root-operation admission
+    /// capacity; [`WorkOptions`] documents runtime independence, cancellation,
+    /// caller deadlines, host-side task bounds, and scheduling guarantees.
     ///
     /// # Examples
     ///
@@ -146,6 +180,11 @@ impl SketchContractKit {
     /// response invariants or report rendering fail; or when background work
     /// cannot complete.
     ///
+    /// # Panics
+    ///
+    /// If the background operation panics on a Rayon worker, its panic payload
+    /// resumes unwinding on the thread that polls this future to completion.
+    ///
     /// # Examples
     ///
     /// ```
@@ -224,6 +263,11 @@ impl SketchContractKit {
     /// code normalizes to empty; when YAML rendering fails; or when background
     /// work cannot complete.
     ///
+    /// # Panics
+    ///
+    /// If the background operation panics on a Rayon worker, its panic payload
+    /// resumes unwinding on the thread that polls this future to completion.
+    ///
     /// # Examples
     ///
     /// ```
@@ -286,6 +330,11 @@ impl SketchContractKit {
     ///
     /// Returns [`SketchContractKitError`] when either catalog contains invalid
     /// sketch contract input or background work cannot complete.
+    ///
+    /// # Panics
+    ///
+    /// If the background operation panics on a Rayon worker, its panic payload
+    /// resumes unwinding on the thread that polls this future to completion.
     ///
     /// # Examples
     ///
@@ -379,8 +428,7 @@ impl LocalSketchContractKit {
 impl SketchContractKitBackend for LocalSketchContractKit {
     async fn check(&self, request: CheckRequest) -> Result<CheckResponse, SketchContractKitError> {
         self.work
-            .submit(move || SketchCheck::new(request).run())
-            .into_result()
+            .execute(move || SketchCheck::new(request).run())
             .await?
     }
 
@@ -389,21 +437,31 @@ impl SketchContractKitBackend for LocalSketchContractKit {
         request: GenerateRequest,
     ) -> Result<GenerateResponse, SketchContractKitError> {
         self.work
-            .submit(move || SketchGenerator::new(request).generate())
-            .into_result()
+            .execute(move || SketchGenerator::new(request).generate())
             .await?
     }
 
     async fn diff(&self, request: DiffRequest) -> Result<DiffResponse, SketchContractKitError> {
         self.work
-            .submit(move || {
-                let current = SketchContracts::from_catalog(request.current_contract_files)?;
-                let previous = SketchContracts::from_catalog(request.previous_contract_files)?;
-
-                Ok(current.diff_against(&previous))
-            })
-            .into_result()
+            .execute(move || SketchDiff::new(request).run())
             .await?
+    }
+}
+
+struct SketchDiff {
+    request: DiffRequest,
+}
+
+impl SketchDiff {
+    fn new(request: DiffRequest) -> Self {
+        Self { request }
+    }
+
+    fn run(self) -> Result<DiffResponse, SketchContractKitError> {
+        let current = SketchContracts::from_catalog(self.request.current_contract_files)?;
+        let previous = SketchContracts::from_catalog(self.request.previous_contract_files)?;
+
+        Ok(current.diff_against(&previous))
     }
 }
 

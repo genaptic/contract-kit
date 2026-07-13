@@ -67,6 +67,18 @@ Public request and response DTOs do not include operating-system paths, storage
 provider details, filesystem roots, or written-file lists. Output-producing
 operations return a `FileCatalog`; callers decide where those bytes go.
 
+## Catalog Boundary
+
+`FileCatalog` is a private-map wrapper over deterministic logical path order.
+It rejects duplicate paths instead of replacing existing bytes and exposes
+only catalog-oriented accessors and iteration.
+
+`CatalogPath` is a validated UTF-8 logical name rather than an operating-system
+path. Serde encodes it as a scalar string and validates that string through
+`CatalogPath::new` during deserialization; legacy object forms are rejected.
+This representation allows nonempty catalogs to round-trip through JSON map
+keys in deterministic logical-path order without bypassing path validation.
+
 ## Data Flows
 
 `generate`:
@@ -154,8 +166,12 @@ together.
 
 Module declarations provide traversal context but are not signatures. Free
 items inside inline modules carry `module_path`; implementation methods fold
-into the owning type. Neutral linked-sketch resolution uses parser spans to
-return exact Rust item text without introducing a runtime dependency.
+into the owning type. Item macros that share a file, module path, and semantic
+name use their one-based declaration occurrence as structural identity; the
+first keeps its unsuffixed ID, while later occurrences append `#2`, `#3`, and
+so on. YAML signature-vector order reconstructs the same identities. Neutral
+linked-sketch resolution uses occurrence order with parser spans to return
+exact Rust item text without introducing a runtime dependency.
 
 Implementation ownership is resolved globally after all selected source files
 are parsed. Supported implementations normalize to a source-declared local
@@ -179,15 +195,19 @@ ABI names.
 - `lib.rs`: declares crate modules and re-exports only the public API and
   boundary types.
 - `api.rs`: owns request and response DTOs, the builder, public behavior
-  wiring, private backend dispatch, check/generate/diff composition, and report
-  byte rendering.
+  wiring, private backend dispatch, top-level async work submission, the
+  complete `SignatureCheck` and current-then-previous `SignatureDiff`
+  workflows, and report byte rendering.
 - `error.rs`: owns `SignatureContractKitError`, contextual operation errors,
   and conversions from catalog and language-neutral inventory errors.
 - `files.rs`: owns `FileCatalog`, `CatalogPath`, path validation,
   deterministic iteration, duplicate rejection, and catalog errors.
-- `work.rs`: owns `AsyncWorkPool`, `WorkHandle`, `WorkOptions`, and
-  `WorkParallelism`. It bridges CPU work to async callers through Rayon and a
-  runtime-neutral oneshot handle.
+- `work.rs`: owns `AsyncWorkPool`, `WorkOptions`, and `WorkParallelism`.
+  `AsyncWorkPool::execute` asynchronously acquires a root-operation permit,
+  moves that permit into the queued or running Rayon closure, and completes
+  through a runtime-neutral one-shot channel. The worker checks for a canceled
+  receiver before starting the workflow, captures panics, and forwards them to
+  resume unwinding on the polling thread.
 - `inventory.rs`: owns language-neutral opaque signature IDs, digests,
   inventory merge, inventory compare, and inventory diff.
 - `languages/mod.rs`: exposes the private parser dispatcher surface to shared
@@ -196,6 +216,8 @@ ABI names.
 Shared modules must remain language-neutral. They may route to concrete parser
 implementations through private dispatcher traits, but they must not import
 Rust YAML DTOs, Rust canonical forms, or Rust parser domain structs.
+Parser dispatch remains synchronous and `Send + Sync` inside one admitted root
+operation; parser implementations do not accept or submit to the work pool.
 
 ## Rust Module Ownership
 
@@ -242,8 +264,6 @@ IDs and digest bytes, not Rust-specific structures.
 
 Determinism is part of the crate contract:
 
-- `FileCatalog` is backed by a private ordered map.
-- Duplicate catalog paths are rejected instead of overwritten.
 - Source parse partials, contract parse partials, generated contract files,
   reports, inventory comparisons, and inventory diffs must be stable across
   runs.
@@ -251,9 +271,41 @@ Determinism is part of the crate contract:
   merging or returning results.
 - Generated report bytes must not recursively include `report_files`.
 
-Public async methods do CPU scheduling, not file loading. `FileCatalog` already
-contains bytes in memory. CPU-heavy work is submitted to the crate-owned Rayon
-pool through `AsyncWorkPool`; the public future remains runtime-neutral.
+Public async methods schedule CPU work, not file loading. `FileCatalog` already
+contains bytes in memory, and operation futures remain executor-neutral. Direct
+`.await` is the normal integration. A spawned task owns its request and the kit
+or an `Arc` clone; the resulting owning future and its output satisfy
+`Send + 'static`.
+
+Every operation awaits admission without blocking its executor and submits one
+complete root workflow to its kit's Rayon pool. `WorkParallelism::Fixed(n)`
+sets both the worker count and the maximum number of admitted root workflows.
+`RuntimeDefault` uses the worker count selected when Rayon builds the pool.
+Nested Rayon work remains part of its admitted root workflow.
+
+The admitted signature workflows are complete domain operations:
+
+- `check` parses the contract and source inventories, compares them, converts
+  the response, and renders any requested report in one worker operation.
+- `generate` parses source and renders the generated documents in one worker
+  operation.
+- `resolve_sketches` performs validation and source resolution in one worker
+  operation.
+- `diff` parses current and then previous contracts sequentially, computes the
+  semantic diff, and converts the response in one worker operation.
+
+Dropping a future before admission prevents submission. After submission but
+before execution, the worker checks for a canceled receiver and normally skips
+the job; the check is best effort. Finite work that has started runs to
+completion, although its result is discarded if the caller has gone away. A
+host timeout bounds waiting rather than CPU execution. Admission also does not
+bound how many pending tasks and owned catalogs a host creates, so services
+must apply request-level bounds. No FIFO scheduling guarantee is made.
+
+The work bridge completes through a runtime-neutral one-shot channel. Worker
+panics resume unwinding on the polling thread, while recoverable failures remain
+typed domain errors. Operations only transform owned in-memory catalogs, so a
+discarded result cannot leave partial external side effects.
 
 ## Dispatcher Rules
 
@@ -275,6 +327,15 @@ and keep concrete behavior in the owning subtree.
 Unit tests live next to the implementation they exercise. Public API and
 boundary tests live under `conkit-signature/tests`.
 
+`tests/public_api.rs` contains compile-time contracts for the public builder,
+kit, directly borrowed futures, and owning spawned-task shapes. Its existing
+executor-neutral behavioral tests remain in place. The local `work.rs` tests
+cover bounded admission, cancellation before admission, best-effort queued
+cancellation, run-to-completion after start, worker-thread execution, panic
+forwarding, and worker-channel loss. They coordinate with explicit channels,
+manual polling, and bounded completion guards rather than sleeps or production
+test seams.
+
 `conkit-signature/tests/public_api.rs` protects the architecture by exercising the
 public crate surface and scanning for forbidden boundary regressions, including:
 
@@ -294,4 +355,8 @@ Combined Rust YAML behavior is tested under
 `languages/rust/parser/yaml/tests/`. These unit tests cover rejection of the
 non-combined `version`/`language` shape, parsing of hand-authored canonical
 combined documents, global ownership/link validation, linked source
-resolution, and generated round trips against source inventories.
+resolution, and generated round trips against source inventories. They also
+cover repeated item-macro occurrence identity, numeric ordering beyond nine,
+label retention during regeneration, and occurrence-aware sketch resolution.
+The `files.rs` tests protect scalar-only `CatalogPath` Serde, legacy object-form
+rejection, and deterministic nonempty `FileCatalog` map-key round trips.

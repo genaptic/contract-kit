@@ -8,6 +8,8 @@ use std::fmt;
 /// `FileCatalog` is the crate boundary for source files, contract files,
 /// generated reports, and previous contract catalogs. It keeps entries sorted by
 /// [`CatalogPath`] and rejects duplicate paths instead of overwriting bytes.
+/// When serialized, validated catalog path strings are map keys in the same
+/// deterministic order.
 ///
 /// # Examples
 ///
@@ -18,14 +20,18 @@ use std::fmt;
 /// let lib = CatalogPath::new("src/lib.rs")?;
 /// let module = CatalogPath::new("src/a.rs")?;
 ///
-/// catalog.insert(lib.clone(), b"pub fn answer() -> u8 { 42 }\n".to_vec())?;
-/// catalog.insert(module.clone(), b"pub fn helper() {}\n".to_vec())?;
+/// catalog.insert(lib.clone(), b"lib".to_vec())?;
+/// catalog.insert(module.clone(), b"a".to_vec())?;
 ///
-/// assert_eq!(catalog.get(&lib), Some(&b"pub fn answer() -> u8 { 42 }\n"[..]));
+/// assert_eq!(catalog.get(&lib), Some(&b"lib"[..]));
 /// assert_eq!(
 ///     catalog.iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>(),
 ///     ["src/a.rs", "src/lib.rs"],
 /// );
+///
+/// let json = serde_json::to_string(&catalog)?;
+/// assert_eq!(json, r#"{"files":{"src/a.rs":[97],"src/lib.rs":[108,105,98]}}"#);
+/// assert_eq!(serde_json::from_str::<FileCatalog>(&json)?, catalog);
 ///
 /// let entries = catalog
 ///     .into_entries()
@@ -190,7 +196,9 @@ impl FileCatalog {
 /// A validated logical catalog path.
 ///
 /// Catalog paths are UTF-8, relative, use `/` separators, and are independent
-/// of the host operating system path format.
+/// of the host operating system path format. Serde encodes a catalog path as a
+/// scalar string and validates that string during deserialization; object forms
+/// are rejected.
 ///
 /// # Examples
 ///
@@ -201,15 +209,32 @@ impl FileCatalog {
 /// assert_eq!(path.as_str(), "contracts/rust/lib.yaml");
 /// assert_eq!(path.to_string(), "contracts/rust/lib.yaml");
 ///
+/// let json = serde_json::to_string(&path)?;
+/// assert_eq!(json, r#""contracts/rust/lib.yaml""#);
+/// assert_eq!(serde_json::from_str::<CatalogPath>(&json)?, path);
+/// assert!(serde_json::from_str::<CatalogPath>(
+///     r#"{"value":"contracts/rust/lib.yaml"}"#,
+/// )
+/// .is_err());
+///
 /// assert!(matches!(
 ///     CatalogPath::new("../lib.rs"),
 ///     Err(FileCatalogError::InvalidPath { .. })
 /// ));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct CatalogPath {
     value: String,
+}
+
+impl Serialize for CatalogPath {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 impl<'de> Deserialize<'de> for CatalogPath {
@@ -217,13 +242,8 @@ impl<'de> Deserialize<'de> for CatalogPath {
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        struct CatalogPathDocument {
-            value: String,
-        }
-
-        let document = CatalogPathDocument::deserialize(deserializer)?;
-        Self::new(document.value).map_err(serde::de::Error::custom)
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -388,21 +408,45 @@ mod tests {
     }
 
     #[test]
-    fn catalog_path_deserialization_rejects_invalid_object_value() {
-        let error = serde_json::from_str::<CatalogPath>(r#"{"value":"../escape.yaml"}"#)
+    fn catalog_path_deserialization_requires_a_valid_scalar() {
+        let path = serde_json::from_str::<CatalogPath>(r#""src/lib.rs""#)
+            .expect("valid scalar catalog path");
+        assert_eq!(path.as_str(), "src/lib.rs");
+
+        let error = serde_json::from_str::<CatalogPath>(r#""../escape.yaml""#)
             .expect_err("deserialization must preserve the catalog path invariant");
 
         assert!(error.to_string().contains("invalid catalog path"));
+
+        serde_json::from_str::<CatalogPath>(r#"{"value":"src/lib.rs"}"#)
+            .expect_err("the legacy object form must be rejected");
     }
 
     #[test]
-    fn catalog_path_serialization_preserves_object_shape() {
+    fn catalog_path_serializes_as_a_scalar() {
         let path = CatalogPath::new("src/lib.rs").expect("catalog path");
 
         assert_eq!(
             serde_json::to_string(&path).expect("serialize catalog path"),
-            r#"{"value":"src/lib.rs"}"#
+            r#""src/lib.rs""#
         );
+    }
+
+    #[test]
+    fn nonempty_catalog_json_round_trip_is_path_sorted() {
+        let mut catalog = FileCatalog::new();
+        catalog
+            .insert(CatalogPath::new("src/z.rs").expect("z path"), b"z".to_vec())
+            .expect("insert z");
+        catalog
+            .insert(CatalogPath::new("src/a.rs").expect("a path"), b"a".to_vec())
+            .expect("insert a");
+
+        let json = serde_json::to_string(&catalog).expect("serialize nonempty catalog");
+        assert_eq!(json, r#"{"files":{"src/a.rs":[97],"src/z.rs":[122]}}"#);
+
+        let reparsed = serde_json::from_str::<FileCatalog>(&json).expect("reparse catalog");
+        assert_eq!(reparsed, catalog);
     }
 
     #[test]

@@ -50,7 +50,10 @@ impl RustInventoryBuilder {
             syn::Item::Static(item) => {
                 Some(self.converter().convert_static(&self.context(), item)?)
             }
-            syn::Item::Macro(item) => Some(self.converter().convert_macro(&self.context(), item)?),
+            syn::Item::Macro(item) => {
+                let context = self.context();
+                Some(self.converter.convert_macro(&context, item)?)
+            }
             syn::Item::Type(item) => {
                 Some(self.converter().convert_type_alias(&self.context(), item)?)
             }

@@ -16,6 +16,15 @@ The Rust workspace has three members:
 Initial signature support targets Rust. Sketches are opt-in snippets linked
 from a named signature in the same combined contract document.
 
+## Releases and API documentation
+
+Versioned `conkit` executables for Linux, Windows, Intel macOS, and Apple
+Silicon macOS are published through
+[GitHub Releases](https://github.com/genaptic/contract-kit/releases). The two
+library crates are published separately to crates.io, with versioned API
+documentation at [conkit-signature on docs.rs](https://docs.rs/conkit-signature)
+and [conkit-sketch on docs.rs](https://docs.rs/conkit-sketch).
+
 ## Command-line interface
 
 ### Check contracts
@@ -129,6 +138,11 @@ sketches: []
 The one-entry map key (`answer_contract`) is the stable user label. Methods are
 nested below their owning type or trait; instance methods declare `receiver`,
 and items inside Rust modules declare `module_path`.
+
+Repeated Rust item macros that share the same source file, module path, and
+name remain distinct by declaration occurrence. Generation and regeneration
+preserve their user labels by occurrence, and a linked sketch resolves the
+corresponding macro occurrence.
 
 Implementation methods are folded into a source-declared local struct, enum,
 union, or type alias. Moving an implementation block or changing an equivalent

@@ -6,8 +6,8 @@ inventory_digest: 58d9f80e24c99ea0364c3c14b8e1204382b826c529de51ff62b47e8bf78aed
 diagnostics:
 - !Mismatched
   signature_id: answer
-  expected_digest: b4fe3f35e4835e39508ce338b09407d0dfcac82935f67b854a404f5315a1330b
-  actual_digest: d7db0211e2f6b6694a9c1a3e84695ea8b225c241fc9fdbd70ad08020e829e5d2
+  expected_digest: 2346e94bb75bfad6216cde584a70260cae93d9a0cba9e644da47c5331259edc3
+  actual_digest: b9ec9b1b50dcc7a0b33c63aa620fcfbb83536f83f35036e4e97c8a5c0fd2890c
 - !Missing
   signature_id: expected_only
 - !Extra

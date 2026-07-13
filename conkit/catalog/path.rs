@@ -174,6 +174,10 @@ impl ResolvedPath {
     }
 
     /// Returns a portable relative path from this location to `target`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the resolved paths do not share a filesystem prefix.
     pub(crate) fn relative_path_to(&self, target: &Self) -> Result<PathBuf, CliError> {
         let origin = self.resolved.components().collect::<Vec<_>>();
         let destination = target.resolved.components().collect::<Vec<_>>();
@@ -206,6 +210,10 @@ impl ResolvedPath {
     }
 
     /// Requires `candidate` to resolve within this path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `candidate` resolves outside this path.
     pub(super) fn ensure_within(&self, candidate: &Self) -> Result<(), CliError> {
         if self.contains(candidate) {
             Ok(())
@@ -218,6 +226,12 @@ impl ResolvedPath {
     }
 
     /// Requires a generated path to stay below this root without symlink descendants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path is not a normal lexical descendant, an
+    /// existing component is a symlink or cannot be resolved, or the resolved
+    /// path escapes this root.
     pub(super) fn ensure_generated_path(&self, path: &Path) -> Result<(), CliError> {
         let relative =
             path.strip_prefix(&self.original)
@@ -319,6 +333,11 @@ impl CatalogDirectory {
     ///
     /// The selected root may itself be a symlink when its target is a
     /// directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the root cannot be inspected or does not resolve to
+    /// an existing directory.
     pub(super) fn validate_directory(&self) -> Result<(), CliError> {
         match fs_err::symlink_metadata(&self.path) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
@@ -348,6 +367,12 @@ impl CatalogDirectory {
     }
 
     /// Converts a file below this root into a logical catalog path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is outside the root, contains a non-normal,
+    /// non-UTF-8, or nonportable component, or does not form a valid catalog
+    /// path.
     pub(super) fn logical_path(&self, file: &Path) -> Result<CatalogPath, CliError> {
         let relative = file
             .strip_prefix(&self.path)

@@ -1,7 +1,7 @@
 use crate::error::SignatureContractKitError;
 use crate::languages::rust::parser::inventory_builder::RustItemContext;
 use crate::languages::rust::parser::signature_id::{
-    RustImplementationId, RustItemId, RustItemKind,
+    RustImplementationId, RustItemId, RustItemIdAllocator, RustItemKind,
 };
 use crate::languages::rust::parser::type_converter::RustTypeConverter;
 use crate::languages::rust::parser::visibility_converter::RustVisibilityConverter;
@@ -29,6 +29,7 @@ use quote::ToTokens;
 #[derive(Default)]
 pub(super) struct RustItemConverter {
     visibility_converter: RustVisibilityConverter,
+    item_ids: RustItemIdAllocator,
 }
 
 impl RustItemConverter {
@@ -199,7 +200,7 @@ impl RustItemConverter {
     }
 
     pub(super) fn convert_macro(
-        &self,
+        &mut self,
         context: &RustItemContext,
         item: syn::ItemMacro,
     ) -> Result<RustParsedEntry, SignatureContractKitError> {
@@ -213,8 +214,9 @@ impl RustItemConverter {
             self.tokens(&item.mac),
         );
 
+        let id = self.item_id(context, RustItemKind::Macro, name);
         Ok(RustParsedEntry::new(
-            self.item_id(context, RustItemKind::Macro, name),
+            self.item_ids.allocate(id)?,
             RustSignature::Macro(signature),
         ))
     }

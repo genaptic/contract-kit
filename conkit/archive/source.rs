@@ -1,4 +1,10 @@
 //! Verified, bounded archive input for `conkit diff`.
+//!
+//! The final path component is opened atomically without following it: Unix
+//! uses `O_NOFOLLOW`, while Windows opens the reparse point itself instead of
+//! traversing it. Any opened handle is then verified to be a regular file. Its
+//! metadata length is only an early size check; a bounded reader enforces the
+//! compressed limit while reading from that same verified handle.
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read};
@@ -25,6 +31,11 @@ impl ArchiveSource {
 
     /// Reads and decodes the archived contract catalog through one verified
     /// regular-file handle.
+    ///
+    /// Opening atomically refuses to follow a final-component symlink on Unix
+    /// or reparse point on Windows. The handle's metadata length provides an
+    /// early size rejection, while bounded reading from that same handle
+    /// enforces the compressed archive limit if the file grows.
     ///
     /// # Errors
     ///
@@ -73,8 +84,30 @@ impl ArchiveSource {
             });
         }
 
-        let file = OpenOptions::new().read(true).open(&self.path)?;
-        if !file.metadata()?.is_file() {
+        self.open_without_following()
+    }
+
+    fn open_without_following(&self) -> Result<File, CliError> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+
+        let file = options.open(&self.path)?;
+        let metadata = file.metadata()?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(CliError::ArchiveNotRegularFile {
                 path: self.path.clone(),
             });
@@ -278,6 +311,24 @@ mod tests {
 
             drop(socket);
         }
+        temp.close().expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_open_does_not_follow_a_final_file_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temp dir");
+        let target = temp.path().join("target.gzip");
+        let link = temp.path().join("archive-link.gzip");
+        std::fs::write(&target, b"archive").expect("archive target");
+        symlink(&target, &link).expect("resolvable archive symlink");
+
+        ArchiveSource::new(link)
+            .open_without_following()
+            .expect_err("opening must atomically reject the final symlink");
+
         temp.close().expect("cleanup");
     }
 }

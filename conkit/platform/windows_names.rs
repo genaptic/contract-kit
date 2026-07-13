@@ -19,6 +19,11 @@ impl<'a> WindowsFileName<'a> {
     }
 
     /// Validates the component against Windows-specific restrictions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the component contains a forbidden character, ends
+    /// in a space or dot, or uses a reserved device name.
     pub(super) fn validate(&self) -> Result<(), CliError> {
         if let Some(character) = self.invalid_character() {
             return Err(CliError::WindowsInvalidFileNameCharacter {

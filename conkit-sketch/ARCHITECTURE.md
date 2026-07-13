@@ -89,9 +89,13 @@ values so callers choose where and how to persist them. Requests, responses,
 and their public enum fields remain serializable, deserializable, and
 comparable at this boundary.
 
-The builder configures the crate-owned CPU pool. `WorkParallelism::RuntimeDefault`
-lets Rayon choose its worker count, while `WorkParallelism::Fixed` accepts a
-nonzero explicit count.
+The builder configures the crate-owned CPU pool through the single
+`WorkOptions::parallelism` field. `WorkParallelism::RuntimeDefault` uses the
+worker count Rayon selects when building the pool, while
+`WorkParallelism::Fixed(n)` uses the caller's nonzero count. In both cases that
+same worker count is the per-kit root-operation admission capacity. Waiting
+callers acquire permits asynchronously; no second public capacity option or
+serialized field is required.
 
 ## Catalog Boundary
 
@@ -305,10 +309,32 @@ the local backend payload implement the same private
 so adding another backend is a compile-time-visible change.
 
 Public methods bridge into the handle's private trait implementation. The
-local implementation submits one finite top-level job to `AsyncWorkPool`.
-That pool owns a Rayon thread pool and sends the completed result through a
-futures oneshot channel. The returned future is not tied to Tokio or another
-async runtime, and the crate never calls `block_on` internally.
+local implementation calls `AsyncWorkPool::execute` exactly once per operation
+around a complete `SketchCheck`, `SketchGenerator`, or `SketchDiff` workflow.
+The pool first awaits an owned semaphore permit without blocking the caller's
+executor. It then submits the workflow to its Rayon pool and moves the permit
+into the worker closure, so queued and running jobs retain admission until they
+finish. The closure best-effort skips work when its oneshot receiver was
+already canceled, catches a job panic for forwarding, and sends the completed
+outcome through the runtime-neutral oneshot channel. A panic resumes on the
+thread polling the operation future; recoverable failures continue through the
+typed error boundary.
+
+Calling an operation directly with `.await` is the normal integration. A
+spawned task instead owns its request and kit, commonly through an `Arc` clone
+captured by `async move`; that owning future and its output satisfy
+`Send + 'static`. A future directly borrowing a local kit is not itself
+promised to be `'static`.
+
+Dropping before admission prevents submission. Dropping after submission but
+before execution allows a best-effort skip. Finite work which has started runs
+to completion, although its result may be discarded. Host deadlines therefore
+limit waiting rather than preempting CPU execution. Hosts must also bound the
+number of pending tasks and owned request catalogs they create; per-kit
+admission bounds only submitted root work. Neither semaphore admission nor
+Rayon scheduling promises FIFO order. Operations have no external side
+effects, so a discarded result cannot leave partial filesystem or network
+state.
 
 Within a check job, per-sketch matching may use Rayon parallel iteration.
 Deterministic sorting occurs before values cross the public boundary.
@@ -318,15 +344,17 @@ Deterministic sorting occurs before values cross the public boundary.
 - `lib.rs`: crate policy, module declarations, and intentional public
   re-exports.
 - `api.rs`: public requests/responses, builder, opaque handle, private backend
-  dispatch, and top-level check/generate/diff composition.
+  dispatch, top-level async work submission, and the `SketchCheck` and
+  current-then-previous `SketchDiff` workflow owners.
 - `files.rs`: `FileCatalog`, `CatalogPath`, deterministic catalog access, path
   validation, duplicate rejection, and catalog errors.
 - `error.rs`: the public builder/check/generate/diff error wrapper and
   contextual internal error construction.
 - `id.rs`: the private sketch-ID invariant plus contract and seed
   normalization.
-- `work.rs`: `WorkOptions`, `WorkParallelism`, the Rayon pool, and the
-  runtime-neutral oneshot result bridge.
+- `work.rs`: `WorkOptions`, `WorkParallelism`, bounded asynchronous root
+  admission, `AsyncWorkPool::execute`, permit-held queued and running work,
+  panic forwarding, and runtime-neutral oneshot completion.
 - `contract.rs`: the parsed document set, original-byte and passthrough
   preservation, strict validation, minimal signature-link indexing,
   catalog-wide uniqueness, targeted refresh/rendering, flattened sketch
@@ -338,7 +366,8 @@ Deterministic sorting occurs before values cross the public boundary.
 - `inventory.rs`: diagnostics, deterministic diagnostic ordering, counts,
   comparison invariants, and check-mode response construction.
 - `report.rs`: YAML and JSON report rendering into a returned catalog.
-- `generate.rs`: resolved-seed validation and generation orchestration.
+- `generate.rs`: `SketchGenerator`, resolved-seed validation, and generation
+  orchestration.
 - `tests/public_api.rs`: public API, async behavior, serialization, error
   context, generation/check round trips, and source-boundary scanners.
 
@@ -362,8 +391,19 @@ return through the public typed error. Match failures remain data in
 
 ## Tests And Boundary Scanners
 
-Unit tests live beside private implementation details. Public API and
-architecture regression tests live under `conkit-sketch/tests`.
+Unit tests live beside private implementation details. The local `work.rs`
+tests deterministically cover worker execution, bounded admission, cancellation
+before admission, best-effort queued cancellation, started-job completion,
+maximum active root work, panic forwarding, and worker-channel loss. Their
+coordination uses channels, atomics, explicit manual polling, and bounded wake
+guards rather than sleeps or production test seams.
+
+Public API and architecture regression tests live under `conkit-sketch/tests`.
+`tests/public_api.rs` asserts at compile time that directly borrowed operation
+futures are `Send`, that the public builder and kit satisfy their ownership
+contracts, and that `Arc`-owned spawned-operation futures and outputs satisfy
+`Send + 'static`. Existing executor-neutral behavioral tests continue to poll
+operations through the lightweight test executor.
 
 Together, unit and public API tests exercise malformed-byte normalization,
 catalog serde, async checking, both report formats, linked-sketch refresh,

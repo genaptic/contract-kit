@@ -134,6 +134,11 @@ impl ContractsStore {
     }
 
     /// Validates the reserved metadata directory and every recognized entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the contracts root cannot be inspected or the
+    /// reserved namespace has noncanonical spelling, shape, or entries.
     pub(super) fn validate_reserved_namespace(&self) -> Result<(), CliError> {
         let entries = match fs_err::read_dir(self.path()) {
             Ok(entries) => entries,
@@ -177,6 +182,11 @@ impl ContractsStore {
     }
 
     /// Removes only recognized abandoned atomic ownership-manifest writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata directory cannot be inspected, a
+    /// recognized temporary is not a file, or removal fails.
     pub(super) fn remove_abandoned_manifest_temporaries(&self) -> Result<(), CliError> {
         let directory = self.path().join(OwnershipManifest::DIRECTORY);
         let entries = match fs_err::read_dir(&directory) {
@@ -209,6 +219,12 @@ impl ContractsStore {
     }
 
     /// Maps and containment-checks one generated logical path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the logical path enters the reserved namespace, has
+    /// a nonportable component, encounters a symlink, or escapes the contracts
+    /// root.
     pub(super) fn validated_output_path(
         &self,
         root: &ResolvedPath,
@@ -231,6 +247,12 @@ impl ContractsStore {
     }
 
     /// Writes one file through an individually atomic replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if containment or symlink validation fails, parent
+    /// creation fails, or the atomic file cannot be opened, written, or
+    /// committed.
     pub(super) fn atomic_write(
         &self,
         root: &ResolvedPath,

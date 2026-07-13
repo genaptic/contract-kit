@@ -83,6 +83,11 @@ impl ContractsStore {
     /// Recovers an interrupted generated-document update before layout parsing.
     ///
     /// Missing or committed ownership requires no lock and creates no metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reserved namespace or ownership state is invalid,
+    /// the generation lock cannot be acquired, or recovery and persistence fail.
     pub(crate) fn recover_interrupted_generation(&self) -> Result<(), CliError> {
         self.validate_reserved_namespace()?;
         let needs_recovery = OwnershipDocument::load(self)?.is_updating();
@@ -492,6 +497,12 @@ impl Reservation {
 
 impl<'store> CatalogReconciliation<'store> {
     /// Locks, recovers, validates, and preflights one generated catalog update.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if locking or recovery fails, the generation baseline
+    /// changed, ownership or output paths are invalid, a destination conflicts
+    /// or aliases another output, or filesystem preflight fails.
     pub(super) fn new(
         store: &'store ContractsStore,
         generated: GeneratedContracts,
@@ -644,6 +655,12 @@ impl<'store> CatalogReconciliation<'store> {
     }
 
     /// Applies the preflighted update and commits its ownership manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if ownership serialization or persistence, output
+    /// reservation or mutation, post-write verification, or reservation
+    /// rollback fails.
     pub(super) fn apply(mut self) -> Result<GenerationReceipt, CliError> {
         let ownership_path = OwnershipManifest::path(self.store.path());
         let updating =

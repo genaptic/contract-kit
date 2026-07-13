@@ -11,6 +11,11 @@
 //! Rust signatures live in combined YAML documents with `root`, an exact
 //! `files` allowlist, user-named nested `signatures`, signature-to-sketch links,
 //! and flattened `sketches`. Versioned `language: rust` shorthand is rejected.
+//! Repeated item macros with the same file, module path, and semantic name use
+//! one-based declaration occurrence as their structural identity: the first
+//! occurrence is unsuffixed, followed by `#2`, `#3`, and so on. Regeneration
+//! retains user labels by occurrence, and linked-sketch resolution uses that
+//! same occurrence to return the exact Rust item text.
 //!
 //! # Operations
 //!
@@ -31,9 +36,18 @@
 //! crate. This crate validates and preserves signature-owned sketch-link
 //! metadata but does not generate sketch code or perform snippet matching.
 //!
-//! Start with [`SignatureContractKit::builder`] to configure the local kit and
-//! call the async operations. The futures are runtime-neutral; examples use
-//! `futures_executor::block_on` only to keep the doctests self-contained.
+//! # Async execution
+//!
+//! Start with [`SignatureContractKit::builder`] to configure the local kit.
+//! Public operation futures are executor-neutral, and direct `.await` is the
+//! normal integration. A task that is moved into an executor must own both its
+//! request and the kit, usually by moving an [`Arc`](std::sync::Arc) clone into
+//! an `async move` block. That owning task future and its output satisfy
+//! `Send + 'static`; an operation future called directly still borrows the kit.
+//!
+//! [`WorkOptions`] documents the complete worker-admission, cancellation, and
+//! timeout contract. Examples here use `futures_executor::block_on` only to
+//! remain self-contained; the crate does not select that executor for callers.
 //!
 //! # Examples
 //!

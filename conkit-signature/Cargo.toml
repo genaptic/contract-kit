@@ -2,6 +2,14 @@
 name = "conkit-signature"
 version.workspace = true
 edition.workspace = true
+description = "Runtime-neutral signature contracts for Contract Kit"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/conkit-signature"
+readme.workspace = true
+keywords = ["contracts", "rust", "validation"]
+categories = ["development-tools"]
 
 [lints]
 workspace = true
@@ -10,6 +18,7 @@ workspace = true
 path = "lib.rs"
 
 [dependencies]
+async-lock.workspace = true
 futures-channel = "0.3"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
@@ -23,3 +32,6 @@ thiserror = "2"
 
 [dev-dependencies]
 futures-executor = "0.3"
+
+[package.metadata.docs.rs]
+all-features = true

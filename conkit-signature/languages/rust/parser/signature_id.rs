@@ -1,5 +1,7 @@
+use crate::error::SignatureContractKitError;
 use crate::files::CatalogPath;
 use crate::inventory::SignatureId;
+use std::collections::BTreeMap;
 use std::fmt;
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -8,6 +10,7 @@ pub(crate) struct RustItemId {
     module_path: Vec<String>,
     kind: RustItemKind,
     name: String,
+    occurrence: usize,
 }
 
 impl RustItemId {
@@ -22,6 +25,7 @@ impl RustItemId {
             module_path,
             kind,
             name: name.into(),
+            occurrence: 1,
         }
     }
 
@@ -41,6 +45,10 @@ impl RustItemId {
         &self.name
     }
 
+    pub(crate) fn occurrence(&self) -> usize {
+        self.occurrence
+    }
+
     pub(crate) fn into_signature_id(self) -> SignatureId {
         SignatureId::new(self.render())
     }
@@ -52,7 +60,43 @@ impl RustItemId {
             format!("::{}", self.module_path.join("::"))
         };
 
-        format!("rust:{}{}:{}:{}", self.file, module, self.kind, self.name)
+        let occurrence = if self.occurrence == 1 {
+            String::new()
+        } else {
+            format!("#{}", self.occurrence)
+        };
+
+        format!(
+            "rust:{}{}:{}:{}{}",
+            self.file, module, self.kind, self.name, occurrence
+        )
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RustItemIdAllocator {
+    occurrences: BTreeMap<RustItemId, usize>,
+}
+
+impl RustItemIdAllocator {
+    pub(crate) fn allocate(
+        &mut self,
+        mut id: RustItemId,
+    ) -> Result<RustItemId, SignatureContractKitError> {
+        let occurrence = self
+            .occurrences
+            .get(&id)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(1)
+            .ok_or_else(|| {
+                SignatureContractKitError::conversion_failed(
+                    "Rust item occurrence count is exhausted",
+                )
+            })?;
+        self.occurrences.insert(id.clone(), occurrence);
+        id.occurrence = occurrence;
+        Ok(id)
     }
 }
 

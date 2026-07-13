@@ -71,6 +71,11 @@ struct DocumentHeader {
 
 impl ContractDocument {
     /// Parses one checked combined document and binds its root to `source`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the header is invalid, its declared root does not
+    /// resolve to `source`, or a listed source is not a portable Rust path.
     pub(super) fn parse(
         path: ContractDocumentPath,
         bytes: Vec<u8>,

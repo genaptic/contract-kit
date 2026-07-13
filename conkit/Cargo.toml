@@ -2,6 +2,12 @@
 name = "conkit"
 version.workspace = true
 edition.workspace = true
+description = "Contract Kit command-line interface"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = false
 
 [lints]
 workspace = true
@@ -26,6 +32,12 @@ conkit-signature = { path = "../conkit-signature" }
 conkit-sketch = { path = "../conkit-sketch" }
 thiserror = "2"
 walkdir = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 assert_cmd = "2"

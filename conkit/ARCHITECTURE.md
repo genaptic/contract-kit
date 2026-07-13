@@ -235,10 +235,11 @@ publication and that cleanup cannot later delete a recreated temporary.
 Publication failures explicitly clean the temporary and surface both the
 publication and cleanup errors when cleanup also fails.
 
-`archive/source.rs` opens an existing archive once, rejects symlinks and
-non-regular entries, and enforces the compressed-size limit while reading from
-that same handle. Metadata size is only an early rejection, so later growth or
-path replacement cannot cause an unbounded read or switch the decoded bytes.
+`archive/source.rs` opens an existing archive once with atomic final-component
+no-follow behavior, rejects symlinks and non-regular entries, and enforces the
+compressed-size limit while reading from that same handle. Metadata size is
+only an early rejection, so later growth or path replacement cannot cause an
+unbounded read or switch the decoded bytes.
 
 Diff validates paths, reads the current catalog, decodes the archive once,
 then directly awaits signature diff followed by sketch diff. Formatting and

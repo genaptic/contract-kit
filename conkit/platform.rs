@@ -20,6 +20,11 @@ pub(crate) struct PortablePathRules;
 
 impl PortablePathRules {
     /// Validates one component against the portable filename policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the component is not UTF-8 or violates the Windows
+    /// filename restrictions enforced on every platform.
     pub(crate) fn validate_component(component: &OsStr) -> Result<(), CliError> {
         let component = component.to_str().ok_or(CliError::NonUtf8PathComponent)?;
 

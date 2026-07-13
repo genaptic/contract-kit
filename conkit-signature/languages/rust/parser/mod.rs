@@ -29,7 +29,6 @@ use crate::languages::rust::types::struct_type::{StructCanonical, StructType};
 use crate::languages::rust::types::trait_type::{TraitCanonical, TraitType};
 use crate::languages::rust::types::type_alias_type::{TypeAliasCanonical, TypeAliasType};
 use crate::languages::rust::types::union_type::{UnionCanonical, UnionType};
-use crate::work::AsyncWorkPool;
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -725,149 +724,114 @@ enum RustSignatureCanonicalForm {
     TypeAlias(TypeAliasCanonical),
 }
 
-pub(crate) trait SignatureParserBackend {
-    async fn parse_check_inventories(
+pub(crate) trait SignatureParserBackend: Send + Sync {
+    fn parse_check_inventories(
         &self,
         source_files: FileCatalog,
         contract_files: FileCatalog,
-        work: AsyncWorkPool,
     ) -> Result<(SignatureInventory, SignatureInventory), SignatureContractKitError>;
 
-    async fn parse_contract_inventory(
+    fn parse_contract_inventory(
         &self,
         contract_files: FileCatalog,
-        work: AsyncWorkPool,
     ) -> Result<SignatureInventory, SignatureContractKitError>;
 
-    async fn generate_contract_files(
+    fn generate_contract_files(
         &self,
         source_files: FileCatalog,
         target: GenerateTarget,
         scope: ContractScope,
-        work: AsyncWorkPool,
     ) -> Result<GenerateResponse, SignatureContractKitError>;
 
-    async fn resolve_sketches(
+    fn resolve_sketches(
         &self,
         request: ResolveSketchesRequest,
-        work: AsyncWorkPool,
     ) -> Result<ResolveSketchesResponse, SignatureContractKitError>;
 }
 
 impl SignatureParserBackend for SignatureParser {
-    async fn parse_check_inventories(
+    fn parse_check_inventories(
         &self,
         source_files: FileCatalog,
         contract_files: FileCatalog,
-        work: AsyncWorkPool,
     ) -> Result<(SignatureInventory, SignatureInventory), SignatureContractKitError> {
         match &self.inner {
             SignatureParserInner::Rust(inner) => {
-                inner
-                    .parse_check_inventories(source_files, contract_files, work)
-                    .await
+                inner.parse_check_inventories(source_files, contract_files)
             }
         }
     }
 
-    async fn parse_contract_inventory(
+    fn parse_contract_inventory(
         &self,
         contract_files: FileCatalog,
-        work: AsyncWorkPool,
     ) -> Result<SignatureInventory, SignatureContractKitError> {
         match &self.inner {
-            SignatureParserInner::Rust(inner) => {
-                inner.parse_contract_inventory(contract_files, work).await
-            }
+            SignatureParserInner::Rust(inner) => inner.parse_contract_inventory(contract_files),
         }
     }
 
-    async fn generate_contract_files(
+    fn generate_contract_files(
         &self,
         source_files: FileCatalog,
         target: GenerateTarget,
         scope: ContractScope,
-        work: AsyncWorkPool,
     ) -> Result<GenerateResponse, SignatureContractKitError> {
         match &self.inner {
             SignatureParserInner::Rust(inner) => {
-                inner
-                    .generate_contract_files(source_files, target, scope, work)
-                    .await
+                inner.generate_contract_files(source_files, target, scope)
             }
         }
     }
 
-    async fn resolve_sketches(
+    fn resolve_sketches(
         &self,
         request: ResolveSketchesRequest,
-        work: AsyncWorkPool,
     ) -> Result<ResolveSketchesResponse, SignatureContractKitError> {
         match &self.inner {
-            SignatureParserInner::Rust(inner) => inner.resolve_sketches(request, work).await,
+            SignatureParserInner::Rust(inner) => inner.resolve_sketches(request),
         }
     }
 }
 
 struct RustParser;
-
 impl SignatureParserBackend for RustParser {
-    async fn parse_check_inventories(
+    fn parse_check_inventories(
         &self,
         source_files: FileCatalog,
         contract_files: FileCatalog,
-        work: AsyncWorkPool,
     ) -> Result<(SignatureInventory, SignatureInventory), SignatureContractKitError> {
-        work.submit(move || {
-            let contracts = yaml::RustContractDocuments::parse(contract_files)?;
-            let allowlist = contracts.source_allowlist();
-            let source = RustSourceFiles::from_catalog(source_files)
-                .retain_allowlist(&allowlist)?
-                .parse_all()?;
-            let contract = contracts.into_inventory()?;
-            Ok((source, contract))
-        })
-        .into_result()
-        .await
-        .map_err(|source| SignatureContractKitError::worker_failed(source.to_string()))?
+        let contracts = yaml::RustContractDocuments::parse(contract_files)?;
+        let allowlist = contracts.source_allowlist();
+        let source = RustSourceFiles::from_catalog(source_files)
+            .retain_allowlist(&allowlist)?
+            .parse_all()?;
+        let contract = contracts.into_inventory()?;
+        Ok((source, contract))
     }
 
-    async fn parse_contract_inventory(
+    fn parse_contract_inventory(
         &self,
         contract_files: FileCatalog,
-        work: AsyncWorkPool,
     ) -> Result<SignatureInventory, SignatureContractKitError> {
-        work.submit(move || yaml::RustContractDocuments::parse(contract_files)?.into_inventory())
-            .into_result()
-            .await
-            .map_err(|source| SignatureContractKitError::worker_failed(source.to_string()))?
+        yaml::RustContractDocuments::parse(contract_files)?.into_inventory()
     }
 
-    async fn generate_contract_files(
+    fn generate_contract_files(
         &self,
         source_files: FileCatalog,
         target: GenerateTarget,
         scope: ContractScope,
-        work: AsyncWorkPool,
     ) -> Result<GenerateResponse, SignatureContractKitError> {
-        work.submit(move || {
-            let parsed = RustSourceFiles::from_catalog(source_files).parse_all_for_yaml()?;
+        let parsed = RustSourceFiles::from_catalog(source_files).parse_all_for_yaml()?;
 
-            yaml::RustYamlRenderer::new(parsed, target, scope).render()
-        })
-        .into_result()
-        .await
-        .map_err(|source| SignatureContractKitError::worker_failed(source.to_string()))?
+        yaml::RustYamlRenderer::new(parsed, target, scope).render()
     }
 
-    async fn resolve_sketches(
+    fn resolve_sketches(
         &self,
         request: ResolveSketchesRequest,
-        work: AsyncWorkPool,
     ) -> Result<ResolveSketchesResponse, SignatureContractKitError> {
-        work.submit(move || yaml::RustSketchResolver::new(request).resolve())
-            .into_result()
-            .await
-            .map_err(|source| SignatureContractKitError::worker_failed(source.to_string()))?
+        yaml::RustSketchResolver::new(request).resolve()
     }
 }

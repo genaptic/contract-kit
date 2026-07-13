@@ -285,6 +285,51 @@ sketches:
 }
 
 #[test]
+fn linked_sketch_resolver_selects_each_macro_occurrence() {
+    let source = catalog_with(
+        "lib.rs",
+        b"include!(\"first.rs\");\ninclude!(\"second.rs\");\n",
+    );
+    let contracts = catalog_with(
+        "main.yml",
+        br#"root: ../src
+files: [lib.rs]
+signatures:
+  - first_include:
+      file: lib.rs
+      signature_type: macro
+      name: include
+      sketch: first
+  - second_include:
+      file: lib.rs
+      signature_type: macro
+      name: include
+      sketch: second
+sketches:
+  - first:
+    signature_type: macro
+    code: old
+  - second:
+    signature_type: macro
+    code: old
+"#,
+    );
+
+    let response = RustSketchResolver::new(ResolveSketchesRequest {
+        source_files: source,
+        contract_files: contracts,
+    })
+    .resolve()
+    .expect("repeated macro sketches must resolve");
+
+    assert_eq!(response.seeds.len(), 2);
+    assert_eq!(response.seeds[0].sketch_id, "first");
+    assert_eq!(response.seeds[0].code, "include!(\"first.rs\");");
+    assert_eq!(response.seeds[1].sketch_id, "second");
+    assert_eq!(response.seeds[1].code, "include!(\"second.rs\");");
+}
+
+#[test]
 fn orphan_and_mismatched_sketch_links_are_rejected() {
     let error = contract_inventory(catalog_with(
         "main.yml",

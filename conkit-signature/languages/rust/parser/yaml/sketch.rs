@@ -195,7 +195,11 @@ impl<'a> RustSketchItemFinder<'a> {
             })?;
             return self.find_in(remainder, nested);
         }
-        items.iter().find(|item| self.matches(item))
+        let occurrence = self.id.occurrence().checked_sub(1)?;
+        items
+            .iter()
+            .filter(|item| self.matches(item))
+            .nth(occurrence)
     }
 
     fn matches(&self, item: &syn::Item) -> bool {

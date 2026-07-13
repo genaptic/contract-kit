@@ -3,7 +3,7 @@ use crate::error::SignatureContractKitError;
 use crate::files::CatalogPath;
 use crate::inventory::SignatureInventory;
 use crate::languages::rust::parser::signature_id::{
-    RustImplementationId, RustItemId, RustItemKind,
+    RustImplementationId, RustItemId, RustItemIdAllocator, RustItemKind,
 };
 use crate::languages::rust::parser::{RustParsedEntry, RustSignature};
 use crate::languages::rust::types::base_type::BaseType;
@@ -117,9 +117,10 @@ impl RustYamlDocumentInput {
             .map(|file| file.to_catalog_path())
             .collect::<Vec<_>>();
         let mut signatures = Vec::new();
+        let mut item_ids = RustItemIdAllocator::default();
 
         for signature in self.signatures {
-            signatures.push(signature.into_named(catalog_name)?);
+            signatures.push(signature.into_named(catalog_name, &mut item_ids)?);
         }
         RustYamlDocumentValidator::new(catalog_name, &files, &signatures, &self.sketches)
             .validate()?;
@@ -162,6 +163,7 @@ impl RustYamlShorthandEntry {
     fn into_named(
         self,
         catalog_name: &CatalogPath,
+        item_ids: &mut RustItemIdAllocator,
     ) -> Result<RustYamlNamedSignature, SignatureContractKitError> {
         if self.0.len() != 1 {
             return Err(SignatureContractKitError::parse_failed(
@@ -177,7 +179,7 @@ impl RustYamlShorthandEntry {
             ));
         };
 
-        signature.into_named(label, catalog_name)
+        signature.into_named(label, catalog_name, item_ids)
     }
 }
 
@@ -391,12 +393,13 @@ impl RustYamlShorthandSignature {
         self,
         label: String,
         catalog_name: &CatalogPath,
+        item_ids: &mut RustItemIdAllocator,
     ) -> Result<RustYamlNamedSignature, SignatureContractKitError> {
         let Self { common, body } = self;
         let file = common.file.to_catalog_path();
         let signature_type = body.signature_type();
         let sketch = common.sketch.clone();
-        let entries = body.into_entries(&common, label.clone(), catalog_name)?;
+        let entries = body.into_entries(&common, label.clone(), catalog_name, item_ids)?;
 
         Ok(RustYamlNamedSignature {
             label,
@@ -428,6 +431,7 @@ impl RustYamlSignatureBodyInput {
         common: &RustYamlSignatureCommonInput,
         label: String,
         catalog_name: &CatalogPath,
+        item_ids: &mut RustItemIdAllocator,
     ) -> Result<Vec<RustParsedEntry>, SignatureContractKitError> {
         match self {
             Self::MainMethod(value) => {
@@ -449,7 +453,12 @@ impl RustYamlSignatureBodyInput {
             Self::Trait(value) => value.into_entries(common, label, catalog_name),
             Self::Union(value) => value.into_entries(common, label, catalog_name),
             Self::Static(value) => Ok(vec![value.into_entry(common, label, catalog_name)?]),
-            Self::Macro(value) => Ok(vec![value.into_entry(common, label, catalog_name)?]),
+            Self::Macro(value) => Ok(vec![value.into_entry(
+                common,
+                label,
+                catalog_name,
+                item_ids,
+            )?]),
             Self::TypeAlias(value) => value.into_entries(common, label, catalog_name),
         }
     }
@@ -487,14 +496,15 @@ impl RustYamlSignatureCommonInput {
     }
 
     fn entry(&self, kind: RustItemKind, name: String, signature: RustSignature) -> RustParsedEntry {
-        RustParsedEntry::new(
-            RustItemId::new(
-                self.file.to_catalog_path(),
-                self.module_path.clone(),
-                kind,
-                name,
-            ),
-            signature,
+        RustParsedEntry::new(self.id(kind, name), signature)
+    }
+
+    fn id(&self, kind: RustItemKind, name: String) -> RustItemId {
+        RustItemId::new(
+            self.file.to_catalog_path(),
+            self.module_path.clone(),
+            kind,
+            name,
         )
     }
 
@@ -832,16 +842,15 @@ impl RustYamlMacroInput {
         common: &RustYamlSignatureCommonInput,
         label: String,
         catalog_name: &CatalogPath,
+        item_ids: &mut RustItemIdAllocator,
     ) -> Result<RustParsedEntry, SignatureContractKitError> {
         let name = common.item_name(label);
-        Ok(common.entry(
-            RustItemKind::Macro,
-            name.clone(),
-            RustSignature::Macro(MacroType::new(
-                common.base(name, Visibility::Private, catalog_name)?,
-                self.tokens.unwrap_or_default(),
-            )),
-        ))
+        let id = common.id(RustItemKind::Macro, name.clone());
+        let signature = RustSignature::Macro(MacroType::new(
+            common.base(name, Visibility::Private, catalog_name)?,
+            self.tokens.unwrap_or_default(),
+        ));
+        Ok(RustParsedEntry::new(item_ids.allocate(id)?, signature))
     }
 }
 

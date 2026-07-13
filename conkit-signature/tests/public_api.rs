@@ -1,9 +1,113 @@
 use conkit_signature::{
     CatalogPath, CheckDiagnostic, CheckMode, CheckRequest, ContractScope, DiffEntry, DiffRequest,
     FileCatalog, GenerateDocument, GenerateRequest, GenerateTarget, ReportFormat, ReportRequest,
-    ResolveSketchesRequest, SignatureContractKitBuilder, WorkOptions, WorkParallelism,
+    ResolveSketchesRequest, SignatureContractKit, SignatureContractKitBuilder, WorkOptions,
+    WorkParallelism,
 };
+use std::future::Future;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+
+mod spawn_compatibility {
+    use super::*;
+
+    struct SpawnContract;
+
+    impl SpawnContract {
+        fn assert_send<F>(future: F)
+        where
+            F: Future + Send,
+        {
+            drop(future);
+        }
+
+        fn assert_spawn_compatible<F>(future: F)
+        where
+            F: Future + Send + 'static,
+            F::Output: Send + 'static,
+        {
+            drop(future);
+        }
+
+        fn assert_send_static<T: Send + 'static>() {}
+
+        fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+
+        fn check_request() -> CheckRequest {
+            CheckRequest {
+                source_files: FileCatalog::new(),
+                contract_files: FileCatalog::new(),
+                report: ReportRequest::None,
+                scope: ContractScope::Signatures,
+                mode: CheckMode::Default,
+            }
+        }
+
+        fn generate_request() -> GenerateRequest {
+            GenerateRequest {
+                source_files: FileCatalog::new(),
+                target: GenerateTarget::New(GenerateDocument {
+                    contract_file: CatalogPath::new("main.yml").expect("contract path"),
+                    root: "../src".to_owned(),
+                    files: vec![CatalogPath::new("lib.rs").expect("source path")],
+                }),
+                scope: ContractScope::Signatures,
+            }
+        }
+
+        fn resolve_sketches_request() -> ResolveSketchesRequest {
+            ResolveSketchesRequest {
+                source_files: FileCatalog::new(),
+                contract_files: FileCatalog::new(),
+            }
+        }
+
+        fn diff_request() -> DiffRequest {
+            DiffRequest {
+                current_contract_files: FileCatalog::new(),
+                previous_contract_files: FileCatalog::new(),
+            }
+        }
+
+        fn assert_public_contracts() {
+            Self::assert_send_static::<SignatureContractKitBuilder>();
+            Self::assert_send_sync_static::<SignatureContractKit>();
+
+            let kit = SignatureContractKitBuilder::default().build().expect("kit");
+            Self::assert_send(kit.check(Self::check_request()));
+            Self::assert_send(kit.generate(Self::generate_request()));
+            Self::assert_send(kit.resolve_sketches(Self::resolve_sketches_request()));
+            Self::assert_send(kit.diff(Self::diff_request()));
+
+            let kit = Arc::new(kit);
+
+            let task_kit = Arc::clone(&kit);
+            Self::assert_spawn_compatible(
+                async move { task_kit.check(Self::check_request()).await },
+            );
+
+            let task_kit = Arc::clone(&kit);
+            Self::assert_spawn_compatible(async move {
+                task_kit.generate(Self::generate_request()).await
+            });
+
+            let task_kit = Arc::clone(&kit);
+            Self::assert_spawn_compatible(async move {
+                task_kit
+                    .resolve_sketches(Self::resolve_sketches_request())
+                    .await
+            });
+
+            let task_kit = Arc::clone(&kit);
+            Self::assert_spawn_compatible(async move { task_kit.diff(Self::diff_request()).await });
+        }
+    }
+
+    #[test]
+    fn public_operations_support_send_and_owning_spawn_contracts() {
+        SpawnContract::assert_public_contracts();
+    }
+}
 
 mod builder_tests {
     use super::*;

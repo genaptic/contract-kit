@@ -11,8 +11,8 @@
       {
         "Mismatched": {
           "signature_id": "answer",
-          "expected_digest": "64cecf908d0a6dad55bf6548834eb5903cda0098ccb9cdd88c4b15e0048ca902",
-          "actual_digest": "96313745c6ad6d6927236c2bd20e2bbe4d9b164309c30b79cbe92f419101e1d6"
+          "expected_digest": "e8524342cded04bc131db0341ac01f35898b1ee580fedece9d38fae73e17ef75",
+          "actual_digest": "037d129e5057d531061964ec84e89d9deade051c019214bb74136036c4a513ad"
         }
       }
     ]

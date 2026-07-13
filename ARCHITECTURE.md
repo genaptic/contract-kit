@@ -42,6 +42,16 @@ signature-link index for link validation, normalization, and matching without
 depending on the signature crate. The CLI adapts signature seeds into sketch
 requests while keeping the domains independent.
 
+## Domain runtime boundary
+
+Both domain kits expose executor-neutral async operations over owned in-memory
+catalogs. Each operation asynchronously awaits per-kit admission, then runs one
+complete root workflow on a reusable Rayon pool. The selected worker count is
+both the worker budget and the admitted-root capacity. Callers own bounds on
+the pending tasks and catalogs they create, as well as their waiting deadlines;
+a deadline does not preempt finite CPU work that has already started. Detailed
+cancellation and worker behavior belongs in each domain crate's architecture.
+
 ## Command orchestration
 
 The CLI grammar lives in `conkit/args.rs`. Async dispatch and adaptation to

@@ -21,6 +21,11 @@ pub(crate) struct SourceTree {
 
 impl SourceTree {
     /// Opens and validates a source root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be inspected or does not resolve to
+    /// an existing directory.
     pub(crate) fn open(path: PathBuf) -> Result<Self, CliError> {
         let directory = CatalogDirectory::source(path);
         directory.validate_directory()?;
@@ -33,6 +38,11 @@ impl SourceTree {
     }
 
     /// Reads every Rust source file below this root in deterministic order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the root is invalid, traversal or reading fails, a
+    /// discovered path is not portable, or duplicate logical paths occur.
     pub(crate) fn read_rust_sources(&self) -> Result<FileCatalog, CliError> {
         self.directory.validate_directory()?;
 
@@ -65,6 +75,12 @@ impl SourceTree {
     /// again for valid components and containment, and compared with the
     /// current path identity. Its bytes are then read through that same opened
     /// handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the root or a selected path is invalid, unavailable,
+    /// outside the root, a symlink, not a regular file, changes during opening,
+    /// cannot be read, or duplicates a logical catalog path.
     pub(crate) fn read_selected(&self, selected: &[CatalogPath]) -> Result<FileCatalog, CliError> {
         self.directory.validate_directory()?;
         let root = ResolvedPath::new(PathRole::Source, self.directory.path().to_path_buf())?;

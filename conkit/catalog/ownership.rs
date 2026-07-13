@@ -124,6 +124,11 @@ impl OwnershipManifest {
     }
 
     /// Parses and validates a version-3 ownership manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes are not a valid version-3 manifest or its
+    /// generation, document paths, digests, ordering, or transition is invalid.
     pub(super) fn from_bytes(path: &Path, bytes: &[u8]) -> Result<Self, CliError> {
         let manifest = serde_json::from_slice::<Self>(bytes).map_err(|source| {
             CliError::InvalidGeneratedOwnership {
@@ -136,6 +141,10 @@ impl OwnershipManifest {
     }
 
     /// Validates and serializes this manifest as pretty JSON plus one newline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest is invalid or JSON serialization fails.
     pub(super) fn to_bytes(&self, path: &Path) -> Result<Vec<u8>, CliError> {
         self.validate(path)?;
         let mut bytes = serde_json::to_vec_pretty(self).map_err(|source| {
@@ -204,6 +213,11 @@ impl OwnedCatalog {
     }
 
     /// Validates paths, digests, portable identity, and deterministic sorting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a document path or digest is invalid, paths collide
+    /// under portable identity, or entries are not uniquely sorted.
     pub(super) fn validate(&self, manifest_path: &Path) -> Result<(), CliError> {
         let mut keys = BTreeMap::<PortableCatalogPathKey, String>::new();
         for file in self.entries() {
@@ -237,6 +251,11 @@ impl OwnedCatalog {
     }
 
     /// Rejects case-only path changes across an ownership transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a previous path is invalid or the transition changes
+    /// only the case of a portable path.
     pub(super) fn validate_transition(
         &self,
         after: &Self,
@@ -337,6 +356,10 @@ impl ContentDigest {
 
 impl VersionProbe {
     /// Parses only the ownership version before version-specific decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes do not contain a valid JSON version probe.
     pub(super) fn from_bytes(path: &Path, bytes: &[u8]) -> Result<Self, CliError> {
         serde_json::from_slice(bytes).map_err(|source| CliError::InvalidGeneratedOwnership {
             path: path.to_path_buf(),
@@ -362,6 +385,10 @@ impl<'file> ReservationMarker<'file> {
     }
 
     /// Serializes this marker as compact JSON plus one newline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reservation marker cannot be serialized as JSON.
     pub(super) fn to_bytes(&self) -> Result<Vec<u8>, CliError> {
         let mut bytes =
             serde_json::to_vec(self).map_err(|source| CliError::InvalidGeneratedOwnership {

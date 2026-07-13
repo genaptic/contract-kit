@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  formatting:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Select the repository toolchain
+        run: rustup show active-toolchain
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  rust:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-latest
+          - name: Windows
+            runner: windows-latest
+          - name: macOS
+            runner: macos-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Select the repository toolchain
+        run: rustup show active-toolchain
+
+      - name: Check every target and feature
+        run: cargo check --locked --workspace --all-targets --all-features
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run rustdoc tests
+        run: cargo test --locked --workspace --doc
+
+      - name: Run workspace tests
+        run: cargo test --locked --workspace --all-targets
+
+  required:
+    name: Required
+    if: always()
+    needs: [formatting, rust]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every CI job
+        env:
+          FORMATTING_RESULT: ${{ needs.formatting.result }}
+          RUST_RESULT: ${{ needs.rust.result }}
+        run: |
+          test "$FORMATTING_RESULT" = success
+          test "$RUST_RESULT" = success

@@ -1,7 +1,8 @@
-use super::super::RustYamlRenderer;
+use super::super::{RustContractDocuments, RustYamlRenderer};
 use super::{RustYamlTestFixture, catalog, catalog_with, contract_inventory, rendered};
 use crate::api::{ContractScope, GenerateDocument, GenerateTarget};
 use crate::files::CatalogPath;
+use crate::inventory::InventoryDiffEntry;
 use crate::languages::rust::parser::{RustParsedFiles, RustSourceFiles};
 use crate::languages::rust::source::RustSourceFile;
 
@@ -108,6 +109,156 @@ where
     let fixture = RustYamlTestFixture::new(source);
     let generated = fixture.render_new("main.yml", &["lib.rs"]);
     fixture.assert_generated_matches_source(generated.contract_files);
+}
+
+#[test]
+fn repeated_macro_invocations_receive_stable_occurrence_ids() {
+    let fixture = RustYamlTestFixture::new(catalog_with(
+        "lib.rs",
+        br#"macro_rules! include { () => {}; }
+include!("shared.rs");
+include!("shared.rs");
+"#,
+    ));
+    let expected = [
+        "rust:lib.rs:macro:include",
+        "rust:lib.rs:macro:include#2",
+        "rust:lib.rs:macro:include#3",
+    ];
+    let parsed = fixture.parsed_for_yaml();
+    let ids = parsed
+        .files()
+        .iter()
+        .flat_map(|file| file.entries())
+        .map(|entry| entry.id().render())
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, expected);
+
+    let edited = RustSourceFiles::from_catalog(catalog_with(
+        "lib.rs",
+        br#"include!("third.rs");
+macro_rules! include { () => {}; }
+include!("first.rs");
+"#,
+    ))
+    .parse_all_for_yaml()
+    .expect("edited repeated macros");
+    let edited_ids = edited
+        .files()
+        .iter()
+        .flat_map(|file| file.entries())
+        .map(|entry| entry.id().render())
+        .collect::<Vec<_>>();
+
+    assert_eq!(edited_ids, expected);
+
+    let generated = fixture.render_new("main.yml", &["lib.rs"]);
+    fixture.assert_generated_matches_source(generated.contract_files);
+}
+
+#[test]
+fn repeated_macro_round_trip_preserves_numeric_occurrence_order() {
+    let source = (1..=11)
+        .map(|ordinal| format!("include!(\"{ordinal}.rs\");\n"))
+        .collect::<String>();
+    let fixture = RustYamlTestFixture::new(catalog_with("lib.rs", source.as_bytes()));
+    let expected = (1..=11)
+        .map(|ordinal| {
+            if ordinal == 1 {
+                "rust:lib.rs:macro:include".to_owned()
+            } else {
+                format!("rust:lib.rs:macro:include#{ordinal}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let source_ids = fixture
+        .parsed_for_yaml()
+        .files()
+        .iter()
+        .flat_map(|file| file.entries())
+        .map(|entry| entry.id().render())
+        .collect::<Vec<_>>();
+
+    assert_eq!(source_ids, expected);
+
+    let generated = fixture.render_new("main.yml", &["lib.rs"]);
+    let reparsed = RustContractDocuments::parse(generated.contract_files.clone())
+        .expect("generated repeated macro contract");
+    let reparsed_ids = reparsed
+        .documents
+        .iter()
+        .flat_map(|document| document.document.signatures.iter())
+        .filter_map(|signature| signature.entries.first())
+        .map(|entry| entry.id().render())
+        .collect::<Vec<_>>();
+
+    assert_eq!(reparsed_ids, expected);
+    fixture.assert_generated_matches_source(generated.contract_files);
+}
+
+#[test]
+fn repeated_macro_regeneration_retains_labels_by_occurrence() {
+    let previous = RustYamlTestFixture::new(catalog_with(
+        "lib.rs",
+        b"include!(\"alpha.rs\");\ninclude!(\"beta.rs\");\n",
+    ));
+    let current = RustYamlTestFixture::new(catalog_with(
+        "lib.rs",
+        b"include!(\"beta.rs\");\ninclude!(\"alpha-v2.rs\");\n",
+    ));
+    let existing = catalog_with(
+        "main.yml",
+        br#"root: ../src
+files: [lib.rs]
+signatures:
+  - first_include:
+      file: lib.rs
+      signature_type: macro
+      name: include
+      visibility: private
+      tokens: include ! ("alpha.rs")
+  - second_include:
+      file: lib.rs
+      signature_type: macro
+      name: include
+      visibility: private
+      tokens: include ! ("beta.rs")
+sketches: []
+"#,
+    );
+
+    let diff = current
+        .source_inventory()
+        .diff_against(previous.source_inventory())
+        .expect("repeated macro diff");
+    assert_eq!(diff.entries().len(), 2, "{:#?}", diff.entries());
+    assert!(
+        diff.entries()
+            .iter()
+            .all(|entry| matches!(entry, InventoryDiffEntry::Changed { .. })),
+        "{:#?}",
+        diff.entries()
+    );
+
+    let generated = current.render_existing(existing);
+    let yaml = rendered(&generated.contract_files, "main.yml");
+    let first = yaml
+        .split("- first_include:")
+        .nth(1)
+        .and_then(|value| value.split("- second_include:").next())
+        .expect("first retained macro label");
+    let second = yaml
+        .split("- second_include:")
+        .nth(1)
+        .expect("second retained macro label");
+
+    assert!(first.contains("tokens: include ! (\"beta.rs\")"), "{yaml}");
+    assert!(
+        second.contains("tokens: include ! (\"alpha-v2.rs\")"),
+        "{yaml}"
+    );
+    current.assert_generated_matches_source(generated.contract_files);
 }
 
 #[test]

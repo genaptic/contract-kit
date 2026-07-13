@@ -1,0 +1,523 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version without the leading v (for example, 0.0.1)
+        required: true
+        default: 0.0.1
+        type: string
+      bootstrap_crates_io:
+        description: Use the one-time crates.io token instead of trusted publishing
+        required: true
+        default: true
+        type: boolean
+      confirm_release:
+        description: Confirm permanent crates.io publication and a public GitHub Release
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Validate release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate the requested version and release state
+        id: version
+        shell: bash
+        env:
+          CONFIRM_RELEASE: ${{ inputs.confirm_release }}
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Release runs must be dispatched from main, not $GITHUB_REF." >&2
+            exit 1
+          fi
+
+          if [[ "$CONFIRM_RELEASE" != "true" ]]; then
+            echo "confirm_release must be selected." >&2
+            exit 1
+          fi
+
+          if [[ ! "$REQUESTED_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Version must be stable SemVer in X.Y.Z form." >&2
+            exit 1
+          fi
+
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          package_count="$(jq '[.packages[] | select(.name == "conkit" or .name == "conkit-signature" or .name == "conkit-sketch")] | length' <<<"$metadata")"
+          workspace_version="$(jq -r '[.packages[] | select(.name == "conkit" or .name == "conkit-signature" or .name == "conkit-sketch") | .version] | unique | if length == 1 then .[0] else empty end' <<<"$metadata")"
+
+          if [[ "$package_count" != "3" || "$workspace_version" != "$REQUESTED_VERSION" ]]; then
+            echo "All three workspace packages must have version $REQUESTED_VERSION." >&2
+            exit 1
+          fi
+
+          conkit_publish="$(jq -c '.packages[] | select(.name == "conkit") | .publish' <<<"$metadata")"
+          if [[ "$conkit_publish" != "[]" ]]; then
+            echo "The conkit binary package must remain publish = false." >&2
+            exit 1
+          fi
+
+          licensed_library_count="$(jq '[.packages[] | select(
+            (.name == "conkit-signature" or .name == "conkit-sketch")
+            and .license == "Apache-2.0"
+          )] | length' <<<"$metadata")"
+          if [[ "$licensed_library_count" != "2" ]]; then
+            echo "Both publishable libraries must retain Apache-2.0 metadata." >&2
+            exit 1
+          fi
+
+          tag="v$REQUESTED_VERSION"
+          remote_tag="$(git ls-remote origin "refs/tags/$tag")"
+          if [[ -n "$remote_tag" ]]; then
+            git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+            tag_commit="$(git rev-list -n 1 "$tag")"
+            if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+              echo "$tag already points to $tag_commit, not $GITHUB_SHA." >&2
+              exit 1
+            fi
+          fi
+
+          if release_json="$(gh release view "$tag" --json isDraft 2>/dev/null)"; then
+            if [[ "$(jq -r '.isDraft' <<<"$release_json")" != "true" ]]; then
+              echo "A public GitHub Release already exists for $tag." >&2
+              exit 1
+            fi
+            echo "Resuming the existing draft release for $tag."
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$REQUESTED_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release-note labels
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          for label in breaking-change ignore-for-release dependencies; do
+            if ! gh api --silent "repos/$GITHUB_REPOSITORY/labels/$label"; then
+              echo "Required release-note label '$label' is missing." >&2
+              echo "Provision the labels documented in RELEASING.md before releasing." >&2
+              exit 1
+            fi
+          done
+
+      - name: Select the repository toolchain
+        run: rustup show active-toolchain
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check every target and feature
+        run: cargo check --locked --workspace --all-targets --all-features
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run rustdoc tests
+        run: cargo test --locked --workspace --doc
+
+      - name: Run workspace tests
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Verify and dry-run the library packages
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          for crate in conkit-signature conkit-sketch; do
+            package_files="$(cargo package --locked --list -p "$crate")"
+            if ! grep --fixed-strings --line-regexp --quiet 'LICENSE' <<<"$package_files"; then
+              echo "$crate $VERSION does not package a top-level LICENSE file." >&2
+              exit 1
+            fi
+
+            cargo package --locked --no-verify -p "$crate"
+            archive="target/package/$crate-$VERSION.crate"
+            if ! tar -xOzf "$archive" "$crate-$VERSION/LICENSE" | cmp --silent LICENSE -; then
+              echo "$crate $VERSION does not package the repository LICENSE verbatim." >&2
+              exit 1
+            fi
+
+            cargo publish --locked --dry-run -p "$crate"
+          done
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: dist/*.tar.gz
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            archive: dist/*.zip
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: dist/*.tar.gz
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            archive: dist/*.tar.gz
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Select the repository toolchain and target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build the release executable
+        run: cargo build --locked --release -p conkit --target ${{ matrix.target }}
+
+      - name: Smoke-test and package the Unix executable
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/conkit"
+          [[ "$("$binary" --version)" == "conkit $VERSION" ]]
+
+          bundle_name="conkit-v$VERSION-$TARGET"
+          bundle_dir="dist/$bundle_name"
+          mkdir -p "$bundle_dir"
+          cp "$binary" "$bundle_dir/conkit"
+          cp LICENSE README.md "$bundle_dir/"
+          tar -C dist -czf "dist/$bundle_name.tar.gz" "$bundle_name"
+
+      - name: Smoke-test and package the Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $binary = "target/$env:TARGET/release/conkit.exe"
+          $actualVersion = & $binary --version
+          if ($actualVersion -ne "conkit $env:VERSION") {
+            throw "Unexpected version output: $actualVersion"
+          }
+
+          $bundleName = "conkit-v$env:VERSION-$env:TARGET"
+          $bundleDir = "dist/$bundleName"
+          New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
+          Copy-Item $binary "$bundleDir/conkit.exe"
+          Copy-Item -Path LICENSE, README.md -Destination $bundleDir
+          Compress-Archive -Path $bundleDir -DestinationPath "dist/$bundleName.zip"
+
+      - name: Upload the native archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: conkit-${{ matrix.target }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: [preflight, build]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download the native archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: conkit-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          sha256sum conkit-* > SHA256SUMS
+
+      - name: Attest the release artifacts
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: release-artifacts/*
+
+      - name: Create or update the draft GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if release_json="$(gh release view "$TAG" --json isDraft 2>/dev/null)"; then
+            if [[ "$(jq -r '.isDraft' <<<"$release_json")" != "true" ]]; then
+              echo "Refusing to replace the existing public release $TAG." >&2
+              exit 1
+            fi
+            gh release upload "$TAG" release-artifacts/* --clobber
+          else
+            gh release create "$TAG" release-artifacts/* \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --generate-notes \
+              --draft
+          fi
+
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          tag_commit="$(git rev-list -n 1 "$TAG")"
+          if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+            echo "$TAG points to $tag_commit, not $GITHUB_SHA." >&2
+            exit 1
+          fi
+
+      - name: Authenticate with crates.io trusted publishing
+        id: crates_io_auth
+        if: ${{ inputs.bootstrap_crates_io == false }}
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish the library crates
+        shell: bash
+        env:
+          BOOTSTRAP_CRATES_IO: ${{ inputs.bootstrap_crates_io }}
+          CARGO_REGISTRY_TOKEN: ${{ inputs.bootstrap_crates_io && secrets.CARGO_REGISTRY_TOKEN || steps.crates_io_auth.outputs.token }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            if [[ "$BOOTSTRAP_CRATES_IO" == "true" ]]; then
+              echo "The release environment needs CARGO_REGISTRY_TOKEN for the first publish." >&2
+            else
+              echo "Trusted publishing did not return a crates.io token." >&2
+            fi
+            exit 1
+          fi
+
+          temporary_directory="$(mktemp -d)"
+          trap 'rm -rf "$temporary_directory"' EXIT
+          user_agent="contract-kit-release ($GITHUB_SERVER_URL/$GITHUB_REPOSITORY)"
+
+          check_registry_package() {
+            local crate="$1"
+            local local_checksum="$2"
+            local response_file="$temporary_directory/$crate-version.json"
+            local downloaded_archive="$temporary_directory/$crate-$VERSION.crate"
+            local version_url="https://crates.io/api/v1/crates/$crate/$VERSION"
+            local download_url="$version_url/download"
+            local curl_exit=0
+            local status
+
+            status="$(
+              curl --silent --show-error --location \
+                --connect-timeout 10 \
+                --max-time 30 \
+                --retry 3 \
+                --retry-all-errors \
+                --retry-delay 2 \
+                --output "$response_file" \
+                --write-out '%{http_code}' \
+                --user-agent "$user_agent" \
+                "$version_url"
+            )" || curl_exit=$?
+
+            if [[ "$curl_exit" -ne 0 ]]; then
+              echo "Unable to query crates.io for $crate $VERSION (curl exit $curl_exit)." >&2
+              return 2
+            fi
+
+            case "$status" in
+              200)
+                if ! jq --exit-status \
+                  --arg crate "$crate" \
+                  --arg version "$VERSION" \
+                  '(.version | type == "object")
+                    and .version.crate == $crate
+                    and .version.num == $version
+                    and (.version.yanked | type == "boolean")
+                    and (.version.checksum | type == "string")
+                    and (.version.checksum | test("^[0-9a-f]{64}$"))' \
+                  "$response_file" >/dev/null; then
+                  echo "crates.io returned malformed metadata for $crate $VERSION." >&2
+                  return 3
+                fi
+
+                if [[ "$(jq --raw-output '.version.yanked' "$response_file")" != "false" ]]; then
+                  echo "$crate $VERSION is yanked; refusing to accept it for this release." >&2
+                  return 3
+                fi
+
+                local registry_checksum
+                registry_checksum="$(jq --raw-output '.version.checksum' "$response_file")"
+                if [[ "$registry_checksum" != "$local_checksum" ]]; then
+                  echo "$crate $VERSION checksum does not match the local release package." >&2
+                  echo "local:    $local_checksum" >&2
+                  echo "registry: $registry_checksum" >&2
+                  return 3
+                fi
+
+                if ! curl --silent --show-error --fail --location \
+                  --connect-timeout 10 \
+                  --max-time 60 \
+                  --retry 3 \
+                  --retry-all-errors \
+                  --retry-delay 2 \
+                  --output "$downloaded_archive" \
+                  --user-agent "$user_agent" \
+                  "$download_url"; then
+                  echo "Unable to download $crate $VERSION from crates.io." >&2
+                  return 2
+                fi
+
+                local downloaded_checksum
+                downloaded_checksum="$(sha256sum "$downloaded_archive" | awk '{print $1}')"
+                if [[ "$downloaded_checksum" != "$local_checksum" ]]; then
+                  echo "$crate $VERSION downloaded archive checksum does not match." >&2
+                  echo "local:      $local_checksum" >&2
+                  echo "downloaded: $downloaded_checksum" >&2
+                  return 3
+                fi
+
+                echo "Verified $crate $VERSION against the crates.io metadata and archive."
+                return 0
+                ;;
+              404)
+                return 1
+                ;;
+              408|429|500|502|503|504)
+                echo "crates.io temporarily returned HTTP $status for $crate $VERSION." >&2
+                return 2
+                ;;
+              *)
+                echo "crates.io returned HTTP $status for $crate $VERSION." >&2
+                return 3
+                ;;
+            esac
+          }
+
+          publish_or_verify() {
+            local crate="$1"
+            local archive="target/package/$crate-$VERSION.crate"
+            local local_checksum
+            local published_checksum
+            local registry_state=0
+            local publish_exit=0
+
+            cargo package --locked --no-verify -p "$crate"
+            local_checksum="$(sha256sum "$archive" | awk '{print $1}')"
+            if [[ ! "$local_checksum" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Unable to calculate the local checksum for $crate $VERSION." >&2
+              return 1
+            fi
+
+            check_registry_package "$crate" "$local_checksum" || registry_state=$?
+            case "$registry_state" in
+              0)
+                echo "$crate $VERSION is already published with the expected contents; skipping."
+                return 0
+                ;;
+              1)
+                ;;
+              2)
+                echo "Cannot safely determine whether $crate $VERSION already exists." >&2
+                return 1
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+
+            cargo publish --locked -p "$crate" || publish_exit=$?
+            if [[ "$publish_exit" -ne 0 ]]; then
+              echo "cargo publish exited with $publish_exit; checking whether the upload completed." >&2
+            fi
+
+            published_checksum="$(sha256sum "$archive" | awk '{print $1}')"
+            if [[ ! "$published_checksum" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Unable to calculate the publish-time checksum for $crate $VERSION." >&2
+              return 1
+            fi
+            if [[ "$published_checksum" != "$local_checksum" ]]; then
+              echo "cargo publish produced different package contents for $crate $VERSION." >&2
+              echo "prepared:  $local_checksum" >&2
+              echo "published: $published_checksum" >&2
+              return 1
+            fi
+            local_checksum="$published_checksum"
+
+            for attempt in $(seq 1 30); do
+              registry_state=0
+              check_registry_package "$crate" "$local_checksum" || registry_state=$?
+              case "$registry_state" in
+                0)
+                  return 0
+                  ;;
+                1|2)
+                  if [[ "$attempt" -eq 30 ]]; then
+                    break
+                  fi
+                  echo "Waiting for crates.io to expose $crate $VERSION (attempt $attempt of 30)."
+                  sleep 10
+                  ;;
+                *)
+                  return 1
+                  ;;
+              esac
+            done
+
+            echo "Unable to verify $crate $VERSION on crates.io after 30 attempts." >&2
+            return 1
+          }
+
+          publish_or_verify conkit-signature
+          publish_or_verify conkit-sketch
+
+      - name: Make the GitHub Release public
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: gh release edit "$TAG" --draft=false --latest

@@ -18,6 +18,11 @@ pub(crate) struct CommandContext {
 
 impl CommandContext {
     /// Initializes every CLI-owned runtime dependency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signature or sketch contract adapter cannot be
+    /// initialized.
     pub(crate) fn initialize() -> Result<Self> {
         Ok(Self {
             signature: conkit_signature::SignatureContractKit::builder().build()?,
