@@ -1,0 +1,12 @@
+Generate contract files from source files
+
+Usage: conkit generate <COMMAND>
+
+Commands:
+  all         Generate every implemented contract family
+  signatures  Generate signature contracts only
+  sketches    Generate sketch contracts only
+  help        Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help

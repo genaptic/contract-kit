@@ -1,0 +1,5 @@
+root: ../other
+files:
+  - lib.rs
+signatures: []
+sketches: []

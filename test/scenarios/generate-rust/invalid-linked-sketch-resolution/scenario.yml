@@ -1,0 +1,49 @@
+version: 1
+coverage:
+- behavior.generate.error.invalid-linked-sketch-resolution
+- behavior.generate.all.no-partial-write.sketch-domain-failure
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - signatures
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 signature contracts
+    stderr:
+      kind: empty
+- type: overlay
+  source: assets/invalid/main.yml
+  destination: /output/contracts/main.yml
+- type: overlay
+  source: assets/invalid/generated-files.json
+  destination: /output/contracts/.contract-kit/generated-files.json
+- type: run
+  argv:
+  - conkit
+  - generate
+  - all
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        failed to parse catalog input main.yml: sketch answer_body code must not be empty
+- type: assert_tree
+  actual: /output/contracts
+  expected: output
+  contents: text

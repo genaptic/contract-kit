@@ -1,0 +1,46 @@
+version: 1
+coverage:
+- behavior.generate.repeat.all
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - all
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 signature contracts and 0 sketch contracts
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /output/contracts
+  expected: output/fresh-all-generation-1
+  contents: text
+- type: run
+  argv:
+  - conkit
+  - generate
+  - all
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 signature contracts and 0 sketch contracts
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /output/contracts
+  expected: output/fresh-all-generation-2
+  contents: text

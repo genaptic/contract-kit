@@ -1,0 +1,34 @@
+version: 1
+coverage:
+- behavior.check.error.sketch-contract-malformed
+steps:
+- type: overlay
+  source: output/sentinel.txt
+  destination: /output/sentinel.txt
+- type: overlay
+  source: assets/overlays/malformed/main.yml
+  destination: /input/contracts/main.yml
+- type: run
+  argv:
+  - conkit
+  - check
+  - sketches
+  - --source
+  - /input/src
+  - --contracts
+  - /input/contracts
+  - --output
+  - /output/report.yml
+  - --strict
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        failed to parse catalog input main.yml: sketch entries must be flattened mappings
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: text

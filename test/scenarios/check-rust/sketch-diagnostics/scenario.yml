@@ -1,0 +1,55 @@
+version: 1
+coverage:
+- behavior.check.diagnostic.sketch.orphan-link
+- behavior.check.diagnostic.sketch.not-matched
+steps:
+- type: overlay
+  source: assets/overlays/sketch-diagnostics/not-matched.yml
+  destination: /input/contracts/main.yml
+- type: run
+  argv:
+  - conkit
+  - check
+  - sketches
+  - --source
+  - /input/src
+  - --contracts
+  - /input/contracts
+  - --output
+  - /output/report.yml
+  - --strict
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        contract check failed for Sketches
+- type: overlay
+  source: assets/overlays/sketch-diagnostics/orphan.yml
+  destination: /input/contracts/main.yml
+- type: run
+  argv:
+  - conkit
+  - check
+  - sketches
+  - --source
+  - /input/src
+  - --contracts
+  - /input/contracts
+  - --output
+  - /output/report.yml
+  - --strict
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        failed to parse catalog input main.yml: orphan sketch answer_body is not referenced by a signature
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: text

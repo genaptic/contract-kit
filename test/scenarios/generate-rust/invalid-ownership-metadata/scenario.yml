@@ -1,0 +1,45 @@
+version: 1
+coverage:
+- behavior.generate.error.invalid-ownership
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - signatures
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 signature contracts
+    stderr:
+      kind: empty
+- type: overlay
+  source: assets/overlays/invalid-ownership/generated-files.json
+  destination: /output/contracts/.contract-kit/generated-files.json
+- type: run
+  argv:
+  - conkit
+  - generate
+  - signatures
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        invalid generated-file ownership metadata /output/contracts/.contract-kit/generated-files.json: unsupported ownership version 2
+- type: assert_tree
+  actual: /output/contracts
+  expected: output
+  contents: text

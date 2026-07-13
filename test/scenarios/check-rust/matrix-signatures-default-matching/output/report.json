@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "counts": {
+    "source_signature_count": 1,
+    "contract_signature_count": 1
+  },
+  "inventory_digest": "938e22ab00ca16b405a6c3f2b407bb210bab6c34a3f0a50ad94fbad3926d399e",
+  "diagnostics": []
+}

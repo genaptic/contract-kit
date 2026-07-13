@@ -1,0 +1,43 @@
+version: 1
+coverage:
+- behavior.diff.error.archive-payload.invalid-path
+steps:
+- type: overlay
+  source: output/sentinel.txt
+  destination: /output/sentinel.txt
+- type: overlay
+  source: assets
+  destination: /input/archives
+- type: run
+  argv:
+  - conkit
+  - diff
+  - --contracts
+  - /input/contracts
+  - --archive
+  - /input/archives/invalid-path.gzip
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        failed to decode contract archive
+
+        Caused by:
+            failed to process archive: invalid-path.gzip: invalid catalog path: ../escape.yml
+- type: assert_tree
+  actual: /input/archives
+  expected: assets
+  contents: bytes
+- type: remove
+  path: /input/archives
+- type: assert_tree
+  actual: /input
+  expected: input
+  contents: bytes
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: bytes

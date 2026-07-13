@@ -1,0 +1,16 @@
+version: 1
+coverage:
+- grammar.version
+steps:
+- type: run
+  argv:
+  - conkit
+  - --version
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        conkit 0.0.1
+    stderr:
+      kind: empty

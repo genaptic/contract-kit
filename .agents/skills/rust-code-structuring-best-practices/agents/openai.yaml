@@ -1,0 +1,6 @@
+interface:
+  display_name: "Rust Code Structuring Best Practices"
+  short_description: "Structure Rust types, methods, aliases, and state families."
+  default_prompt: "Use $rust-code-structuring-best-practices to replace type aliases and state families with owned Rust types and receiver methods."
+policy:
+  allow_implicit_invocation: true

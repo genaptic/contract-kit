@@ -1,0 +1,12 @@
+Check all implemented contract families
+
+Usage: conkit check all [OPTIONS] --source <DIR> --contracts <DIR> --output <FILE>
+
+Options:
+      --source <DIR>     Root directory containing source files to inspect
+      --contracts <DIR>  Root directory containing contract files to compare against
+      --output <FILE>    Report file to write for the requested check
+      --default          Use the domain crate's default check mode
+      --strict           Treat contract diagnostics as check failures
+      --warning          Emit diagnostics without failing the contract check
+  -h, --help             Print help

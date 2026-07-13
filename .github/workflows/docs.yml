@@ -1,0 +1,45 @@
+name: Rustdocs
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rustdocs-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rustdocs:
+    name: Build preview
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Select the repository toolchain
+        run: rustup show active-toolchain
+
+      - name: Build public API documentation
+        run: cargo doc --locked --workspace --all-features --no-deps
+
+      - name: Upload the rustdoc preview
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustdocs-${{ github.sha }}
+          path: target/doc
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Add preview instructions
+        run: |
+          echo 'Download the rustdocs artifact from this run and open `index.html`.' >> "$GITHUB_STEP_SUMMARY"

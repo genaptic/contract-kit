@@ -1,0 +1,25 @@
+version: 1
+coverage:
+- surface.mode.check.default
+- surface.format.check.json
+steps:
+- type: run
+  argv:
+  - conkit
+  - check
+  - all
+  - --source
+  - /input/missing
+  - --contracts
+  - /input/contracts
+  - --output
+  - /output/report.json
+  - --default
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        Source root is not a directory: /input/missing

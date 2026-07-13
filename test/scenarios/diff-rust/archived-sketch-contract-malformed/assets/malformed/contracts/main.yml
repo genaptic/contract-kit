@@ -1,0 +1,15 @@
+root: ../src
+files:
+  - lib.rs
+signatures:
+  - answer_signature:
+      file: lib.rs
+      signature_type: function
+      name: answer
+      visibility: public
+      return_type: u8
+      sketch: answer_body
+sketches:
+  - answer_body:
+    signature_type: function
+    code: "   \n\t\n"

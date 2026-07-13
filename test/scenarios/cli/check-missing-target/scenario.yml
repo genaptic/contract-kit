@@ -1,0 +1,15 @@
+version: 1
+coverage:
+- grammar.error.check.missing-target
+steps:
+- type: run
+  argv:
+  - conkit
+  - check
+  expect:
+    exit_code: 2
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact_file
+      value: assets/stderr.txt

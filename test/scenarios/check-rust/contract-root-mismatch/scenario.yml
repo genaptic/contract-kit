@@ -1,0 +1,30 @@
+version: 1
+coverage:
+  - behavior.check.contracts.root-mismatch
+steps:
+  - type: overlay
+    source: output/sentinel.txt
+    destination: /output/sentinel.txt
+  - type: run
+    argv:
+      - conkit
+      - check
+      - sketches
+      - --source
+      - /input/src
+      - --contracts
+      - /input/contracts
+      - --output
+      - /output/report.yml
+      - --strict
+    expect:
+      exit_code: 1
+      stdout: { kind: empty }
+      stderr:
+        kind: exact
+        value: |
+          invalid contract layout /input/contracts/main.yml: contract root "../other" resolves to /input/other, not selected source /input/src
+  - type: assert_tree
+    actual: /output
+    expected: output
+    contents: text

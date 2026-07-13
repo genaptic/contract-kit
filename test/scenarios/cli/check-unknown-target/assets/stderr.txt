@@ -1,0 +1,5 @@
+error: unrecognized subcommand 'definitely-not-a-target'
+
+Usage: conkit check <COMMAND>
+
+For more information, try '--help'.

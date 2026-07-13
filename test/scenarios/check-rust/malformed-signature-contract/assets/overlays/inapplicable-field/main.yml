@@ -1,0 +1,14 @@
+root: ../src
+files:
+  - lib.rs
+signatures:
+  - answer:
+      file: lib.rs
+      signature_type: function
+      name: answer
+      visibility: public
+      fields:
+        value: u8
+      parameters: []
+      return_type: u8
+sketches: []

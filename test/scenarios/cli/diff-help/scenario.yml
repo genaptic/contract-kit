@@ -1,0 +1,17 @@
+version: 1
+coverage:
+- grammar.help.diff
+- surface.command.diff
+steps:
+- type: run
+  argv:
+  - conkit
+  - diff
+  - --help
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact_file
+      value: assets/stdout.txt
+    stderr:
+      kind: empty

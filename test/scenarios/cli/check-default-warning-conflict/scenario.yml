@@ -1,0 +1,24 @@
+version: 1
+coverage:
+- grammar.error.check.conflict.default-warning
+steps:
+- type: run
+  argv:
+  - conkit
+  - check
+  - all
+  - --source
+  - /input/missing
+  - --contracts
+  - /input/contracts
+  - --output
+  - /output/report.yml
+  - --default
+  - --warning
+  expect:
+    exit_code: 2
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact_file
+      value: assets/stderr.txt

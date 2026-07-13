@@ -1,0 +1,87 @@
+name: Bug report
+description: Report reproducible incorrect behavior in Contract Kit
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Contract Kit. Please remove secrets and private source code from commands, logs, contracts, and archives before submitting them.
+
+  - type: input
+    id: version
+    attributes:
+      label: Contract Kit version
+      description: Provide the release version or source commit.
+      placeholder: 0.0.1 or commit SHA
+    validations:
+      required: true
+
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - GitHub Release binary
+        - Built from source
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      placeholder: Windows 11 x86_64, Ubuntu 24.04 x86_64, macOS 15 arm64
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: Provide the smallest command that reproduces the problem.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: List the inputs, contract files, and ordered steps needed to reproduce the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the exit code and relevant stdout or stderr.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Additional logs or context
+      description: Paste redacted logs or add any other details that may help investigation.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched the existing issues for this problem.
+          required: true
+        - label: I removed secrets and private source content from this report.
+          required: true

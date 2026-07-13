@@ -1,0 +1,6 @@
+root: ../src
+files:
+  - lib.rs
+signatures:
+  - not-a-named-signature
+sketches: []

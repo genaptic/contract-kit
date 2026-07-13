@@ -1,0 +1,17 @@
+root: ../src
+files:
+  - lib.rs
+signatures:
+  - answer:
+      file: lib.rs
+      signature_type: function
+      name: answer
+      visibility: public
+      parameters: []
+      return_type: u16
+      sketch: answer_body
+sketches:
+  - answer_body:
+    signature_type: function
+    code: |
+      pub fn answer() -> u8 { 42 }

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Rust Testing Best Practices"
+  short_description: "Unit, integration, doctest, and e2e strategy."
+  default_prompt: "Use $use-rust-best-practices-testing to apply modern Rust testing best practices to this task."
+policy:
+  allow_implicit_invocation: true

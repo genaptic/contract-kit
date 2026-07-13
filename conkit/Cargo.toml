@@ -1,0 +1,47 @@
+[package]
+name = "conkit"
+version.workspace = true
+edition.workspace = true
+description = "Contract Kit command-line interface"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "conkit"
+path = "main.rs"
+
+[dependencies]
+anyhow = "1"
+atomic-write-file = "0.3"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+flate2 = "1"
+fs-err = "3"
+futures-executor = "0.3"
+same-file = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+conkit-signature = { path = "../conkit-signature" }
+conkit-sketch = { path = "../conkit-sketch" }
+thiserror = "2"
+walkdir = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+assert_fs = "1"
+cargo_metadata = "0.23.1"
+predicates = "3"
+toml_edit = "0.25.12"

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Rust Shell CLI Best Practices"
+  short_description: "Rust CLI App, clap, paths, output, tests."
+  brand_color: "#DEA584"
+  default_prompt: "Use $use-rust-shell-cli-best-practices to design or review a `conkit` Rust CLI change."
+policy:
+  allow_implicit_invocation: true

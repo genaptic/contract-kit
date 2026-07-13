@@ -1,0 +1,15 @@
+{
+  "version": 3,
+  "journal": {
+    "state": "committed",
+    "generation": 1,
+    "files": {
+      "documents": [
+        {
+          "path": "main.yml",
+          "sha256": "636bc6576b758a47060426abde9419229fa54747013929d059c8f066b88a41b4"
+        }
+      ]
+    }
+  }
+}

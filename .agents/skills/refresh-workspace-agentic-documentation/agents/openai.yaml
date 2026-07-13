@@ -1,0 +1,6 @@
+interface:
+  display_name: "Refresh Workspace Agentic Docs"
+  short_description: "Refresh Contract Kit markdown docs."
+  default_prompt: "Use $refresh-workspace-agentic-documentation from /plan to refresh Contract Kit repo-owned markdown docs and skill documentation."
+policy:
+  allow_implicit_invocation: false

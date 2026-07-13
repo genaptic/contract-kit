@@ -1,0 +1,145 @@
+version: 1
+coverage:
+- behavior.generate.preserve.sketches-when-signatures-selected
+- behavior.generate.preserve.signatures-when-sketches-selected
+- behavior.generate.manual-file-preserved
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - signatures
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 signature contracts
+    stderr:
+      kind: empty
+- type: overlay
+  source: assets/linked/main.yml
+  destination: /output/contracts/main.yml
+- type: overlay
+  source: assets/linked/generated-files.json
+  destination: /output/contracts/.contract-kit/generated-files.json
+- type: run
+  argv:
+  - conkit
+  - generate
+  - sketches
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 sketch contracts
+    stderr:
+      kind: empty
+- type: overlay
+  source: assets/overlays/manual/manual.txt
+  destination: /output/contracts/manual.txt
+- type: overlay
+  source: assets/overlays/body-only/lib.rs
+  destination: /input/source/nested/lib.rs
+- type: run
+  argv:
+  - conkit
+  - generate
+  - signatures
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 signature contracts
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /output/contracts
+  expected: output/after-signatures
+  contents: text
+- type: run
+  argv:
+  - conkit
+  - generate
+  - sketches
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 sketch contracts
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /output/contracts
+  expected: output/after-sketches
+  contents: text
+- type: overlay
+  source: assets/overlays/lifecycle/extra.rs
+  destination: /input/source/nested/extra.rs
+- type: overlay
+  source: assets/overlays/lifecycle/lib.rs
+  destination: /input/source/nested/lib.rs
+- type: run
+  argv:
+  - conkit
+  - generate
+  - signatures
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        failed to generate signature contracts
+
+        Caused by:
+            failed to convert signatures: removing signature extra_function would orphan preserved sketch extra_body
+- type: assert_tree
+  actual: /output/contracts
+  expected: output/after-sketches
+  contents: text
+- type: run
+  argv:
+  - conkit
+  - generate
+  - all
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 1 signature contracts and 1 sketch contracts
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /output/contracts
+  expected: output/after-all-cleanup
+  contents: text

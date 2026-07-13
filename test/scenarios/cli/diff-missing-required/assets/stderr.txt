@@ -1,0 +1,7 @@
+error: the following required arguments were not provided:
+  --contracts <DIR>
+  --archive <FILE>
+
+Usage: conkit diff --contracts <DIR> --archive <FILE>
+
+For more information, try '--help'.

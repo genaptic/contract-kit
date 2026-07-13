@@ -1,0 +1,9 @@
+Generate signature contracts only
+
+Usage: conkit generate signatures [OPTIONS] --source <DIR> --contracts <DIR>
+
+Options:
+      --source <DIR>     Root directory containing source files to inspect
+      --contracts <DIR>  Root directory where generated contract files should be written
+      --adopt-existing   Adopt matching pre-existing generated outputs into managed ownership
+  -h, --help             Print help

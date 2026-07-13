@@ -1,0 +1,20 @@
+{
+  "skill_name": "use-rust-shell-cli-best-practices",
+  "evals": [
+    {
+      "id": "crud-cli-design",
+      "prompt": "Design the Rust CLI structure for app create/list/show/update/remove project commands, with business logic in separate crates and filesystem support on macOS/Linux/Windows.",
+      "expected_output": "Uses this skill, recommends a thin clap-based CLI crate with a root App runtime, CommandContext, AppCommand implementations, domain command structs in business crates, PathBuf paths, typed errors, stdout/stderr policy, tests, and workspace layout."
+    },
+    {
+      "id": "review-bad-cli-code",
+      "prompt": "Review this Rust CLI code: it parses Vec<String>, passes clap matches into a library crate, and writes config with std::fs::write.",
+      "expected_output": "Uses this skill and flags argument parsing, missing root App/CommandContext/AppCommand boundaries, CLI/domain coupling, non-atomic writes, path handling, and missing tests."
+    },
+    {
+      "id": "path-cross-platform",
+      "prompt": "I need to fix a command that uses string concatenation for file paths and fails on Windows. What should Codex change?",
+      "expected_output": "Uses this skill and recommends Path/PathBuf, path.join, fs-err, tests with spaces and non-ASCII paths, and avoiding hard-coded Unix assumptions."
+    }
+  ]
+}

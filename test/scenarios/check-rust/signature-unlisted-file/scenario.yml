@@ -1,0 +1,30 @@
+version: 1
+coverage:
+  - behavior.check.contracts.signature-unlisted-file
+steps:
+  - type: overlay
+    source: output/sentinel.txt
+    destination: /output/sentinel.txt
+  - type: run
+    argv:
+      - conkit
+      - check
+      - sketches
+      - --source
+      - /input/src
+      - --contracts
+      - /input/contracts
+      - --output
+      - /output/report.yml
+      - --strict
+    expect:
+      exit_code: 1
+      stdout: { kind: empty }
+      stderr:
+        kind: exact
+        value: |
+          failed to parse catalog input main.yml: signature ignored_signature references unlisted file ignored.rs
+  - type: assert_tree
+    actual: /output
+    expected: output
+    contents: text

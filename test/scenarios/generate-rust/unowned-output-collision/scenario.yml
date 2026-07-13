@@ -1,0 +1,25 @@
+version: 1
+coverage:
+- behavior.generate.error.unowned-collision
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - signatures
+  - --source
+  - /input/source
+  - --contracts
+  - /input/contracts
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        refusing to overwrite unowned generated output: /input/contracts/main.yml
+- type: assert_tree
+  actual: /input/contracts
+  expected: output
+  contents: text

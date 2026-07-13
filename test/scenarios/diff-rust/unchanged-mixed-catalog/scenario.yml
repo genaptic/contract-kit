@@ -1,0 +1,31 @@
+version: 1
+coverage:
+- behavior.diff.unchanged
+steps:
+- type: overlay
+  source: output/sentinel.txt
+  destination: /output/sentinel.txt
+- type: run
+  argv:
+  - conkit
+  - diff
+  - --contracts
+  - /input/contracts
+  - --archive
+  - /input/archives/mixed-v1.gzip
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        contracts unchanged
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /input
+  expected: input
+  contents: bytes
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: bytes

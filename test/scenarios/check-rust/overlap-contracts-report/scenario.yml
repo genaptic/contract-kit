@@ -1,0 +1,35 @@
+version: 1
+coverage:
+- behavior.check.error.overlap.contracts-report
+steps:
+- type: overlay
+  source: output/sentinel.txt
+  destination: /output/sentinel.txt
+- type: run
+  argv:
+  - conkit
+  - check
+  - all
+  - --source
+  - /input/src
+  - --contracts
+  - /input/contracts
+  - --output
+  - /input/contracts/report.yml
+  - --strict
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        contracts path /input/contracts overlaps report path /input/contracts/report.yml
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: text
+- type: assert_tree
+  actual: /input
+  expected: input
+  contents: bytes

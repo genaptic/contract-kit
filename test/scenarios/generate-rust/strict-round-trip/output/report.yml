@@ -1,0 +1,17 @@
+passed: true
+signatures:
+  passed: true
+  counts:
+    source_signature_count: 4
+    contract_signature_count: 4
+  inventory_digest: 197bb4d5180d9ccd590d909d18e287e7bf5bb39648c768d50f521139ef2a9484
+  diagnostics: []
+sketches:
+  passed: true
+  counts:
+    source_file_count: 2
+    contract_file_count: 1
+    sketch_count: 0
+    matched_sketch_count: 0
+    failed_sketch_count: 0
+  diagnostics: []

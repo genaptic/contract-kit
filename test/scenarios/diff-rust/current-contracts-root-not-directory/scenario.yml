@@ -1,0 +1,31 @@
+version: 1
+coverage:
+- behavior.diff.error.current.contracts-root-not-directory
+steps:
+- type: overlay
+  source: output/sentinel.txt
+  destination: /output/sentinel.txt
+- type: run
+  argv:
+  - conkit
+  - diff
+  - --contracts
+  - /input/contracts-file
+  - --archive
+  - /input/archives/mixed-v1.gzip
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        Contracts root is not a directory: /input/contracts-file
+- type: assert_tree
+  actual: /input
+  expected: input
+  contents: bytes
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: bytes

@@ -1,0 +1,43 @@
+version: 1
+coverage:
+- behavior.diff.error.archived.sketch-contract-malformed
+steps:
+- type: overlay
+  source: output/sentinel.txt
+  destination: /output/sentinel.txt
+- type: overlay
+  source: assets
+  destination: /input/archives
+- type: run
+  argv:
+  - conkit
+  - diff
+  - --contracts
+  - /input/contracts
+  - --archive
+  - /input/archives/malformed/archived-sketch.gzip
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        failed to diff sketch contracts
+
+        Caused by:
+            failed to parse catalog input main.yml: sketch answer_body code must not be empty
+- type: assert_tree
+  actual: /input/archives
+  expected: assets
+  contents: bytes
+- type: remove
+  path: /input/archives
+- type: assert_tree
+  actual: /input
+  expected: input
+  contents: bytes
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: bytes

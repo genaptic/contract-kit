@@ -1,0 +1,25 @@
+version: 1
+coverage:
+- behavior.generate.error.overlap.equal
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - signatures
+  - --source
+  - /input/source
+  - --contracts
+  - /input/source
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        source path /input/source overlaps contracts path /input/source
+- type: assert_tree
+  actual: /input/source
+  expected: input/source
+  contents: text

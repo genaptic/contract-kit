@@ -1,0 +1,70 @@
+version: 1
+coverage:
+- behavior.generate.deterministic.signatures
+- behavior.generate.deterministic.sketches
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - signatures
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 signature contracts
+    stderr:
+      kind: empty
+- type: overlay
+  source: assets/linked/main.yml
+  destination: /output/contracts/main.yml
+- type: overlay
+  source: assets/linked/generated-files.json
+  destination: /output/contracts/.contract-kit/generated-files.json
+- type: run
+  argv:
+  - conkit
+  - generate
+  - all
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 signature contracts and 1 sketch contracts
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /output/contracts
+  expected: output/generation-2
+  contents: bytes
+- type: run
+  argv:
+  - conkit
+  - generate
+  - all
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 signature contracts and 1 sketch contracts
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /output/contracts
+  expected: output/generation-3
+  contents: bytes

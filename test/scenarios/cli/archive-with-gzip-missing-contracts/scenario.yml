@@ -1,0 +1,21 @@
+version: 1
+coverage:
+- surface.option.archive.gzip.present
+steps:
+- type: run
+  argv:
+  - conkit
+  - archive
+  - --contracts
+  - /input/missing
+  - --archive
+  - /output/archives
+  - --gzip
+  expect:
+    exit_code: 1
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact
+      value: |
+        Contracts root is not a directory: /input/missing

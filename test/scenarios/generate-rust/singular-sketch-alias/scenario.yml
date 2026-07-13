@@ -1,0 +1,48 @@
+version: 1
+coverage:
+- behavior.generate.alias.sketch
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - signatures
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 2 signature contracts
+    stderr:
+      kind: empty
+- type: overlay
+  source: assets/linked/main.yml
+  destination: /output/contracts/main.yml
+- type: overlay
+  source: assets/linked/generated-files.json
+  destination: /output/contracts/.contract-kit/generated-files.json
+- type: run
+  argv:
+  - conkit
+  - generate
+  - sketch
+  - --source
+  - /input/source
+  - --contracts
+  - /output/contracts
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        generated 1 sketch contracts
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /output/contracts
+  expected: output
+  contents: text

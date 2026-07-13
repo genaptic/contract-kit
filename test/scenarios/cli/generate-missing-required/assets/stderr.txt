@@ -1,0 +1,7 @@
+error: the following required arguments were not provided:
+  --source <DIR>
+  --contracts <DIR>
+
+Usage: conkit generate all --source <DIR> --contracts <DIR>
+
+For more information, try '--help'.

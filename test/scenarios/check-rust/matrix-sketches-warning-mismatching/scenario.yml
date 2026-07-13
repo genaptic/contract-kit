@@ -1,0 +1,28 @@
+version: 1
+coverage:
+- behavior.check.matrix.sketches.warning.mismatching
+steps:
+- type: run
+  argv:
+  - conkit
+  - check
+  - sketches
+  - --source
+  - /input/src
+  - --contracts
+  - /input/contracts
+  - --output
+  - /output/report.json
+  - --warning
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        sketch check passed: 0 matched sketches, 1 failed sketches
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: text

@@ -1,0 +1,31 @@
+root: ../src
+files:
+  - lib.rs
+signatures:
+  - added:
+      file: lib.rs
+      signature_type: function
+      name: added
+      visibility: public
+      return_type: u8
+      sketch: added_sketch
+  - changed:
+      file: lib.rs
+      signature_type: function
+      name: changed
+      visibility: public
+      return_type: u16
+      sketch: changed_sketch
+sketches:
+  - added_sketch:
+    signature_type: function
+    code: |
+      pub fn added() -> u8 {
+          1
+      }
+  - changed_sketch:
+    signature_type: function
+    code: |
+      pub fn changed() -> u8 {
+          2
+      }

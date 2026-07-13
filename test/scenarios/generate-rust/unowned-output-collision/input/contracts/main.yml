@@ -1,0 +1,6 @@
+root: ../source
+files:
+- nested/extra.rs
+- nested/lib.rs
+signatures: []
+sketches: []

@@ -1,0 +1,28 @@
+version: 1
+coverage:
+- behavior.check.matrix.signatures.strict.matching
+steps:
+- type: run
+  argv:
+  - conkit
+  - check
+  - signatures
+  - --source
+  - /input/src
+  - --contracts
+  - /input/contracts
+  - --output
+  - /output/report.yml
+  - --strict
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact
+      value: |
+        signature check passed: 1 source signatures, 1 contract signatures
+    stderr:
+      kind: empty
+- type: assert_tree
+  actual: /output
+  expected: output
+  contents: text

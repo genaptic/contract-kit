@@ -1,0 +1,11 @@
+root: ../src
+files:
+  - lib.rs
+signatures:
+  - ignored_signature:
+      file: ignored.rs
+      signature_type: function
+      name: ignored
+      visibility: public
+      parameters: []
+sketches: []

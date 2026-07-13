@@ -1,0 +1,20 @@
+{
+  "skill_name": "add-new-cli-command",
+  "evals": [
+    {
+      "id": "add-conkit-inspect-ownership",
+      "prompt": "Add a new `conkit inspect ownership --contracts DIR` command that reports which combined contract documents are managed or unowned without modifying the contracts tree.",
+      "expected_output": "Uses this skill and its required Rust guidance, checks the command against the existing conkit grammar, adds parse-only clap data and exhaustive native async AppCommand dispatch, keeps ownership-journal reads and OS paths in conkit, renders stable output through the CLI adapter, and adds focused help, behavior, failure, and manifest-aware scenario coverage."
+    },
+    {
+      "id": "add-opt-in-diff-exit-code",
+      "prompt": "Add `--exit-code` to `conkit diff --contracts DIR --archive FILE` so semantic changes return a nonzero exit code only when the flag is present; preserve the current successful changed-diff behavior by default.",
+      "expected_output": "Uses this skill, keeps semantic comparison in the signature and sketch domains, implements the opt-in process policy in the conkit adapter, preserves default diff output and exit behavior, and adds exact help, unchanged, changed, operational-error, and manifest-aware exit-code coverage."
+    },
+    {
+      "id": "reject-domain-filesystem-coupling",
+      "prompt": "Simplify `conkit generate signatures` by changing `conkit_signature::GenerateRequest` to accept `source_root: PathBuf` and `contracts_root: PathBuf`, then have the domain crate traverse the source tree and write generated YAML itself.",
+      "expected_output": "Uses this skill to reject the proposed boundary violation, keeps PathBuf traversal in SourceTree and ContractsStore plus ContractLayout, recovery, ownership, and persistence in conkit, passes FileCatalog data with the required typed generation target and scope into conkit-signature, and persists the completed GeneratedContracts result through ContractsStore."
+    }
+  ]
+}

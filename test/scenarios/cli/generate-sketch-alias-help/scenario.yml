@@ -1,0 +1,18 @@
+version: 1
+coverage:
+- grammar.alias.generate.sketch
+- surface.alias.generate.sketch
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - sketch
+  - --help
+  expect:
+    exit_code: 0
+    stdout:
+      kind: exact_file
+      value: assets/stdout.txt
+    stderr:
+      kind: empty

@@ -1,0 +1,16 @@
+version: 1
+coverage:
+- grammar.error.generate.missing-required
+steps:
+- type: run
+  argv:
+  - conkit
+  - generate
+  - all
+  expect:
+    exit_code: 2
+    stdout:
+      kind: empty
+    stderr:
+      kind: exact_file
+      value: assets/stderr.txt
