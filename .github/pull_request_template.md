@@ -1,3 +1,11 @@
+<!--
+Before submitting, read:
+https://github.com/genaptic/contract-kit/blob/main/CONTRIBUTING.md
+
+Community participation is governed by:
+https://github.com/genaptic/contract-kit/blob/main/CODE_OF_CONDUCT.md
+-->
+
 ## Summary
 
 <!-- What changed, and why is this the right boundary for the change? -->
@@ -15,7 +23,7 @@
 - [ ] `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`
 - [ ] `cargo test --locked --workspace --doc`
 - [ ] `cargo test --locked --workspace --all-targets`
-- [ ] Targeted scenario commands were run when scenarios or the harness changed.
+- [ ] Targeted commands from the [scenario guide][scenario-validation] were run when scenarios or the harness changed.
 
 ## Impact review
 
@@ -28,3 +36,5 @@
 ## Breaking changes and release notes
 
 <!-- Write "None" when there are none. -->
+
+[scenario-validation]: https://github.com/genaptic/contract-kit/blob/main/test/scenarios/README.md#validation
