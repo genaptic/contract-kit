@@ -103,7 +103,9 @@ canonical manifest schema, fixture and step rules, evidence definitions,
 coverage declarations, and focused validation commands belong in the
 [scenario authoring guide](test/scenarios/README.md).
 
-Keep this document structural. Product usage belongs in `README.md`,
-operational agent instructions belong in `AGENTS.md`, scenario authoring belongs
-in `test/scenarios/README.md`, and crate-specific structure belongs in each
-crate's `ARCHITECTURE.md`.
+Keep this document structural. Product installation and usage belong in
+`README.md`; human development and pull-request workflow belong in
+`CONTRIBUTING.md`; community behavior and reporting belong in
+`CODE_OF_CONDUCT.md`; operational agent instructions belong in `AGENTS.md`;
+scenario authoring belongs in `test/scenarios/README.md`; and crate-specific
+structure belongs in each crate's `ARCHITECTURE.md`.

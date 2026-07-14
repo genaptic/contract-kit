@@ -14,8 +14,11 @@
 - Keep mixed-catalog archive encoding and decoding in `conkit`;
   `conkit-signature` and `conkit-sketch` own their respective contract
   semantics, including semantic diffing.
-- Keep `README.md` product-facing, `ARCHITECTURE.md` structural, and this file
-  operational. Crate-specific rules belong in each crate's nested `AGENTS.md`.
+- Keep `README.md` product-facing, `CONTRIBUTING.md` human-facing,
+  `ARCHITECTURE.md` structural, `CODE_OF_CONDUCT.md` authoritative for
+  community behavior and reporting, and this file operational for agents.
+  Crate-specific structure and agent rules belong in each crate's nested
+  `ARCHITECTURE.md` and `AGENTS.md`.
 - Treat `test/scenarios/README.md` as the canonical scenario-manifest authoring
   guide and `test/scenarios/AGENTS.md` as the operational instructions for that
   subtree. Link to the guide instead of duplicating its schema in root or crate
@@ -61,6 +64,13 @@
   cargo test --locked --workspace --all-targets
   ```
 
+- Keep the complete five-command workspace gate set synchronized everywhere it
+  is repeated: this file, `CONTRIBUTING.md`,
+  `.github/pull_request_template.md`, `.github/workflows/ci.yml`,
+  `.github/workflows/release.yml`, and repo-local skill instructions and
+  references under `.agents/skills`. Update every complete copy in the same
+  change whenever a gate changes; keep crate-specific narrowed validation
+  blocks specialized.
 - For scenario or harness changes, run the targeted scenario tests in
   `test/scenarios/README.md` before the workspace gates.
 - Do not invoke the `rust[c]` executable directly in tests; use Cargo-level
