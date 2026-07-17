@@ -21,7 +21,7 @@ steps:
       kind: contains_in_order
       value:
       - failed to decode contract archive
-      - failed to query metadata of file `/input/archives/missing.gzip`
+      - (os error
 - type: assert_tree
   actual: /input
   expected: input

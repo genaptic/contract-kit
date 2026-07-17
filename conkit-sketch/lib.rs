@@ -15,35 +15,42 @@
 //!
 //! # Contracts and matching
 //!
-//! Each YAML document contains exactly `root`, `files`, `signatures`, and
-//! `sketches`. A flattened sketch record has a null-valued identifier beside
-//! `signature_type` and `code`; its linked signature owns the `file` and
-//! `sketch` fields. The later `version`/`language` reverse-link dialect is not
-//! accepted. Only direct root-level `.yaml` and `.yml` catalog entries are
-//! considered; nested YAML entries are ignored.
+//! Each YAML document contains exactly `contract_version`, `root`, `files`,
+//! `signatures`, and `sketches`, plus `extraction` when signatures are present.
+//! Every sketch is a one-entry mapping from its identifier to a nested body
+//! containing `file`, `signature`, `signature_type`, `matching`, and `code`.
+//! The later `version`/`language` reverse-link dialect is not accepted. Only
+//! direct root-level `.yaml` and `.yml` catalog entries are considered; nested
+//! YAML entries are ignored.
 //!
-//! Matching collapses whitespace within each line, removes empty lines, and
-//! compares the remaining lines as one contiguous ordered sequence. Source
-//! bytes do not need to be UTF-8: malformed source lines use an ASCII-whitespace
-//! fallback that preserves every other byte. A sketch still matches only the
-//! logical source path declared by its linked signature.
+//! Every v2 sketch declares `matching.normalization: exact_lines_v1` and an
+//! occurrence policy. Exact-line normalization converts CRLF to LF and treats
+//! one final line terminator as nonsemantic. It preserves indentation, internal
+//! and trailing whitespace, tabs, blank lines, isolated carriage returns, and
+//! arbitrary non-UTF-8 bytes. [`SketchOccurrence::AtLeastOne`] accepts the first
+//! contiguous match; [`SketchOccurrence::ExactlyOne`] requires one occurrence
+//! and reports duplicate source spans. Sketch identifiers are exact: the parser
+//! rejects empty values, surrounding whitespace, control characters, and
+//! over-limit values instead of trimming or Unicode-normalizing them.
 //!
 //! # Semantic diffing
 //!
 //! [`SketchContractKit::diff`] treats the sketch identifier as identity. For a
 //! sketch present in both catalogs, the linked source file, linked signature
-//! label, `signature_type`, and normalized code are semantic. The containing
-//! contract document, YAML formatting, YAML comments outside `code`, and mapping
-//! order are nonsemantic.
+//! label, `signature_type`, [`SketchMatchPolicy`], and normalized code are
+//! semantic. The containing contract document, YAML formatting, YAML comments
+//! outside `code`, and mapping order are nonsemantic.
 //!
-//! Normalization removes blank lines and collapses whitespace within each line,
-//! so those changes alone do not produce a diff. Line order and every token or
-//! comment inside `code` remain semantic.
+//! CRLF/LF spelling and one final line terminator are the only nonsemantic code
+//! differences under [`SketchNormalization::ExactLinesV1`]. Line order,
+//! indentation, blank lines, horizontal whitespace, tokens, and comments inside
+//! `code` remain semantic.
 //!
 //! # Generation and reports
 //!
-//! Generation accepts one [`SketchSeed`] for every explicit signature link and
-//! refreshes only the flattened sketch's `code`. It preserves the combined
+//! Full generation accepts one [`SketchSeed`] for every explicit signature
+//! link; partial generation updates only supplied exact IDs. Both refresh only
+//! the nested sketch body's `code`. They preserve the combined
 //! document's root, file allowlist, signatures, links, identifiers, and kinds.
 //! The response returns the complete input catalog, including unchanged nested
 //! YAML and non-YAML passthrough entries, and counts the linked sketches that
@@ -52,14 +59,20 @@
 //!
 //! A check can return YAML or JSON report bytes through [`ReportRequest`]. The
 //! caller chooses the logical output path and persists those bytes if desired.
+//! [`CheckResponse::report_view`] exposes the same report payload as a borrowed
+//! serializable view that omits returned report files, allowing callers to
+//! embed it without recreating sketch-domain fields.
 //!
 //! # Errors and diagnostics
 //!
 //! Malformed YAML, invalid contract fields, duplicate sketch identifiers, and
 //! invalid generation seeds return [`SketchContractKitError`]. A valid sketch
-//! that references a missing source file or whose snippet does not match is
-//! represented by [`SketchDiagnostic`] in a successful [`CheckResponse`].
-//! [`CheckMode`] determines whether those diagnostics make the response fail.
+//! that references a missing source file, whose snippet does not match, or
+//! whose occurrence count violates its policy is represented by
+//! [`SketchDiagnostic`] in a successful [`CheckResponse`]. Diagnostics retain
+//! [`SketchLocation`] context and may include a nearest [`MatchCandidate`] or
+//! bounded [`SourceLineSpan`] evidence. [`CheckMode`] determines whether those
+//! diagnostics make the response fail.
 //!
 //! # Runtime and storage boundaries
 //!
@@ -76,10 +89,12 @@
 //! owning future and its output satisfy `Send + 'static`; a method future which
 //! still borrows a local kit is not promised to be `'static`.
 //!
-//! CPU work runs on a reusable Rayon-backed pool. [`WorkOptions`] documents the
-//! complete worker-budget, root-admission, cancellation, and caller-deadline
-//! contract. Catalogs, diagnostics, generated entries, and rendered output
-//! remain deterministic regardless of worker scheduling.
+//! CPU work runs on a reusable Rayon-backed pool. [`WorkerPool`] selects a
+//! default, dedicated, or application-shared pool, while [`WorkOptions`]
+//! independently bounds active and pending root operations. [`SketchLimits`]
+//! bounds catalog, YAML, matching, diagnostic, and generated-output resources.
+//! Catalogs, diagnostics, generated entries, and rendered output remain
+//! deterministic regardless of worker scheduling.
 //!
 //! # Examples
 //!
@@ -87,8 +102,8 @@
 //!
 //! ```
 //! use conkit_sketch::{
-//!     CatalogPath, CheckMode, CheckRequest, FileCatalog, GenerateRequest,
-//!     ReportRequest, SketchContractKit, SketchSeed,
+//!     CatalogPath, CheckMode, CheckRequest, FileCatalog, GenerateMode,
+//!     GenerateRequest, ReportRequest, SketchContractKit, SketchSeed,
 //! };
 //!
 //! let source_path = CatalogPath::new("lib.rs")?;
@@ -99,8 +114,10 @@
 //!     b"pub fn answer() -> u8 { 42 }\n".to_vec(),
 //! )?;
 //! let mut contract_files = FileCatalog::new();
-//! contract_files.insert(contract_path.clone(), br#"root: ../src
+//! contract_files.insert(contract_path.clone(), br#"contract_version: 2
+//! root: ../src
 //! files: [lib.rs]
+//! extraction: { mode: rust_syntax_v2, profile: rust_api_v1, crates: [{ id: example, root: lib.rs, kind: library }] }
 //! signatures:
 //!   - answer_signature:
 //!       file: lib.rs
@@ -108,8 +125,12 @@
 //!       sketch: answer_body
 //! sketches:
 //!   - answer_body:
-//!     signature_type: function
-//!     code: old code
+//!       file: lib.rs
+//!       signature: answer_signature
+//!       signature_type: function
+//!       matching: { normalization: exact_lines_v1, occurrence: at_least_one }
+//!       code: |-
+//!         old code
 //! "#.to_vec())?;
 //!
 //! let kit = SketchContractKit::builder().build()?;
@@ -117,14 +138,16 @@
 //!     contract_files,
 //!     seeds: vec![SketchSeed {
 //!         contract_file: contract_path.clone(),
+//!         document_index: 0,
 //!         sketch_id: "answer_body".to_owned(),
 //!         signature_type: "function".to_owned(),
 //!         file: source_path.clone(),
 //!         code: "pub fn answer() -> u8 { 42 }".to_owned(),
 //!     }],
+//!     mode: GenerateMode::FullRefresh,
 //! }))?;
 //!
-//! assert_eq!(generated.sketch_count, 1);
+//! assert_eq!(generated.counts.refreshed_sketch_count, 1);
 //! assert!(generated
 //!     .contract_files
 //!     .get(&contract_path)
@@ -134,7 +157,7 @@
 //!     source_files,
 //!     contract_files: generated.contract_files,
 //!     report: ReportRequest::None,
-//!     mode: CheckMode::Strict,
+//!     mode: CheckMode::Enforce,
 //! }))?;
 //!
 //! assert!(checked.passed);
@@ -153,17 +176,27 @@ mod files;
 mod generate;
 mod id;
 mod inventory;
+mod limits;
 mod matcher;
 mod normalize;
 mod report;
 mod work;
 
 pub use crate::api::{
-    CheckMode, CheckRequest, CheckResponse, DiffEntry, DiffRequest, DiffResponse, GenerateRequest,
-    GenerateResponse, SketchContractKit, SketchContractKitBuilder, SketchSeed,
+    CheckMode, CheckRequest, CheckResponse, DiffEntry, DiffRequest, DiffResponse, GenerateMode,
+    GenerateRequest, GenerateResponse, SketchContractKit, SketchContractKitBuilder, SketchField,
+    SketchGenerationCounts, SketchSeed, SketchSnapshot,
 };
+pub use crate::contract::{SketchMatchPolicy, SketchNormalization, SketchOccurrence};
 pub use crate::error::SketchContractKitError;
 pub use crate::files::{CatalogPath, FileCatalog, FileCatalogError};
-pub use crate::inventory::{SketchCheckCounts, SketchDiagnostic};
+pub use crate::inventory::{
+    DiagnosticExcerpt, MatchCandidate, SketchCheckCounts, SketchDiagnostic, SketchLocation,
+    SourceLineSpan,
+};
+pub use crate::limits::{
+    CatalogLimits, DiagnosticLimits, LimitExceeded, LimitResource, MatchingLimits, OutputLimits,
+    SketchLimits, YamlLimits,
+};
 pub use crate::report::{ReportFormat, ReportRequest};
-pub use crate::work::{WorkOptions, WorkParallelism};
+pub use crate::work::{WorkOptions, WorkerPool};

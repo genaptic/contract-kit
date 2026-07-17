@@ -1,21 +1,31 @@
 //! Concrete adapter for the independent sketch contract domain.
 
+use crate::context::ApplicationCancellation;
 use crate::error::CliError;
 
 /// Initialized sketch service used by command handlers.
 pub(crate) struct SketchAdapter {
     kit: conkit_sketch::SketchContractKit,
+    cancellation: ApplicationCancellation,
 }
 
 impl SketchAdapter {
-    /// Builds the default sketch kit for local CLI execution.
+    /// Builds the sketch kit over application-owned work and resource budgets.
     ///
     /// # Errors
     ///
     /// Returns an error if the sketch domain cannot initialize its CPU pool.
-    pub(crate) fn initialize() -> Result<Self, CliError> {
+    pub(crate) fn initialize(
+        work: conkit_sketch::WorkOptions,
+        limits: conkit_sketch::SketchLimits,
+        cancellation: &ApplicationCancellation,
+    ) -> Result<Self, CliError> {
         Ok(Self {
-            kit: conkit_sketch::SketchContractKit::builder().build()?,
+            kit: conkit_sketch::SketchContractKit::builder()
+                .with_work_options(work)
+                .with_limits(limits)
+                .build()?,
+            cancellation: cancellation.clone(),
         })
     }
 
@@ -28,7 +38,10 @@ impl SketchAdapter {
         &self,
         request: SketchCheckRequest,
     ) -> Result<conkit_sketch::CheckResponse, CliError> {
-        Ok(self.kit.check(request.into_sketch_request()?).await?)
+        Ok(self
+            .kit
+            .check(request.into_sketch_request(&self.cancellation)?)
+            .await?)
     }
 
     /// Refreshes explicitly linked sketches and converts the result back.
@@ -41,11 +54,17 @@ impl SketchAdapter {
         &self,
         request: SketchGenerateRequest,
     ) -> Result<SketchGenerateResponse, CliError> {
-        let response = self.kit.generate(request.into_sketch_request()?).await?;
+        let response = self
+            .kit
+            .generate(request.into_sketch_request(&self.cancellation)?)
+            .await?;
 
         Ok(SketchGenerateResponse {
-            contract_files: SketchCatalogs::into_signature_catalog(response.contract_files)?,
-            sketch_count: response.sketch_count,
+            contract_files: SketchCatalogs::into_signature_catalog(
+                response.contract_files,
+                &self.cancellation,
+            )?,
+            counts: response.counts,
         })
     }
 
@@ -65,9 +84,11 @@ impl SketchAdapter {
             .diff(conkit_sketch::DiffRequest {
                 current_contract_files: SketchCatalogs::from_signature_catalog(
                     current_contract_files,
+                    &self.cancellation,
                 )?,
                 previous_contract_files: SketchCatalogs::from_signature_catalog(
                     previous_contract_files,
+                    &self.cancellation,
                 )?,
             })
             .await?)
@@ -99,10 +120,16 @@ impl SketchCheckRequest {
         }
     }
 
-    fn into_sketch_request(self) -> Result<conkit_sketch::CheckRequest, CliError> {
+    fn into_sketch_request(
+        self,
+        cancellation: &ApplicationCancellation,
+    ) -> Result<conkit_sketch::CheckRequest, CliError> {
         Ok(conkit_sketch::CheckRequest {
-            source_files: SketchCatalogs::from_signature_catalog(self.source_files)?,
-            contract_files: SketchCatalogs::from_signature_catalog(self.contract_files)?,
+            source_files: SketchCatalogs::from_signature_catalog(self.source_files, cancellation)?,
+            contract_files: SketchCatalogs::from_signature_catalog(
+                self.contract_files,
+                cancellation,
+            )?,
             report: self.report,
             mode: self.mode,
         })
@@ -128,14 +155,22 @@ impl SketchGenerateRequest {
         }
     }
 
-    fn into_sketch_request(self) -> Result<conkit_sketch::GenerateRequest, CliError> {
+    fn into_sketch_request(
+        self,
+        cancellation: &ApplicationCancellation,
+    ) -> Result<conkit_sketch::GenerateRequest, CliError> {
+        let mut seeds = Vec::with_capacity(self.seeds.len());
+        for seed in self.seeds {
+            cancellation.checkpoint()?;
+            seeds.push(SketchCatalogs::from_resolved_seed(seed)?);
+        }
         Ok(conkit_sketch::GenerateRequest {
-            contract_files: SketchCatalogs::from_signature_catalog(self.contract_files)?,
-            seeds: self
-                .seeds
-                .into_iter()
-                .map(SketchCatalogs::from_resolved_seed)
-                .collect::<Result<Vec<_>, CliError>>()?,
+            contract_files: SketchCatalogs::from_signature_catalog(
+                self.contract_files,
+                cancellation,
+            )?,
+            seeds,
+            mode: conkit_sketch::GenerateMode::FullRefresh,
         })
     }
 }
@@ -144,13 +179,18 @@ impl SketchGenerateRequest {
 #[derive(Debug)]
 pub(crate) struct SketchGenerateResponse {
     contract_files: conkit_signature::FileCatalog,
-    sketch_count: usize,
+    counts: conkit_sketch::SketchGenerationCounts,
 }
 
 impl SketchGenerateResponse {
-    /// Consumes the response into its completed documents and refreshed count.
-    pub(crate) fn into_parts(self) -> (conkit_signature::FileCatalog, usize) {
-        (self.contract_files, self.sketch_count)
+    /// Consumes the response into its completed documents and cohesive counts.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        conkit_signature::FileCatalog,
+        conkit_sketch::SketchGenerationCounts,
+    ) {
+        (self.contract_files, self.counts)
     }
 }
 
@@ -159,10 +199,12 @@ struct SketchCatalogs;
 impl SketchCatalogs {
     fn from_signature_catalog(
         catalog: conkit_signature::FileCatalog,
+        cancellation: &ApplicationCancellation,
     ) -> Result<conkit_sketch::FileCatalog, CliError> {
         let mut converted = conkit_sketch::FileCatalog::new();
 
         for (path, bytes) in catalog.into_entries() {
+            cancellation.checkpoint()?;
             converted.insert(conkit_sketch::CatalogPath::new(path.as_str())?, bytes)?;
         }
 
@@ -171,10 +213,12 @@ impl SketchCatalogs {
 
     fn into_signature_catalog(
         catalog: conkit_sketch::FileCatalog,
+        cancellation: &ApplicationCancellation,
     ) -> Result<conkit_signature::FileCatalog, CliError> {
         let mut converted = conkit_signature::FileCatalog::new();
 
         for (path, bytes) in catalog.into_entries() {
+            cancellation.checkpoint()?;
             converted.insert(conkit_signature::CatalogPath::new(path.as_str())?, bytes)?;
         }
 
@@ -186,6 +230,7 @@ impl SketchCatalogs {
     ) -> Result<conkit_sketch::SketchSeed, CliError> {
         Ok(conkit_sketch::SketchSeed {
             contract_file: conkit_sketch::CatalogPath::new(seed.contract_file.as_str())?,
+            document_index: seed.document_index,
             sketch_id: seed.sketch_id,
             signature_type: seed.signature_type,
             file: conkit_sketch::CatalogPath::new(seed.file.as_str())?,
@@ -226,7 +271,7 @@ mod tests {
             report,
             conkit_sketch::CheckMode::Warning,
         )
-        .into_sketch_request()
+        .into_sketch_request(&crate::context::ApplicationCancellation::new())
         .expect("converted request");
 
         assert_eq!(request.source_files.len(), 1);
@@ -251,6 +296,7 @@ mod tests {
             .expect("contract entry");
         let seed = conkit_signature::ResolvedSketchSeed {
             contract_file: contract_path,
+            document_index: 2,
             sketch_id: "answer_path".to_owned(),
             signature_type: "function".to_owned(),
             file: source_path,
@@ -258,35 +304,66 @@ mod tests {
         };
 
         let request = SketchGenerateRequest::new(contract_files, vec![seed])
-            .into_sketch_request()
+            .into_sketch_request(&crate::context::ApplicationCancellation::new())
             .expect("converted request");
 
         assert_eq!(request.contract_files.len(), 1);
         assert_eq!(request.seeds.len(), 1);
         assert_eq!(request.seeds[0].contract_file.as_str(), "main.yml");
+        assert_eq!(request.seeds[0].document_index, 2);
         assert_eq!(request.seeds[0].file.as_str(), "src/lib.rs");
         assert_eq!(request.seeds[0].sketch_id, "answer_path");
+        assert_eq!(request.mode, conkit_sketch::GenerateMode::FullRefresh);
     }
 
     #[test]
-    fn catalog_conversion_roundtrips_paths_bytes_and_response_parts() {
+    fn catalog_conversion_roundtrips_paths_bytes_and_cohesive_response_parts() {
         let path = CatalogPath::new("main.yml").expect("contract path");
         let mut signature_catalog = FileCatalog::new();
         signature_catalog
             .insert(path.clone(), b"contract\n".to_vec())
             .expect("contract entry");
 
+        let cancellation = crate::context::ApplicationCancellation::new();
         let sketch_catalog =
-            SketchCatalogs::from_signature_catalog(signature_catalog).expect("sketch catalog");
+            SketchCatalogs::from_signature_catalog(signature_catalog, &cancellation)
+                .expect("sketch catalog");
         let signature_catalog =
-            SketchCatalogs::into_signature_catalog(sketch_catalog).expect("signature catalog");
-        let (contract_files, sketch_count) = SketchGenerateResponse {
+            SketchCatalogs::into_signature_catalog(sketch_catalog, &cancellation)
+                .expect("signature catalog");
+        let (contract_files, counts) = SketchGenerateResponse {
             contract_files: signature_catalog,
-            sketch_count: 1,
+            counts: conkit_sketch::SketchGenerationCounts {
+                linked_sketch_count: 3,
+                refreshed_sketch_count: 3,
+                changed_sketch_count: 2,
+                changed_document_count: 1,
+            },
         }
         .into_parts();
 
         assert_eq!(contract_files.get(&path), Some(b"contract\n".as_slice()));
-        assert_eq!(sketch_count, 1);
+        assert_eq!(counts.linked_sketch_count, 3);
+        assert_eq!(counts.refreshed_sketch_count, 3);
+        assert_eq!(counts.changed_sketch_count, 2);
+        assert_eq!(counts.changed_document_count, 1);
+    }
+
+    #[test]
+    fn canceled_catalog_conversion_stops_before_domain_work() {
+        let mut signature_catalog = FileCatalog::new();
+        signature_catalog
+            .insert(
+                CatalogPath::new("main.yml").expect("contract path"),
+                b"contract\n".to_vec(),
+            )
+            .expect("contract entry");
+        let cancellation = crate::context::ApplicationCancellation::new();
+        cancellation.request();
+
+        let error = SketchCatalogs::from_signature_catalog(signature_catalog, &cancellation)
+            .expect_err("pre-canceled conversion must stop before domain dispatch");
+
+        assert!(matches!(error, crate::error::CliError::OperationCanceled));
     }
 }

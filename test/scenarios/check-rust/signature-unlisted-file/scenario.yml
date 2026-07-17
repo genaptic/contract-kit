@@ -23,7 +23,7 @@ steps:
       stderr:
         kind: exact
         value: |
-          failed to parse catalog input main.yml: signature ignored_signature references unlisted file ignored.rs
+          failed to parse catalog input main.yml document 0: signature ignored_signature references unlisted file ignored.rs
   - type: assert_tree
     actual: /output
     expected: output

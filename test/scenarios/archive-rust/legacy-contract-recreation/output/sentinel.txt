@@ -1,0 +1,1 @@
+legacy contract rejection must not publish an archive

@@ -1,5 +1,25 @@
+# BUG_RESOLUTION_PLAN [PHASE 8][MODIFICATION + TEST]
+# Citations: BUG_RESOLUTION_PLAN.md:1365-1376; BUG_AUDIT_FINDINGS.md:799-817.
+# Keep bounded weekly Cargo and Actions update queues. Advisory, license,
+# source, yanked, and unmaintained policy remains centralized in `deny.toml`;
+# explicit bans retain rationale because update tooling cannot infer every
+# archived or semantically critical upstream dependency.
 version: 2
 updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # The excluded cargo-fuzz package has an independent dependency graph and
+  # must not be folded into the three-package production workspace.
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

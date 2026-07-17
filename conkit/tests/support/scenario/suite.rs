@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde_saphyr::{DuplicateKeyPolicy, MergeKeyPolicy};
 use walkdir::WalkDir;
 
 use super::REQUIRED_COVERAGE_KEYS;
@@ -159,14 +160,19 @@ impl Scenario {
             });
         }
         let manifest_path = directory.join("scenario.yml");
-        let contents = fs::read_to_string(&manifest_path).map_err(|source| HarnessError::Read {
+        let contents = fs::read(&manifest_path).map_err(|source| HarnessError::Read {
             path: manifest_path.clone(),
             source,
         })?;
-        let manifest: Manifest =
-            serde_yaml::from_str(&contents).map_err(|source| HarnessError::Parse {
+        let options = serde_saphyr::options! {
+            duplicate_keys: DuplicateKeyPolicy::Error,
+            merge_keys: MergeKeyPolicy::Error,
+            strict_booleans: true,
+        };
+        let manifest: Manifest = serde_saphyr::from_slice_with_options(&contents, options)
+            .map_err(|source| HarnessError::Parse {
                 path: manifest_path.clone(),
-                source,
+                source: Box::new(source),
             })?;
         let scenario = Self {
             id,

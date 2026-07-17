@@ -26,12 +26,16 @@ steps:
       kind: exact
       value: |
         contracts changed
-        signature added added
-        signature changed changed
-        signature removed removed
-        sketch added added_sketch
-        sketch changed changed_sketch
-        sketch removed removed_sketch
+        signature contract digest v2 ac0dd0263330a4e7b29245798918f8e2659819ada74926afffb267ee2f087a2b
+        sketch contract digest v2 d5a28163076c8a1aeae50a9df3aeef693d6fc141530748102b411f309481b737
+        signature added added [source_semantics]
+        signature changed changed 499c21befab45e060ba45f524c5ee83d982e9e2feb74df51dda5acf1615984f2 -> c09a95aac9e1b009272f28c7cb8c3b67254fa5cf9a1de5a265b52109106a2284 [source_semantics]
+        signature removed removed [source_semantics]
+        sketch added added_sketch at main.yml document 0; source lib.rs; signature added (function); matching exact_lines_v1/at_least_one; code a1fd3059bfbc3348c0a92121b3f85110398b3d18e0c4a6c1f825fcb19651b5ab
+        sketch changed changed_sketch [code]
+        sketch previous changed_sketch at main.yml document 0; source lib.rs; signature changed (function); matching exact_lines_v1/at_least_one; code f825431dc542c34eb0b829bfab40034fc41db3652bac7bc0843ab17e67420111
+        sketch current changed_sketch at main.yml document 0; source lib.rs; signature changed (function); matching exact_lines_v1/at_least_one; code e2204608347e62722bf2be37712e191519ea2c1d2e7d719377797f49adec9ddb
+        sketch removed removed_sketch at main.yml document 0; source lib.rs; signature removed (function); matching exact_lines_v1/at_least_one; code ffc63792daa52dcb6a6af62f5f3b17439f6169df43f26f6784044233a961ecdc
     stderr:
       kind: empty
 - type: assert_tree

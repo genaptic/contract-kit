@@ -1,0 +1,12 @@
+[package]
+name = "conkit-compiler-api-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+selected = []
+broken = []
+
+[workspace]

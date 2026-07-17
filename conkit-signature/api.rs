@@ -1,21 +1,33 @@
 use crate::error::SignatureContractKitError;
 use crate::files::{CatalogPath, FileCatalog};
 use crate::inventory::{
-    InventoryComparison, InventoryDiagnostic, InventoryDiff, InventoryDiffEntry,
+    InventoryChangeCategory, InventoryComparison, InventoryDiagnostic, InventoryDiff,
+    InventoryDiffEntry, SignatureDigest,
 };
-use crate::languages::{SignatureParser, SignatureParserBackend};
-use crate::work::{AsyncWorkPool, WorkOptions};
+use crate::languages::SignatureParser;
+use crate::languages::rust::rustdoc::RustCompilerArtifact;
+use crate::limits::SignatureLimits;
+use crate::work::{AsyncWorkPool, CancellationProbe, WorkOptions};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Public handle for signature contract operations.
 ///
 /// Build a kit with [`SignatureContractKit::builder`], then call the async
-/// methods with in-memory catalog requests. Each handle owns and reuses one
-/// local Rayon pool for complete CPU-bound workflows; the returned futures
-/// remain independent of any particular async runtime. The selected worker
-/// count also bounds admitted root operations. See [`WorkOptions`] for the
-/// complete admission, cancellation, caller-deadline, and scheduling contract.
+/// methods with in-memory catalog requests. Each handle either owns a local
+/// Rayon pool or reuses a caller-supplied shared pool for complete CPU-bound
+/// workflows; the returned futures remain independent of any particular async
+/// runtime. Worker threads, active root operations, and pending admission are
+/// configured independently. See [`WorkOptions`] for the complete admission,
+/// cancellation, and scheduling contract.
+///
+/// Rust contracts use mandatory v2 extraction. Each signature-bearing
+/// document records `rust_syntax_v2` or `rust_compiler_v1`, `rust_api_v1`, an
+/// exact source allowlist, and explicit crate IDs, root paths, and target kinds.
+/// Compiler mode additionally records the validated compiler/rustdoc schema,
+/// target, features, cfg, and Cargo package/target identity supplied by the
+/// host-produced artifact.
 ///
 /// # Examples
 ///
@@ -34,7 +46,7 @@ use std::sync::Arc;
 /// ```
 /// use conkit_signature::{
 ///     CatalogPath, ContractScope, FileCatalog, GenerateDocument, GenerateRequest,
-///     GenerateTarget, SignatureContractKit,
+///     GenerateTarget, RustCrateKind, RustCrateRoot, SignatureContractKit,
 /// };
 /// use std::sync::Arc;
 ///
@@ -45,11 +57,17 @@ use std::sync::Arc;
 ///     b"pub fn answer() -> u8 { 42 }\n".to_vec(),
 /// )?;
 /// let request = GenerateRequest {
+///     extraction: conkit_signature::RustExtractionInput::Syntax,
 ///     source_files,
 ///     target: GenerateTarget::New(GenerateDocument {
 ///         contract_file: CatalogPath::new("main.yml")?,
 ///         root: "../src".to_owned(),
 ///         files: vec![CatalogPath::new("lib.rs")?],
+///         crates: vec![RustCrateRoot {
+///             id: "sample".to_owned(),
+///             root: CatalogPath::new("lib.rs")?,
+///             kind: RustCrateKind::Library,
+///         }],
 ///     }),
 ///     scope: ContractScope::Signatures,
 /// };
@@ -57,37 +75,36 @@ use std::sync::Arc;
 /// let task = async move { task_kit.generate(request).await };
 /// let response = futures_executor::block_on(task)?;
 ///
-/// assert_eq!(response.signature_count, 1);
+/// assert_eq!(response.counts.signature_count, 1);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct SignatureContractKit {
-    inner: SignatureContractKitInner,
-}
-
-enum SignatureContractKitInner {
-    Local(LocalSignatureContractKit),
+    parser: Arc<SignatureParser>,
+    work: AsyncWorkPool,
 }
 
 #[derive(Default)]
 /// Builder for [`SignatureContractKit`].
 ///
-/// The default builder uses
-/// [`WorkParallelism::RuntimeDefault`](crate::WorkParallelism::RuntimeDefault),
-/// deriving root-operation admission from Rayon's selected worker count. Use
-/// [`SignatureContractKitBuilder::with_work_options`] with
-/// [`WorkParallelism::Fixed`](crate::WorkParallelism::Fixed) to select one
-/// explicit non-zero value for both worker count and admitted root operations.
-/// See [`WorkOptions`] for the complete scheduling contract.
+/// The default builder uses [`WorkerPool::RuntimeDefault`](crate::WorkerPool::RuntimeDefault),
+/// one active root operation, and no pending queue. Use
+/// [`SignatureContractKitBuilder::with_work_options`] to configure worker
+/// ownership, active operations, and pending admission independently. See
+/// [`WorkOptions`] for the complete scheduling contract.
 ///
 /// # Examples
 ///
 /// ```
-/// use conkit_signature::{SignatureContractKitBuilder, WorkOptions, WorkParallelism};
+/// use conkit_signature::{SignatureContractKitBuilder, WorkOptions, WorkerPool};
 /// use std::num::NonZeroUsize;
 ///
 /// let kit = SignatureContractKitBuilder::default()
 ///     .with_work_options(WorkOptions {
-///         parallelism: WorkParallelism::Fixed(NonZeroUsize::MIN),
+///         pool: WorkerPool::Dedicated {
+///             worker_threads: NonZeroUsize::MIN,
+///         },
+///         max_in_flight_operations: NonZeroUsize::MIN,
+///         max_pending_operations: 8,
 ///     })
 ///     .build()?;
 /// # let _ = kit;
@@ -95,24 +112,29 @@ enum SignatureContractKitInner {
 /// ```
 pub struct SignatureContractKitBuilder {
     work: WorkOptions,
+    limits: SignatureLimits,
 }
 
 impl SignatureContractKitBuilder {
     /// Configures CPU work scheduling for the kit.
     ///
-    /// This replaces the builder's current [`WorkOptions`]. Fixed parallelism
-    /// sets both the Rayon worker count and per-kit root-operation admission
-    /// capacity; [`WorkOptions`] documents runtime independence, cancellation,
-    /// caller deadlines, host-side task bounds, and scheduling guarantees.
+    /// This replaces the builder's current [`WorkOptions`]. Worker ownership,
+    /// active root operations, and pending admission are independent;
+    /// [`WorkOptions`] documents runtime independence, cancellation, and
+    /// scheduling guarantees.
     ///
     /// # Examples
     ///
     /// ```
-    /// use conkit_signature::{SignatureContractKitBuilder, WorkOptions, WorkParallelism};
+    /// use conkit_signature::{SignatureContractKitBuilder, WorkOptions, WorkerPool};
     /// use std::num::NonZeroUsize;
     ///
     /// let builder = SignatureContractKitBuilder::default().with_work_options(WorkOptions {
-    ///     parallelism: WorkParallelism::Fixed(NonZeroUsize::MIN),
+    ///     pool: WorkerPool::Dedicated {
+    ///         worker_threads: NonZeroUsize::MIN,
+    ///     },
+    ///     max_in_flight_operations: NonZeroUsize::MIN,
+    ///     max_pending_operations: 8,
     /// });
     /// let kit = builder.build()?;
     /// # let _ = kit;
@@ -120,6 +142,12 @@ impl SignatureContractKitBuilder {
     /// ```
     pub fn with_work_options(mut self, work: WorkOptions) -> Self {
         self.work = work;
+        self
+    }
+
+    /// Replaces the resource budgets enforced for every operation.
+    pub fn with_limits(mut self, limits: SignatureLimits) -> Self {
+        self.limits = limits;
         self
     }
 
@@ -141,7 +169,8 @@ impl SignatureContractKitBuilder {
     /// ```
     pub fn build(self) -> Result<SignatureContractKit, SignatureContractKitError> {
         Ok(SignatureContractKit {
-            inner: SignatureContractKitInner::Local(LocalSignatureContractKit::new(self.work)?),
+            parser: Arc::new(SignatureParser::new(self.limits)),
+            work: AsyncWorkPool::new(self.work)?,
         })
     }
 }
@@ -164,8 +193,19 @@ impl SignatureContractKit {
 
     /// Checks source files against contract files.
     ///
-    /// Rust contract files are interpreted as combined `root`/`files` YAML documents;
-    /// callers decide how those bytes are read from or written to local files.
+    /// Rust contract files are interpreted as mandatory `contract_version: 2`
+    /// combined documents with `rust_syntax_v2`/`rust_api_v1` extraction
+    /// metadata, explicit crate roots, an exact `files` allowlist, signatures,
+    /// and nested sketches. Rust decoding, graph traversal, owner resolution,
+    /// and inventory construction are bounded by each document's allowlist.
+    /// Callers decide how those bytes are read from or written to local files.
+    ///
+    /// Syntax extraction retains modeled declarations and emits capability
+    /// warnings for compiler-dependent facts such as `cfg`, macro expansion,
+    /// and reexport resolution. [`CheckMode::Default`] permits warning-only
+    /// results, [`CheckMode::Strict`] requires no diagnostics, and
+    /// [`CheckMode::Warning`] preserves all diagnostics while passing a
+    /// completed check. Unsupported reachable syntax fails closed.
     ///
     /// # Errors
     ///
@@ -183,7 +223,8 @@ impl SignatureContractKit {
     /// ```
     /// use conkit_signature::{
     ///     CatalogPath, CheckMode, CheckRequest, ContractScope, FileCatalog,
-    ///     GenerateDocument, GenerateRequest, GenerateTarget, ReportRequest, SignatureContractKit,
+    ///     GenerateDocument, GenerateRequest, GenerateTarget, ReportRequest, RustCrateKind,
+    ///     RustCrateRoot, SignatureContractKit,
     /// };
     ///
     /// fn catalog_with(path: &str, bytes: &[u8]) -> Result<FileCatalog, Box<dyn std::error::Error>> {
@@ -195,20 +236,26 @@ impl SignatureContractKit {
     /// let kit = SignatureContractKit::builder().build()?;
     /// let source_files = catalog_with("lib.rs", b"pub fn answer() -> u8 { 42 }\n")?;
     /// let generated = futures_executor::block_on(kit.generate(GenerateRequest {
+    ///     extraction: conkit_signature::RustExtractionInput::Syntax,
     ///     source_files: source_files.clone(),
     ///     target: GenerateTarget::New(GenerateDocument {
     ///         contract_file: CatalogPath::new("main.yml")?,
     ///         root: "../src".to_owned(),
     ///         files: vec![CatalogPath::new("lib.rs")?],
+    ///         crates: vec![RustCrateRoot {
+    ///             id: "sample".to_owned(),
+    ///             root: CatalogPath::new("lib.rs")?,
+    ///             kind: RustCrateKind::Library,
+    ///         }],
     ///     }),
     ///     scope: ContractScope::Signatures,
     /// }))?;
     ///
     /// let response = futures_executor::block_on(kit.check(CheckRequest {
+    ///     extraction: conkit_signature::RustExtractionInput::Syntax,
     ///     source_files,
     ///     contract_files: generated.contract_files,
     ///     report: ReportRequest::None,
-    ///     scope: ContractScope::Signatures,
     ///     mode: CheckMode::Default,
     /// }))?;
     ///
@@ -220,12 +267,20 @@ impl SignatureContractKit {
         &self,
         request: CheckRequest,
     ) -> Result<CheckResponse, SignatureContractKitError> {
-        <Self as SignatureContractKitBackend>::check(self, request).await
+        let parser = Arc::clone(&self.parser);
+
+        self.work
+            .execute(move |cancellation| SignatureCheck::new(parser, cancellation, request).run())
+            .await?
     }
 
     /// Generates contract files from source files.
     ///
     /// Rust source entries produce combined user-named YAML contract documents.
+    /// A new document requires explicit [`RustCrateRoot`] values; target kind
+    /// and logical module identity are not inferred from `lib.rs`, `main.rs`, or
+    /// any other filename. Existing documents retain their recorded extraction
+    /// context.
     ///
     /// # Errors
     ///
@@ -244,7 +299,7 @@ impl SignatureContractKit {
     /// # Examples
     ///
     /// ```
-    /// use conkit_signature::{CatalogPath, ContractScope, FileCatalog, GenerateDocument, GenerateRequest, GenerateTarget, SignatureContractKit};
+    /// use conkit_signature::{CatalogPath, ContractScope, FileCatalog, GenerateDocument, GenerateRequest, GenerateTarget, RustCrateKind, RustCrateRoot, SignatureContractKit};
     ///
     /// let kit = SignatureContractKit::builder().build()?;
     /// let mut source_files = FileCatalog::new();
@@ -254,17 +309,23 @@ impl SignatureContractKit {
     /// )?;
     ///
     /// let response = futures_executor::block_on(kit.generate(GenerateRequest {
+    ///     extraction: conkit_signature::RustExtractionInput::Syntax,
     ///     source_files,
     ///     target: GenerateTarget::New(GenerateDocument {
     ///         contract_file: CatalogPath::new("main.yml")?,
     ///         root: "../src".to_owned(),
     ///         files: vec![CatalogPath::new("lib.rs")?],
+    ///         crates: vec![RustCrateRoot {
+    ///             id: "sample".to_owned(),
+    ///             root: CatalogPath::new("lib.rs")?,
+    ///             kind: RustCrateKind::Library,
+    ///         }],
     ///     }),
     ///     scope: ContractScope::Signatures,
     /// }))?;
     ///
-    /// assert_eq!(response.signature_count, 1);
-    /// assert_eq!(response.sketch_count, 0);
+    /// assert_eq!(response.counts.signature_count, 1);
+    /// assert_eq!(response.counts.preserved_sketch_count, 0);
     /// assert!(response.contract_files.get(&CatalogPath::new("main.yml")?).is_some());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -272,15 +333,41 @@ impl SignatureContractKit {
         &self,
         request: GenerateRequest,
     ) -> Result<GenerateResponse, SignatureContractKitError> {
-        <Self as SignatureContractKitBackend>::generate(self, request).await
+        let parser = Arc::clone(&self.parser);
+
+        self.work
+            .execute(move |cancellation| {
+                let mut catalog_usage = parser.limits().catalog.usage();
+                cancellation.checkpoint()?;
+                catalog_usage.record(&request.source_files, &cancellation)?;
+                cancellation.checkpoint()?;
+                if let GenerateTarget::Existing(contract_files) = &request.target {
+                    catalog_usage.record(contract_files, &cancellation)?;
+                    cancellation.checkpoint()?;
+                }
+                let GenerateRequest {
+                    source_files,
+                    target,
+                    extraction,
+                    scope,
+                } = request;
+                parser.generate_contract_files(
+                    source_files,
+                    target,
+                    extraction,
+                    scope,
+                    &cancellation,
+                )
+            })
+            .await?
     }
 
     /// Resolves every explicitly linked sketch to its exact Rust source item.
     ///
-    /// Item macros with the same file, module path, and semantic name are
-    /// distinguished by one-based declaration occurrence. Contract signature
-    /// order reconstructs those occurrences, so each link selects the exact
-    /// corresponding macro item text.
+    /// Structurally repeatable items with the same crate, module path, item
+    /// kind, and semantic name are distinguished by one-based declaration
+    /// occurrence. Contract signature order reconstructs those occurrences, so
+    /// each link selects the exact corresponding item text.
     ///
     /// # Errors
     ///
@@ -311,32 +398,43 @@ impl SignatureContractKit {
     /// let kit = SignatureContractKit::builder().build()?;
     /// let response = futures_executor::block_on(kit.resolve_sketches(
     ///     ResolveSketchesRequest {
+    ///         extraction: conkit_signature::RustExtractionInput::Syntax,
     ///         source_files: catalog(
     ///             "lib.rs",
     ///             b"include!(\"first.rs\");\ninclude!(\"second.rs\");\n",
     ///         )?,
     ///         contract_files: catalog(
     ///             "main.yml",
-    ///             br#"root: ../src
+    ///             br#"contract_version: 2
+    /// root: ../src
     /// files: [lib.rs]
+    /// extraction: { mode: rust_syntax_v2, profile: rust_api_v1, crates: [{ id: sample, root: lib.rs, kind: library }] }
     /// signatures:
     ///   - first_include:
     ///       file: lib.rs
     ///       signature_type: macro
     ///       name: include
+    ///       tokens: 'include ! ("first.rs")'
     ///       sketch: first
     ///   - second_include:
     ///       file: lib.rs
     ///       signature_type: macro
     ///       name: include
+    ///       tokens: 'include ! ("second.rs")'
     ///       sketch: second
     /// sketches:
     ///   - first:
-    ///     signature_type: macro
-    ///     code: old
+    ///       file: lib.rs
+    ///       signature: first_include
+    ///       signature_type: macro
+    ///       matching: { normalization: exact_lines_v1, occurrence: exactly_one }
+    ///       code: old
     ///   - second:
-    ///     signature_type: macro
-    ///     code: old
+    ///       file: lib.rs
+    ///       signature: second_include
+    ///       signature_type: macro
+    ///       matching: { normalization: exact_lines_v1, occurrence: exactly_one }
+    ///       code: old
     /// "#,
     ///         )?,
     ///     },
@@ -356,7 +454,19 @@ impl SignatureContractKit {
         &self,
         request: ResolveSketchesRequest,
     ) -> Result<ResolveSketchesResponse, SignatureContractKitError> {
-        <Self as SignatureContractKitBackend>::resolve_sketches(self, request).await
+        let parser = Arc::clone(&self.parser);
+
+        self.work
+            .execute(move |cancellation| {
+                let mut catalog_usage = parser.limits().catalog.usage();
+                cancellation.checkpoint()?;
+                catalog_usage.record(&request.source_files, &cancellation)?;
+                cancellation.checkpoint()?;
+                catalog_usage.record(&request.contract_files, &cancellation)?;
+                cancellation.checkpoint()?;
+                parser.resolve_sketches(request, &cancellation)
+            })
+            .await?
     }
 
     /// Diffs current signature contract files against previous contract files.
@@ -376,7 +486,8 @@ impl SignatureContractKit {
     /// ```
     /// use conkit_signature::{
     ///     CatalogPath, ContractScope, DiffRequest, FileCatalog, GenerateDocument,
-    ///     GenerateRequest, GenerateTarget, SignatureContractKit,
+    ///     GenerateRequest, GenerateTarget, RustCrateKind, RustCrateRoot,
+    ///     SignatureContractKit,
     /// };
     ///
     /// fn source(path: &str, bytes: &[u8]) -> Result<FileCatalog, Box<dyn std::error::Error>> {
@@ -387,11 +498,17 @@ impl SignatureContractKit {
     ///
     /// let kit = SignatureContractKit::builder().build()?;
     /// let contracts = futures_executor::block_on(kit.generate(GenerateRequest {
+    ///     extraction: conkit_signature::RustExtractionInput::Syntax,
     ///     source_files: source("lib.rs", b"pub fn answer() {}\n")?,
     ///     target: GenerateTarget::New(GenerateDocument {
     ///         contract_file: CatalogPath::new("main.yml")?,
     ///         root: "../src".to_owned(),
     ///         files: vec![CatalogPath::new("lib.rs")?],
+    ///         crates: vec![RustCrateRoot {
+    ///             id: "sample".to_owned(),
+    ///             root: CatalogPath::new("lib.rs")?,
+    ///             kind: RustCrateKind::Library,
+    ///         }],
     ///     }),
     ///     scope: ContractScope::Signatures,
     /// }))?
@@ -401,7 +518,7 @@ impl SignatureContractKit {
     ///     previous_contract_files: contracts,
     /// }))?;
     ///
-    /// assert!(!diff.changed);
+    /// assert!(!diff.changed());
     /// assert!(diff.entries.is_empty());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -409,101 +526,85 @@ impl SignatureContractKit {
         &self,
         request: DiffRequest,
     ) -> Result<DiffResponse, SignatureContractKitError> {
-        <Self as SignatureContractKitBackend>::diff(self, request).await
-    }
-}
+        let parser = Arc::clone(&self.parser);
 
-pub(crate) trait SignatureContractKitBackend {
-    async fn check(
-        &self,
-        request: CheckRequest,
-    ) -> Result<CheckResponse, SignatureContractKitError>;
-
-    async fn generate(
-        &self,
-        request: GenerateRequest,
-    ) -> Result<GenerateResponse, SignatureContractKitError>;
-
-    async fn resolve_sketches(
-        &self,
-        request: ResolveSketchesRequest,
-    ) -> Result<ResolveSketchesResponse, SignatureContractKitError>;
-
-    async fn diff(&self, request: DiffRequest) -> Result<DiffResponse, SignatureContractKitError>;
-}
-
-impl SignatureContractKitBackend for SignatureContractKit {
-    async fn check(
-        &self,
-        request: CheckRequest,
-    ) -> Result<CheckResponse, SignatureContractKitError> {
-        match &self.inner {
-            SignatureContractKitInner::Local(inner) => inner.check(request).await,
-        }
-    }
-
-    async fn generate(
-        &self,
-        request: GenerateRequest,
-    ) -> Result<GenerateResponse, SignatureContractKitError> {
-        match &self.inner {
-            SignatureContractKitInner::Local(inner) => inner.generate(request).await,
-        }
-    }
-
-    async fn resolve_sketches(
-        &self,
-        request: ResolveSketchesRequest,
-    ) -> Result<ResolveSketchesResponse, SignatureContractKitError> {
-        match &self.inner {
-            SignatureContractKitInner::Local(inner) => inner.resolve_sketches(request).await,
-        }
-    }
-
-    async fn diff(&self, request: DiffRequest) -> Result<DiffResponse, SignatureContractKitError> {
-        match &self.inner {
-            SignatureContractKitInner::Local(inner) => inner.diff(request).await,
-        }
+        self.work
+            .execute(move |cancellation| SignatureDiff::new(parser, cancellation, request).run())
+            .await?
     }
 }
 
 struct SignatureCheck {
     parser: Arc<SignatureParser>,
+    cancellation: CancellationProbe,
     request: CheckRequest,
 }
 
 impl SignatureCheck {
-    fn new(parser: Arc<SignatureParser>, request: CheckRequest) -> Self {
-        Self { parser, request }
+    fn new(
+        parser: Arc<SignatureParser>,
+        cancellation: CancellationProbe,
+        request: CheckRequest,
+    ) -> Self {
+        Self {
+            parser,
+            cancellation,
+            request,
+        }
     }
 
     fn run(self) -> Result<CheckResponse, SignatureContractKitError> {
         let CheckRequest {
             source_files,
             contract_files,
+            extraction,
             report,
-            scope: _,
             mode,
         } = self.request;
-        let (source, contract) = self
-            .parser
-            .parse_check_inventories(source_files, contract_files)?;
-        let comparison = source.compare_against(&contract)?;
-        let mut response = CheckResponse::from_inventory_comparison(comparison, mode);
+        let limits = self.parser.limits();
+        let mut catalog_usage = limits.catalog.usage();
+        self.cancellation.checkpoint()?;
+        catalog_usage.record(&source_files, &self.cancellation)?;
+        self.cancellation.checkpoint()?;
+        catalog_usage.record(&contract_files, &self.cancellation)?;
+        self.cancellation.checkpoint()?;
+        let parsed = self.parser.parse_check_inventories(
+            source_files,
+            contract_files,
+            extraction,
+            &self.cancellation,
+        )?;
+        let comparison = parsed.compare(&limits.diagnostics, &self.cancellation)?;
+        let mut response = CheckResponse::from_inventory_comparison(
+            comparison,
+            parsed.capability_warning_messages(),
+            mode,
+            &limits.diagnostics,
+            &self.cancellation,
+        )?;
 
-        response.report_files = ReportFiles::new(report).render(&response)?;
+        response.report_files = report.render(&response, limits, &self.cancellation)?;
         Ok(response)
     }
 }
 
 struct SignatureDiff {
     parser: Arc<SignatureParser>,
+    cancellation: CancellationProbe,
     request: DiffRequest,
 }
 
 impl SignatureDiff {
-    fn new(parser: Arc<SignatureParser>, request: DiffRequest) -> Self {
-        Self { parser, request }
+    fn new(
+        parser: Arc<SignatureParser>,
+        cancellation: CancellationProbe,
+        request: DiffRequest,
+    ) -> Self {
+        Self {
+            parser,
+            cancellation,
+            request,
+        }
     }
 
     fn run(self) -> Result<DiffResponse, SignatureContractKitError> {
@@ -511,112 +612,49 @@ impl SignatureDiff {
             current_contract_files,
             previous_contract_files,
         } = self.request;
-        let current = self
-            .parser
-            .parse_contract_inventory(current_contract_files)?;
-        let previous = self
-            .parser
-            .parse_contract_inventory(previous_contract_files)?;
+        let limits = self.parser.limits();
+        let mut catalog_usage = limits.catalog.usage();
+        self.cancellation.checkpoint()?;
+        catalog_usage.record(&current_contract_files, &self.cancellation)?;
+        self.cancellation.checkpoint()?;
+        catalog_usage.record(&previous_contract_files, &self.cancellation)?;
+        self.cancellation.checkpoint()?;
+        let (current, previous) = self.parser.parse_contract_diff_inventories(
+            current_contract_files,
+            previous_contract_files,
+            &self.cancellation,
+        )?;
 
-        Ok(DiffResponse::from_inventory_diff(
-            current.diff_against(&previous)?,
-        ))
+        DiffResponse::from_inventory_diff(
+            current.diff_against(&previous, &limits.diagnostics, &self.cancellation)?,
+            &limits.diagnostics,
+            &self.cancellation,
+        )
     }
 }
 
-struct LocalSignatureContractKit {
-    parser: Arc<SignatureParser>,
-    work: AsyncWorkPool,
-}
-
-impl LocalSignatureContractKit {
-    fn new(work: WorkOptions) -> Result<Self, SignatureContractKitError> {
-        Ok(Self {
-            parser: Arc::new(SignatureParser::default()),
-            work: AsyncWorkPool::new(work)?,
-        })
-    }
-}
-
-impl SignatureContractKitBackend for LocalSignatureContractKit {
-    async fn check(
-        &self,
-        request: CheckRequest,
-    ) -> Result<CheckResponse, SignatureContractKitError> {
-        let parser = Arc::clone(&self.parser);
-
-        self.work
-            .execute(move || SignatureCheck::new(parser, request).run())
-            .await?
-    }
-
-    async fn generate(
-        &self,
-        request: GenerateRequest,
-    ) -> Result<GenerateResponse, SignatureContractKitError> {
-        let parser = Arc::clone(&self.parser);
-
-        self.work
-            .execute(move || {
-                let GenerateRequest {
-                    source_files,
-                    target,
-                    scope,
-                } = request;
-                parser.generate_contract_files(source_files, target, scope)
-            })
-            .await?
-    }
-
-    async fn resolve_sketches(
-        &self,
-        request: ResolveSketchesRequest,
-    ) -> Result<ResolveSketchesResponse, SignatureContractKitError> {
-        let parser = Arc::clone(&self.parser);
-
-        self.work
-            .execute(move || parser.resolve_sketches(request))
-            .await?
-    }
-
-    async fn diff(&self, request: DiffRequest) -> Result<DiffResponse, SignatureContractKitError> {
-        let parser = Arc::clone(&self.parser);
-
-        self.work
-            .execute(move || SignatureDiff::new(parser, request).run())
-            .await?
-    }
-}
-
-struct ReportFiles {
-    request: ReportRequest,
-}
-
-impl ReportFiles {
-    fn new(request: ReportRequest) -> Self {
-        Self { request }
-    }
-
-    fn render(&self, response: &CheckResponse) -> Result<FileCatalog, SignatureContractKitError> {
-        match &self.request {
+impl ReportRequest {
+    fn render(
+        self,
+        response: &CheckResponse,
+        limits: &SignatureLimits,
+        cancellation: &CancellationProbe,
+    ) -> Result<FileCatalog, SignatureContractKitError> {
+        cancellation.checkpoint()?;
+        match self {
             ReportRequest::None => Ok(FileCatalog::new()),
             ReportRequest::Generate {
                 format,
                 output_file,
             } => {
-                let report = CheckReport::from_response(response);
+                let report = response.report_view();
+                let mut output = limits.output.meter(cancellation);
                 let bytes = match format {
-                    ReportFormat::Yaml => serde_yaml::to_string(&report)
-                        .map(String::into_bytes)
-                        .map_err(|source| {
-                            SignatureContractKitError::write_failed(output_file, source.to_string())
-                        })?,
-                    ReportFormat::Json => serde_json::to_vec_pretty(&report).map_err(|source| {
-                        SignatureContractKitError::write_failed(output_file, source.to_string())
-                    })?,
+                    ReportFormat::Yaml => output.serialize_yaml(&output_file, &report)?,
+                    ReportFormat::Json => output.serialize_pretty_json(&output_file, &report)?,
                 };
                 let mut files = FileCatalog::new();
-                files.insert(output_file.clone(), bytes)?;
+                files.insert(output_file, bytes)?;
 
                 Ok(files)
             }
@@ -624,29 +662,53 @@ impl ReportFiles {
     }
 }
 
-#[derive(Serialize)]
-struct CheckReport<'a> {
-    passed: bool,
-    counts: &'a SignatureCheckCounts,
-    inventory_digest: &'a Option<String>,
-    diagnostics: &'a [CheckDiagnostic],
+#[derive(Clone, Copy)]
+enum CheckReportLayout {
+    Standalone,
+    Embedded,
 }
 
-impl<'a> CheckReport<'a> {
-    fn from_response(response: &'a CheckResponse) -> Self {
-        Self {
-            passed: response.passed,
-            counts: &response.counts,
-            inventory_digest: &response.inventory_digest,
-            diagnostics: &response.diagnostics,
+struct CheckReportView<'response> {
+    response: &'response CheckResponse,
+    layout: CheckReportLayout,
+}
+
+impl<'response> CheckReportView<'response> {
+    fn new(response: &'response CheckResponse, layout: CheckReportLayout) -> Self {
+        Self { response, layout }
+    }
+}
+
+impl Serialize for CheckReportView<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+
+        let mut report = serializer.serialize_struct("CheckReport", 5)?;
+        report.serialize_field("passed", &self.response.passed)?;
+        match self.layout {
+            CheckReportLayout::Standalone => {
+                report
+                    .serialize_field("source_shape_digest", &self.response.source_shape_digest)?;
+                report.serialize_field("digest_version", &self.response.digest_version)?;
+                report.serialize_field("counts", &self.response.counts)?;
+            }
+            CheckReportLayout::Embedded => {
+                report.serialize_field("counts", &self.response.counts)?;
+                report
+                    .serialize_field("source_shape_digest", &self.response.source_shape_digest)?;
+                report.serialize_field("digest_version", &self.response.digest_version)?;
+            }
         }
+        report.serialize_field("diagnostics", &self.response.diagnostics)?;
+        report.end()
     }
 }
 
 /// Selects whether signature generation may coordinate linked-sketch cleanup.
 ///
-/// Checking currently treats both variants identically and compares the same
-/// signature inventory.
 /// [`ContractScope::Signatures`] preserves every valid sketch link and rejects
 /// a signature update that would orphan one. [`ContractScope::All`] allows a
 /// stale signature and its linked sketch record to be removed together before
@@ -674,22 +736,30 @@ impl<'a> CheckReport<'a> {
 /// let source_files = catalog("main.rs", b"// main was removed\n")?;
 /// let existing = catalog(
 ///     "main.yml",
-///     br#"root: ../src
+///     br#"contract_version: 2
+/// root: ../src
 /// files: [main.rs]
+/// extraction: { mode: rust_syntax_v2, profile: rust_api_v1, crates: [{ id: app, root: main.rs, kind: binary }] }
 /// signatures:
 ///   - main:
 ///       file: main.rs
-///       signature_type: main_method
+///       signature_type: function
+///       name: main
+///       visibility: private
 ///       sketch: main
 /// sketches:
 ///   - main:
-///     signature_type: main_method
-///     code: |
-///       fn main() {}
+///       file: main.rs
+///       signature: main
+///       signature_type: function
+///       matching: { normalization: exact_lines_v1, occurrence: exactly_one }
+///       code: |
+///         fn main() {}
 /// "#,
 /// )?;
 ///
 /// let signatures_only = futures_executor::block_on(kit.generate(GenerateRequest {
+///     extraction: conkit_signature::RustExtractionInput::Syntax,
 ///     source_files: source_files.clone(),
 ///     target: GenerateTarget::Existing(existing.clone()),
 ///     scope: ContractScope::Signatures,
@@ -697,6 +767,7 @@ impl<'a> CheckReport<'a> {
 /// assert!(signatures_only.unwrap_err().to_string().contains("orphan"));
 ///
 /// let all = futures_executor::block_on(kit.generate(GenerateRequest {
+///     extraction: conkit_signature::RustExtractionInput::Syntax,
 ///     source_files,
 ///     target: GenerateTarget::Existing(existing),
 ///     scope: ContractScope::All,
@@ -706,14 +777,19 @@ impl<'a> CheckReport<'a> {
 ///         .get(&CatalogPath::new("main.yml")?)
 ///         .expect("updated contract"),
 /// )?;
-/// assert_eq!(all.signature_count, 0);
-/// assert_eq!(all.sketch_count, 0);
-/// assert!(!yaml.contains("main_method"));
+/// assert_eq!(all.counts.signature_count, 0);
+/// assert_eq!(all.counts.preserved_sketch_count, 0);
+/// assert!(!yaml.contains("name: main"));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ContractScope {
     /// Coordinate signatures with linked records for an all-family workflow.
+    ///
+    /// Generation returns exact source seeds for every surviving linked sketch
+    /// in [`GenerateResponse::resolved_sketch_seeds`]. Those seeds come from
+    /// the same parsed source projection used to regenerate the signature
+    /// documents, so callers do not need a second extraction request.
     All,
     /// Process signatures while preserving the sketch section.
     Signatures,
@@ -721,19 +797,50 @@ pub enum ContractScope {
 
 /// Determines whether diagnostics fail a check response.
 ///
-/// [`CheckMode::Default`] and [`CheckMode::Strict`] currently both fail a
-/// response containing any diagnostic. [`CheckMode::Warning`] preserves the
-/// diagnostics while allowing the response to pass.
+/// [`CheckMode::Default`] permits syntax-extraction capability warnings but
+/// fails source/contract comparison errors. [`CheckMode::Strict`] requires a
+/// diagnostic-free response. [`CheckMode::Warning`] preserves every
+/// diagnostic while allowing the response to pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CheckMode {
-    /// Fail the check when the comparison emits any diagnostic.
+    /// Permit capability warnings but fail comparison errors.
     Default,
-    /// Fail the check when the comparison emits any diagnostic.
-    ///
-    /// This currently has the same pass/fail behavior as [`CheckMode::Default`].
+    /// Fail the check when any error or capability warning is emitted.
     Strict,
     /// Keep diagnostics but allow the check response to pass.
     Warning,
+}
+
+impl CheckMode {
+    fn passed(self, diagnostics: &[CheckDiagnostic]) -> bool {
+        match self {
+            Self::Default => diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.severity() == DiagnosticSeverity::Warning),
+            Self::Strict => diagnostics.is_empty(),
+            Self::Warning => true,
+        }
+    }
+}
+
+/// Severity assigned to one completed signature-check diagnostic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    /// The source/API contract does not match and enforcing modes must fail.
+    Error,
+    /// Syntax extraction retained a fact that needs compiler context.
+    Warning,
+}
+
+/// Semantic category assigned to one signature-check diagnostic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckDiagnosticCategory {
+    /// A caller-visible source/API signature differs from the contract.
+    SourceSemantics,
+    /// Syntax extraction cannot fully evaluate a retained semantic fact.
+    SyntaxCapability,
 }
 
 /// Output encoding for generated check reports.
@@ -745,29 +852,48 @@ pub enum ReportFormat {
     Json,
 }
 
+/// Selects the Rust extraction capability for a source-backed operation.
+///
+/// Syntax extraction is the portable default and derives signatures from the
+/// supplied source catalog plus contract crate-root metadata. Compiler
+/// extraction consumes one versioned, host-produced rustdoc artifact; this
+/// crate still performs no process, Cargo, or filesystem work.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode", content = "artifact")]
+pub enum RustExtractionInput {
+    /// Use the mandatory-v2, allowlist-bounded syntax extractor.
+    #[default]
+    Syntax,
+    /// Use compiler-resolved public API facts from the supplied artifact.
+    Compiler(RustCompilerArtifact),
+}
+
 /// Request for [`SignatureContractKit::check`].
 ///
 /// The caller owns filesystem discovery and provides both source and contract
-/// bytes as [`FileCatalog`] values. Rust contract files use the combined
-/// `root`/`files`/user-named `signatures`/flattened `sketches` document shape.
-/// Versioned `language: rust` shorthand is rejected.
+/// bytes as [`FileCatalog`] values. Rust contract files use the mandatory-v2
+/// combined shape: `rust_syntax_v2`/`rust_api_v1` extraction metadata, explicit
+/// typed crate roots, `root`, an exact `files` allowlist, user-named
+/// `signatures`, and nested `sketches`. Missing, legacy, future, or unknown
+/// extraction versions fail closed. The selected [`CheckMode`] controls whether
+/// deterministic syntax-capability warnings fail an otherwise matching check.
 ///
 /// # Examples
 ///
 /// ```
 /// use conkit_signature::{
-///     CheckMode, CheckRequest, ContractScope, FileCatalog, ReportRequest,
+///     CheckMode, CheckRequest, FileCatalog, ReportRequest,
 /// };
 ///
 /// let request = CheckRequest {
+///     extraction: conkit_signature::RustExtractionInput::Syntax,
 ///     source_files: FileCatalog::new(),
 ///     contract_files: FileCatalog::new(),
 ///     report: ReportRequest::None,
-///     scope: ContractScope::Signatures,
 ///     mode: CheckMode::Default,
 /// };
 ///
-/// assert_eq!(request.scope, ContractScope::Signatures);
+/// assert_eq!(request.mode, CheckMode::Default);
 /// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckRequest {
@@ -780,12 +906,11 @@ pub struct CheckRequest {
     ///
     /// Rust signature contracts must be root-level combined YAML documents.
     pub contract_files: FileCatalog,
+    /// Rust extraction capability and optional compiler artifact.
+    #[serde(default)]
+    pub extraction: RustExtractionInput,
     /// Optional report output request.
     pub report: ReportRequest,
-    /// Scope marker for the check.
-    ///
-    /// Both variants currently compare the same signature inventory.
-    pub scope: ContractScope,
     /// Diagnostic pass/fail behavior.
     pub mode: CheckMode,
 }
@@ -822,38 +947,69 @@ pub enum ReportRequest {
 pub struct CheckResponse {
     /// Whether the check passed under the requested [`CheckMode`].
     pub passed: bool,
+    /// Digest for caller-visible source/API shape only.
+    pub source_shape_digest: String,
+    /// Canonical signature digest format version.
+    pub digest_version: u16,
     /// Source and contract signature totals.
     pub counts: SignatureCheckCounts,
-    /// Digest for the compared, grouped source inventory.
-    ///
-    /// Every successful check currently returns `Some`; the optional shape is
-    /// retained as part of the public response contract.
-    pub inventory_digest: Option<String>,
-    /// Differences found during the check.
+    /// Comparison errors followed by deterministic syntax-capability warnings.
     pub diagnostics: Vec<CheckDiagnostic>,
     /// Generated report files, or an empty catalog when no report was requested.
     pub report_files: FileCatalog,
 }
 
 impl CheckResponse {
-    fn from_inventory_comparison(comparison: InventoryComparison, mode: CheckMode) -> Self {
-        let diagnostics = comparison
-            .diagnostics()
-            .iter()
-            .map(CheckDiagnostic::from_inventory_diagnostic)
-            .collect::<Vec<_>>();
-        let passed = diagnostics.is_empty() || mode == CheckMode::Warning;
+    /// Borrows the standalone check-report payload without `report_files`.
+    ///
+    /// The returned opaque value implements [`Serialize`] and preserves the
+    /// established standalone field order.
+    pub fn report_view(&self) -> impl Serialize + '_ {
+        CheckReportView::new(self, CheckReportLayout::Standalone)
+    }
 
-        Self {
+    /// Borrows the check-report payload used inside a combined CLI report.
+    ///
+    /// This layout preserves the established embedded field order and omits
+    /// `report_files`.
+    pub fn embedded_report_view(&self) -> impl Serialize + '_ {
+        CheckReportView::new(self, CheckReportLayout::Embedded)
+    }
+
+    fn from_inventory_comparison(
+        comparison: InventoryComparison,
+        capability_warnings: impl IntoIterator<Item = String>,
+        mode: CheckMode,
+        limits: &crate::limits::DiagnosticLimits,
+        cancellation: &CancellationProbe,
+    ) -> Result<Self, SignatureContractKitError> {
+        let mut usage = limits.usage()?;
+        let mut diagnostics = Vec::new();
+        for diagnostic in comparison.diagnostics() {
+            cancellation.checkpoint()?;
+            let diagnostic = CheckDiagnostic::from_inventory_diagnostic(diagnostic);
+            usage.record(&diagnostic)?;
+            diagnostics.push(diagnostic);
+        }
+        for message in capability_warnings {
+            cancellation.checkpoint()?;
+            let diagnostic = CheckDiagnostic::Warning { message };
+            usage.record(&diagnostic)?;
+            diagnostics.push(diagnostic);
+        }
+        let passed = mode.passed(&diagnostics);
+
+        Ok(Self {
             passed,
+            source_shape_digest: comparison.source_shape_digest().render(),
+            digest_version: SignatureDigest::VERSION,
             counts: SignatureCheckCounts {
                 source_signature_count: comparison.source_signature_count(),
                 contract_signature_count: comparison.contract_signature_count(),
             },
-            inventory_digest: Some(comparison.inventory_digest().as_str().to_owned()),
             diagnostics,
             report_files: FileCatalog::new(),
-        }
+        })
     }
 }
 
@@ -879,7 +1035,7 @@ pub struct SignatureCheckCounts {
 /// use conkit_signature::{
 ///     CatalogPath, CheckDiagnostic, CheckMode, CheckRequest, ContractScope,
 ///     FileCatalog, GenerateDocument, GenerateRequest, GenerateTarget, ReportRequest,
-///     SignatureContractKit,
+///     RustCrateKind, RustCrateRoot, SignatureContractKit,
 /// };
 ///
 /// let kit = SignatureContractKit::builder().build()?;
@@ -889,11 +1045,17 @@ pub struct SignatureCheckCounts {
 ///     b"pub fn expected_only() {}\n".to_vec(),
 /// )?;
 /// let expected_contracts = futures_executor::block_on(kit.generate(GenerateRequest {
+///     extraction: conkit_signature::RustExtractionInput::Syntax,
 ///     source_files: expected_source,
 ///     target: GenerateTarget::New(GenerateDocument {
 ///         contract_file: CatalogPath::new("main.yml")?,
 ///         root: "../src".to_owned(),
 ///         files: vec![CatalogPath::new("lib.rs")?],
+///         crates: vec![RustCrateRoot {
+///             id: "sample".to_owned(),
+///             root: CatalogPath::new("lib.rs")?,
+///             kind: RustCrateKind::Library,
+///         }],
 ///     }),
 ///     scope: ContractScope::Signatures,
 /// }))?
@@ -905,10 +1067,10 @@ pub struct SignatureCheckCounts {
 /// )?;
 ///
 /// let response = futures_executor::block_on(kit.check(CheckRequest {
+///     extraction: conkit_signature::RustExtractionInput::Syntax,
 ///     source_files: actual_source,
 ///     contract_files: expected_contracts,
 ///     report: ReportRequest::None,
-///     scope: ContractScope::Signatures,
 ///     mode: CheckMode::Strict,
 /// }))?;
 ///
@@ -943,11 +1105,13 @@ pub enum CheckDiagnostic {
         /// Digest from the source inventory.
         actual_digest: String,
     },
-    /// A warning diagnostic representation.
+    /// Syntax-extraction capability evidence retained by `rust_syntax_v2`.
     ///
-    /// The current checker does not emit this variant. The variant itself is
-    /// not inherently non-failing; [`CheckMode`] determines response pass/fail
-    /// behavior.
+    /// The warning explains a semantic fact that syntax extraction preserves
+    /// but cannot evaluate, such as conditional compilation, macro expansion,
+    /// or a reexport target. [`CheckMode`] determines whether the retained
+    /// warning fails the response. Unsupported reachable syntax is an operation
+    /// error rather than a warning or silently omitted declaration.
     Warning {
         /// Warning text.
         message: String,
@@ -955,6 +1119,26 @@ pub enum CheckDiagnostic {
 }
 
 impl CheckDiagnostic {
+    /// Returns the pass/fail severity used by [`CheckMode`].
+    pub fn severity(&self) -> DiagnosticSeverity {
+        match self {
+            Self::Missing { .. } | Self::Extra { .. } | Self::Mismatched { .. } => {
+                DiagnosticSeverity::Error
+            }
+            Self::Warning { .. } => DiagnosticSeverity::Warning,
+        }
+    }
+
+    /// Returns the semantic boundary that produced this diagnostic.
+    pub fn category(&self) -> CheckDiagnosticCategory {
+        match self {
+            Self::Missing { .. } | Self::Extra { .. } | Self::Mismatched { .. } => {
+                CheckDiagnosticCategory::SourceSemantics
+            }
+            Self::Warning { .. } => CheckDiagnosticCategory::SyntaxCapability,
+        }
+    }
+
     fn from_inventory_diagnostic(diagnostic: &InventoryDiagnostic) -> Self {
         match diagnostic {
             InventoryDiagnostic::Missing { signature_id } => Self::Missing {
@@ -969,8 +1153,8 @@ impl CheckDiagnostic {
                 actual_digest,
             } => Self::Mismatched {
                 signature_id: signature_id.as_str().to_owned(),
-                expected_digest: expected_digest.as_str().to_owned(),
-                actual_digest: actual_digest.as_str().to_owned(),
+                expected_digest: expected_digest.render(),
+                actual_digest: actual_digest.render(),
             },
         }
     }
@@ -990,6 +1174,9 @@ pub struct GenerateRequest {
     pub source_files: FileCatalog,
     /// Existing combined documents to update or a typed layout for a new one.
     pub target: GenerateTarget,
+    /// Rust extraction capability and optional compiler artifact.
+    #[serde(default)]
+    pub extraction: RustExtractionInput,
     /// Linked-sketch cleanup policy for [`GenerateTarget::Existing`].
     ///
     /// This has no effect on [`GenerateTarget::New`].
@@ -1002,9 +1189,9 @@ pub enum GenerateTarget {
     /// Update existing combined contract documents and retain stable labels for
     /// structurally unchanged Rust items.
     ///
-    /// Repeated item macros with the same file, module path, and semantic name
-    /// retain labels by one-based declaration occurrence, even when their token
-    /// text changes.
+    /// Repeatable items with the same crate, module path, item kind, and
+    /// semantic name retain labels by one-based declaration occurrence, even
+    /// when their retained syntax changes.
     ///
     /// Only direct root-level `.yml` and `.yaml` entries are considered and
     /// returned. Nested YAML and non-YAML catalog entries are ignored and
@@ -1019,6 +1206,13 @@ pub enum GenerateTarget {
 }
 
 /// Layout used when creating a combined contract document.
+///
+/// New signature documents always use `contract_version: 2` and
+/// `profile: rust_api_v1`. [`GenerateRequest::extraction`] selects the closed
+/// `rust_syntax_v2` or `rust_compiler_v1` mode. The caller supplies every
+/// logical crate root explicitly; compiler artifacts must agree with that
+/// identity, and there is no filename-based root, target-kind, or module
+/// inference at this domain boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GenerateDocument {
     /// Logical catalog path for the generated YAML document.
@@ -1027,17 +1221,52 @@ pub struct GenerateDocument {
     pub root: String,
     /// Exact portable Rust file allowlist owned by the document.
     pub files: Vec<CatalogPath>,
+    /// Explicit Rust crate roots interpreted within the document's allowlist.
+    ///
+    /// Crate IDs must be unique. Distinct crate IDs may intentionally project
+    /// the same physical root into separate logical crate contexts. Every root
+    /// must name an allowlisted `.rs` entry and records its target kind
+    /// independently of its filename. Input order is not semantic; generation
+    /// orders roots deterministically before parser dispatch.
+    pub crates: Vec<RustCrateRoot>,
+}
+
+/// One explicit Rust crate root used by syntax extraction.
+///
+/// This identity is the root of one allowlist-bounded logical module graph.
+/// The source path may be conventional or nonconventional; [`RustCrateKind`]
+/// never derives from the basename.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct RustCrateRoot {
+    /// Stable crate identity within one contract document.
+    pub id: String,
+    /// Allowlisted logical Rust source path containing the crate root.
+    pub root: CatalogPath,
+    /// Cargo-style target kind used to interpret the root.
+    pub kind: RustCrateKind,
+}
+
+/// Target kind for an explicitly selected Rust crate root.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RustCrateKind {
+    /// Interpret the explicit root as a library target.
+    Library,
+    /// Interpret the explicit root as a binary target.
+    Binary,
 }
 
 /// Response returned by [`SignatureContractKit::generate`].
 ///
-/// Rust signature generation emits combined YAML with `root`, an exact `files`
-/// allowlist, user-named nested `signatures`, and flattened `sketches`.
+/// Rust signature generation emits mandatory-v2 combined YAML with the
+/// selected versioned extraction metadata, explicit typed crate roots, `root`,
+/// an exact `files` allowlist, user-named `signatures`, and nested sketches that
+/// retain file/signature/type linkage and matching policy.
 ///
 /// # Examples
 ///
 /// ```
-/// use conkit_signature::{CatalogPath, ContractScope, FileCatalog, GenerateDocument, GenerateRequest, GenerateTarget, SignatureContractKit};
+/// use conkit_signature::{CatalogPath, ContractScope, FileCatalog, GenerateDocument, GenerateRequest, GenerateTarget, RustCrateKind, RustCrateRoot, SignatureContractKit};
 ///
 /// let kit = SignatureContractKit::builder().build()?;
 /// let mut source_files = FileCatalog::new();
@@ -1047,11 +1276,17 @@ pub struct GenerateDocument {
 /// )?;
 ///
 /// let response = futures_executor::block_on(kit.generate(GenerateRequest {
+///     extraction: conkit_signature::RustExtractionInput::Syntax,
 ///     source_files,
 ///     target: GenerateTarget::New(GenerateDocument {
 ///         contract_file: CatalogPath::new("main.yml")?,
 ///         root: "../src".to_owned(),
 ///         files: vec![CatalogPath::new("lib.rs")?],
+///         crates: vec![RustCrateRoot {
+///             id: "sample".to_owned(),
+///             root: CatalogPath::new("lib.rs")?,
+///             kind: RustCrateKind::Library,
+///         }],
 ///     }),
 ///     scope: ContractScope::Signatures,
 /// }))?;
@@ -1073,13 +1308,43 @@ pub struct GenerateResponse {
     ///
     /// Rust signature entries are combined YAML catalog bytes.
     pub contract_files: FileCatalog,
-    /// Number of top-level grouped signature records generated.
-    pub signature_count: usize,
-    /// Number of linked sketch records retained in the returned documents.
+    /// Precise totals for documents validated and bytes returned.
+    pub counts: SignatureGenerationCounts,
+    /// Exact source seeds for surviving linked sketches in an all-family run.
     ///
-    /// The `conkit-signature` crate does not generate their code; the caller resolves
-    /// surviving links and delegates refresh to the sketch domain.
-    pub sketch_count: usize,
+    /// This is populated only for [`ContractScope::All`]. Signature-only and
+    /// new-document generation return an empty vector. Sketch-only callers can
+    /// continue to use [`SignatureContractKit::resolve_sketches`].
+    pub resolved_sketch_seeds: Vec<ResolvedSketchSeed>,
+    /// Bounded, deterministic warnings for syntax facts requiring compiler context.
+    ///
+    /// Compiler extraction returns an empty vector. Syntax extraction retains
+    /// these warnings instead of silently discarding them during generation.
+    pub capability_warnings: Vec<String>,
+}
+
+/// Precise generation totals for [`GenerateResponse`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SignatureGenerationCounts {
+    /// Number of semantic YAML documents validated or newly generated.
+    pub document_count: usize,
+    /// Number of top-level grouped signature records in returned documents.
+    pub signature_count: usize,
+    /// Number of linked sketch records preserved in returned documents.
+    ///
+    /// The `conkit-signature` crate does not generate sketch contract code.
+    /// All-scope generation returns exact source seeds for these surviving
+    /// links, and the caller delegates their refresh to the sketch domain.
+    pub preserved_sketch_count: usize,
+    /// Number of documents whose proposed semantic model differs from its input.
+    ///
+    /// Every newly generated document contributes to this count.
+    pub semantically_changed_document_count: usize,
+    /// Number of documents whose returned source bytes differ from their input.
+    ///
+    /// Every newly generated document contributes to this count. Existing
+    /// semantic no-ops retain their original bytes and do not contribute.
+    pub byte_changed_document_count: usize,
 }
 
 /// Request for [`SignatureContractKit::resolve_sketches`].
@@ -1089,20 +1354,31 @@ pub struct ResolveSketchesRequest {
     pub source_files: FileCatalog,
     /// Combined root-level YAML documents containing links and sketches.
     pub contract_files: FileCatalog,
+    /// Rust extraction capability and optional compiler artifact.
+    #[serde(default)]
+    pub extraction: RustExtractionInput,
 }
 
 /// Exact linked Rust items returned by sketch resolution.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResolveSketchesResponse {
-    /// Linked sketch seeds ordered by contract path, then sketch identifier.
+    /// Linked sketch seeds ordered by contract path, physical document index,
+    /// then sketch identifier.
     pub seeds: Vec<ResolvedSketchSeed>,
+    /// Bounded, deterministic warnings for syntax facts requiring compiler context.
+    ///
+    /// Compiler extraction returns an empty vector. Syntax extraction retains
+    /// these warnings instead of silently discarding them during resolution.
+    pub capability_warnings: Vec<String>,
 }
 
 /// Runtime-neutral source seed for one explicitly linked sketch.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResolvedSketchSeed {
-    /// Combined document containing both the link and flattened sketch record.
+    /// Combined YAML file containing both the link and nested sketch record.
     pub contract_file: CatalogPath,
+    /// Zero-based physical YAML document index within [`Self::contract_file`].
+    pub document_index: usize,
     /// User-named sketch identifier.
     pub sketch_id: String,
     /// Linked top-level signature kind such as `function` or `struct`.
@@ -1125,22 +1401,38 @@ pub struct DiffRequest {
 /// Response returned by [`SignatureContractKit::diff`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiffResponse {
-    /// Whether any contract entries changed.
-    pub changed: bool,
+    /// Digest for complete current contract identity, including context.
+    pub contract_digest: String,
+    /// Canonical signature digest format version.
+    pub digest_version: u16,
     /// Diff results for top-level grouped contract identities.
     pub entries: Vec<DiffEntry>,
 }
 
 impl DiffResponse {
-    fn from_inventory_diff(diff: InventoryDiff) -> Self {
-        Self {
-            changed: diff.changed(),
-            entries: diff
-                .entries()
-                .iter()
-                .map(DiffEntry::from_inventory_diff_entry)
-                .collect(),
+    /// Returns whether the diff contains at least one semantic entry.
+    pub fn changed(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
+    fn from_inventory_diff(
+        diff: InventoryDiff,
+        limits: &crate::limits::DiagnosticLimits,
+        cancellation: &CancellationProbe,
+    ) -> Result<Self, SignatureContractKitError> {
+        let mut usage = limits.usage()?;
+        let mut entries = Vec::with_capacity(diff.entries().len());
+        for entry in diff.entries() {
+            cancellation.checkpoint()?;
+            let entry = DiffEntry::from_inventory_diff_entry(entry);
+            usage.record(&entry)?;
+            entries.push(entry);
         }
+        Ok(Self {
+            contract_digest: diff.contract_digest().render(),
+            digest_version: SignatureDigest::VERSION,
+            entries,
+        })
     }
 }
 
@@ -1151,11 +1443,15 @@ pub enum DiffEntry {
     Added {
         /// User contract signature label used as the group identity.
         signature_id: String,
+        /// Semantic facets introduced with the group.
+        categories: BTreeSet<DiffCategory>,
     },
     /// A signature group exists in the previous contracts but not the current set.
     Removed {
         /// User contract signature label used as the group identity.
         signature_id: String,
+        /// Semantic facets removed with the group.
+        categories: BTreeSet<DiffCategory>,
     },
     /// A signature group exists in both contract sets but has different digest bytes.
     Changed {
@@ -1165,27 +1461,397 @@ pub enum DiffEntry {
         current_digest: String,
         /// Group digest from the previous contract files.
         previous_digest: String,
+        /// Exact semantic facets that differ.
+        categories: BTreeSet<DiffCategory>,
     },
 }
 
+/// Semantic facet reported by one [`DiffEntry`].
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffCategory {
+    /// Caller-visible Rust source/API semantics changed.
+    SourceSemantics,
+    /// Extraction mode, profile, crate roots, or exact file participation changed.
+    ExtractionContext,
+    /// A user-owned signature label changed while source shape remained stable.
+    Labels,
+    /// Contract-only root, sketch linkage, or kind metadata changed.
+    DocumentMetadata,
+}
+
 impl DiffEntry {
+    /// Returns the exact semantic facets represented by this diff entry.
+    pub fn categories(&self) -> &BTreeSet<DiffCategory> {
+        match self {
+            Self::Added { categories, .. }
+            | Self::Removed { categories, .. }
+            | Self::Changed { categories, .. } => categories,
+        }
+    }
+
     fn from_inventory_diff_entry(entry: &InventoryDiffEntry) -> Self {
         match entry {
-            InventoryDiffEntry::Added { signature_id } => Self::Added {
+            InventoryDiffEntry::Added {
+                signature_id,
+                categories,
+            } => Self::Added {
                 signature_id: signature_id.as_str().to_owned(),
+                categories: categories.iter().copied().map(DiffCategory::from).collect(),
             },
-            InventoryDiffEntry::Removed { signature_id } => Self::Removed {
+            InventoryDiffEntry::Removed {
+                signature_id,
+                categories,
+            } => Self::Removed {
                 signature_id: signature_id.as_str().to_owned(),
+                categories: categories.iter().copied().map(DiffCategory::from).collect(),
             },
             InventoryDiffEntry::Changed {
                 signature_id,
                 current_digest,
                 previous_digest,
+                categories,
             } => Self::Changed {
                 signature_id: signature_id.as_str().to_owned(),
-                current_digest: current_digest.as_str().to_owned(),
-                previous_digest: previous_digest.as_str().to_owned(),
+                current_digest: current_digest.render(),
+                previous_digest: previous_digest.render(),
+                categories: categories.iter().copied().map(DiffCategory::from).collect(),
             },
         }
+    }
+}
+
+impl From<InventoryChangeCategory> for DiffCategory {
+    fn from(category: InventoryChangeCategory) -> Self {
+        match category {
+            InventoryChangeCategory::SourceSemantics => Self::SourceSemantics,
+            InventoryChangeCategory::ExtractionContext => Self::ExtractionContext,
+            InventoryChangeCategory::Labels => Self::Labels,
+            InventoryChangeCategory::DocumentMetadata => Self::DocumentMetadata,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inventory::{SignatureEntry, SignatureId, SignatureInventory};
+
+    struct SignatureLimitFixture {
+        source_files: FileCatalog,
+        contract_files: FileCatalog,
+    }
+
+    impl SignatureLimitFixture {
+        fn new() -> Self {
+            let mut source_files = FileCatalog::new();
+            source_files
+                .insert(
+                    CatalogPath::new("lib.rs").expect("source path"),
+                    b"pub fn first() {}\npub fn second() {}\n".to_vec(),
+                )
+                .expect("source file");
+            let mut contract_files = FileCatalog::new();
+            contract_files
+                .insert(
+                    CatalogPath::new("main.yml").expect("contract path"),
+                    br#"contract_version: 2
+root: ../src
+files: [lib.rs]
+extraction: { mode: rust_syntax_v2, profile: rust_api_v1, crates: [{ id: sample, root: lib.rs, kind: library }] }
+signatures:
+  - first_function:
+      file: lib.rs
+      signature_type: function
+      name: first
+      visibility: public
+      sketch: first_body
+sketches:
+  - first_body:
+      file: lib.rs
+      signature: first_function
+      signature_type: function
+      matching: { normalization: exact_lines_v1, occurrence: exactly_one }
+      code: old
+"#
+                    .to_vec(),
+                )
+                .expect("contract file");
+            Self {
+                source_files,
+                contract_files,
+            }
+        }
+
+        fn kit(signature_limit: u64) -> SignatureContractKit {
+            SignatureContractKit::builder()
+                .with_limits(SignatureLimits {
+                    rust: crate::limits::RustExtractionLimits {
+                        signatures: signature_limit,
+                        ..crate::limits::RustExtractionLimits::default()
+                    },
+                    ..SignatureLimits::default()
+                })
+                .build()
+                .expect("limited kit")
+        }
+
+        fn assert_signature_limit(error: &SignatureContractKitError, limit: u64) {
+            let exceeded = error.limit_exceeded().expect("typed signature limit");
+            assert_eq!(
+                exceeded.resource,
+                crate::limits::LimitResource::SignatureCount
+            );
+            assert_eq!(exceeded.limit, limit);
+            assert_eq!(exceeded.observed_at_least, limit + 1);
+        }
+    }
+
+    #[test]
+    fn check_modes_apply_error_and_warning_thresholds() {
+        let warning = CheckDiagnostic::Warning {
+            message: "rust_syntax_v2 capability warning".to_owned(),
+        };
+        let error = CheckDiagnostic::Extra {
+            signature_id: "extra".to_owned(),
+        };
+
+        assert!(CheckMode::Default.passed(&[]));
+        assert!(CheckMode::Default.passed(std::slice::from_ref(&warning)));
+        assert!(!CheckMode::Default.passed(std::slice::from_ref(&error)));
+        assert!(!CheckMode::Default.passed(&[error.clone(), warning.clone()]));
+
+        assert!(CheckMode::Strict.passed(&[]));
+        assert!(!CheckMode::Strict.passed(std::slice::from_ref(&warning)));
+        assert!(!CheckMode::Strict.passed(std::slice::from_ref(&error)));
+
+        assert!(CheckMode::Warning.passed(&[]));
+        assert!(CheckMode::Warning.passed(&[error, warning]));
+    }
+
+    #[test]
+    fn generation_checks_the_signature_budget_before_retaining_each_source_signature() {
+        let fixture = SignatureLimitFixture::new();
+        let error =
+            futures_executor::block_on(SignatureLimitFixture::kit(1).generate(GenerateRequest {
+                extraction: RustExtractionInput::Syntax,
+                source_files: fixture.source_files,
+                target: GenerateTarget::New(GenerateDocument {
+                    contract_file: CatalogPath::new("generated.yml").expect("contract path"),
+                    root: "../src".to_owned(),
+                    files: vec![CatalogPath::new("lib.rs").expect("source path")],
+                    crates: vec![RustCrateRoot {
+                        id: "sample".to_owned(),
+                        root: CatalogPath::new("lib.rs").expect("source path"),
+                        kind: RustCrateKind::Library,
+                    }],
+                }),
+                scope: ContractScope::Signatures,
+            }))
+            .expect_err("the second source signature must cross the budget");
+
+        SignatureLimitFixture::assert_signature_limit(&error, 1);
+    }
+
+    #[test]
+    fn checking_uses_one_aggregate_signature_budget_for_contract_and_source_acceptance() {
+        let fixture = SignatureLimitFixture::new();
+        let error = futures_executor::block_on(SignatureLimitFixture::kit(2).check(CheckRequest {
+            extraction: RustExtractionInput::Syntax,
+            source_files: fixture.source_files,
+            contract_files: fixture.contract_files,
+            report: ReportRequest::None,
+            mode: CheckMode::Default,
+        }))
+        .expect_err("the second source signature must cross the aggregate budget");
+
+        SignatureLimitFixture::assert_signature_limit(&error, 2);
+    }
+
+    #[test]
+    fn sketch_resolution_uses_the_same_aggregate_signature_acceptance_budget() {
+        let fixture = SignatureLimitFixture::new();
+        let error = futures_executor::block_on(SignatureLimitFixture::kit(2).resolve_sketches(
+            ResolveSketchesRequest {
+                extraction: RustExtractionInput::Syntax,
+                source_files: fixture.source_files,
+                contract_files: fixture.contract_files,
+            },
+        ))
+        .expect_err("the required source projection must stop at the signature budget");
+
+        SignatureLimitFixture::assert_signature_limit(&error, 2);
+    }
+
+    #[test]
+    fn check_response_orders_inventory_errors_before_capability_warnings() {
+        let id = SignatureId::new("extra");
+        let mut source = SignatureInventory::default();
+        source
+            .insert(SignatureEntry::from_grouped_canonical_bytes(
+                id.clone(),
+                id,
+                b"extra",
+            ))
+            .expect("test inventory should accept its only entry");
+        let comparison = source
+            .compare_against(
+                &SignatureInventory::default(),
+                &crate::limits::DiagnosticLimits::default(),
+                &crate::work::CancellationProbe::new(),
+            )
+            .expect("test inventories should compare");
+
+        let response = CheckResponse::from_inventory_comparison(
+            comparison,
+            vec!["rust_syntax_v2 capability warning: conditional API".to_owned()],
+            CheckMode::Default,
+            &crate::limits::DiagnosticLimits::default(),
+            &crate::work::CancellationProbe::new(),
+        )
+        .expect("diagnostics fit default limits");
+
+        assert!(matches!(
+            response.diagnostics.as_slice(),
+            [
+                CheckDiagnostic::Extra { signature_id },
+                CheckDiagnostic::Warning { message },
+            ] if signature_id == "extra"
+                && message == "rust_syntax_v2 capability warning: conditional API"
+        ));
+        assert!(!response.passed);
+    }
+
+    #[test]
+    fn check_response_streams_inventory_errors_and_capability_warnings_through_one_byte_budget() {
+        let id = SignatureId::new("extra");
+        let mut source = SignatureInventory::default();
+        source
+            .insert(SignatureEntry::from_grouped_canonical_bytes(
+                id.clone(),
+                id,
+                b"extra",
+            ))
+            .expect("test inventory should accept its only entry");
+        let comparison = source
+            .compare_against(
+                &SignatureInventory::default(),
+                &crate::limits::DiagnosticLimits::default(),
+                &crate::work::CancellationProbe::new(),
+            )
+            .expect("test inventories should compare");
+        let warning = "rust_syntax_v2 capability warning: conditional API".to_owned();
+        let expected = vec![
+            CheckDiagnostic::Extra {
+                signature_id: "extra".to_owned(),
+            },
+            CheckDiagnostic::Warning {
+                message: warning.clone(),
+            },
+        ];
+        let serialized_bytes = serde_json::to_vec(&expected)
+            .expect("public diagnostics")
+            .len();
+        let limits = crate::limits::DiagnosticLimits {
+            count: 2,
+            serialized_bytes: u64::try_from(serialized_bytes - 1).expect("fixture size"),
+        };
+
+        let error = CheckResponse::from_inventory_comparison(
+            comparison,
+            std::iter::once(warning),
+            CheckMode::Default,
+            &limits,
+            &crate::work::CancellationProbe::new(),
+        )
+        .expect_err("the warning must cross the shared aggregate byte budget");
+        let exceeded = error.limit_exceeded().expect("typed diagnostic budget");
+        assert_eq!(
+            exceeded.resource,
+            crate::limits::LimitResource::DiagnosticBytes
+        );
+        assert_eq!(
+            exceeded.observed_at_least,
+            u64::try_from(serialized_bytes).expect("fixture size")
+        );
+    }
+
+    #[test]
+    fn report_views_preserve_standalone_and_embedded_wire_order() {
+        let mut report_files = FileCatalog::new();
+        report_files
+            .insert(
+                CatalogPath::new("reports/nested.json").expect("report path"),
+                b"nested".to_vec(),
+            )
+            .expect("report file");
+        let response = CheckResponse {
+            passed: true,
+            source_shape_digest: "digest".to_owned(),
+            digest_version: 2,
+            counts: SignatureCheckCounts {
+                source_signature_count: 1,
+                contract_signature_count: 1,
+            },
+            diagnostics: Vec::new(),
+            report_files,
+        };
+        let standalone = CheckReportView::new(&response, CheckReportLayout::Standalone);
+        let embedded = CheckReportView::new(&response, CheckReportLayout::Embedded);
+
+        assert_eq!(
+            serde_json::to_string_pretty(&standalone).expect("standalone JSON"),
+            concat!(
+                "{\n",
+                "  \"passed\": true,\n",
+                "  \"source_shape_digest\": \"digest\",\n",
+                "  \"digest_version\": 2,\n",
+                "  \"counts\": {\n",
+                "    \"source_signature_count\": 1,\n",
+                "    \"contract_signature_count\": 1\n",
+                "  },\n",
+                "  \"diagnostics\": []\n",
+                "}",
+            )
+        );
+        assert_eq!(
+            serde_saphyr::to_string(&standalone).expect("standalone YAML"),
+            concat!(
+                "passed: true\n",
+                "source_shape_digest: digest\n",
+                "digest_version: 2\n",
+                "counts:\n",
+                "  source_signature_count: 1\n",
+                "  contract_signature_count: 1\n",
+                "diagnostics: []\n",
+            )
+        );
+        assert_eq!(
+            serde_json::to_string_pretty(&embedded).expect("embedded JSON"),
+            concat!(
+                "{\n",
+                "  \"passed\": true,\n",
+                "  \"counts\": {\n",
+                "    \"source_signature_count\": 1,\n",
+                "    \"contract_signature_count\": 1\n",
+                "  },\n",
+                "  \"source_shape_digest\": \"digest\",\n",
+                "  \"digest_version\": 2,\n",
+                "  \"diagnostics\": []\n",
+                "}",
+            )
+        );
+        assert_eq!(
+            serde_saphyr::to_string(&embedded).expect("embedded YAML"),
+            concat!(
+                "passed: true\n",
+                "counts:\n",
+                "  source_signature_count: 1\n",
+                "  contract_signature_count: 1\n",
+                "source_shape_digest: digest\n",
+                "digest_version: 2\n",
+                "diagnostics: []\n",
+            )
+        );
     }
 }

@@ -23,7 +23,7 @@ Version 1 is deliberately one-scenario-per-manifest:
 ```yaml
 version: 1
 coverage:
-  - behavior.check.matrix.all.strict.matching
+  - behavior.check.matching.passes
 steps:
   - type: run
     argv:
@@ -127,7 +127,10 @@ Sandbox paths must be exactly `/work`, `/input`, or `/output`, or a descendant
 using `/`. Scenario-relative inputs must remain under their own leaf. Host
 absolute paths, `.`/`..`, empty components, backslashes, colon-bearing portable
 components, prefix tricks such as `/input-extra`, partial placeholders, and
-unknown captures are rejected.
+unknown captures are rejected. The value immediately following `--crate-root`
+has the documented `CRATE_ID=KIND:RELATIVE_PATH` shape; its single kind/path
+separator is accepted while the embedded relative path remains subject to the
+same traversal, host-absolute, and portable-component checks.
 
 Fixture copying skips only local debris that cannot be canonical input:
 `target` directories, `Cargo.lock`, and `.DS_Store`. When

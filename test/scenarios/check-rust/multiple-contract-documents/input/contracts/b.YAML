@@ -1,6 +1,8 @@
+contract_version: 2
 root: ../src
 files:
   - b.rs
+extraction: { mode: rust_syntax_v2, profile: rust_api_v1, crates: [{ id: b, root: b.rs, kind: library }] }
 signatures:
   - b_signature:
       file: b.rs
@@ -12,8 +14,11 @@ signatures:
       sketch: b_body
 sketches:
   - b_body:
-    signature_type: function
-    code: |
-      pub fn b() -> u8 {
-          2
-      }
+      file: b.rs
+      signature: b_signature
+      signature_type: function
+      matching: { normalization: exact_lines_v1, occurrence: at_least_one }
+      code: |
+        pub fn b() -> u8 {
+            2
+        }

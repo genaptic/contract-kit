@@ -1,12 +1,22 @@
-//! Combined contract document paths and CLI-owned header validation.
+//! Combined contract-document facade and physical-file orchestration.
 
-use std::path::{Component, Path};
+mod header;
+pub(super) mod yaml;
+
+use std::cell::RefCell;
+use std::path::Path;
+use std::rc::Rc;
 
 use conkit_signature::CatalogPath;
-use serde::{Deserialize, de::IgnoredAny};
+use serde_saphyr::{DuplicateKeyPolicy, MergeKeyPolicy};
 
-use crate::error::CliError;
-use crate::platform::PortablePathRules;
+use super::layout::LayoutExtraction;
+use crate::error::{CliError, DuplicateContractKey};
+
+pub(crate) use header::ContractCompilerContext;
+use header::{ContractLocation, DocumentHeader};
+use yaml::ContractYamlStream;
+pub(super) use yaml::{ContractYamlLimits, ContractYamlUsage};
 
 /// A direct root-level YAML combined contract document path.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,22 +61,20 @@ impl ContractDocumentPath {
     }
 }
 
-/// One parsed document header paired with its original bytes.
+/// One physical YAML file with its indexed v2 headers and original bytes.
+#[derive(Debug)]
 pub(super) struct ContractDocument {
     path: ContractDocumentPath,
     bytes: Vec<u8>,
-    source_paths: Vec<CatalogPath>,
+    plans: Vec<ContractDocumentPlan>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DocumentHeader {
-    root: String,
-    files: Vec<String>,
-    #[serde(rename = "signatures")]
-    _signatures: Vec<IgnoredAny>,
-    #[serde(default, rename = "sketches")]
-    _sketches: Vec<IgnoredAny>,
+/// One semantic document header emitted while parsing a physical YAML file.
+#[derive(Debug)]
+pub(super) struct ContractDocumentPlan {
+    declared_root: String,
+    pub(super) source_paths: Vec<CatalogPath>,
+    pub(super) extraction: Option<LayoutExtraction>,
 }
 
 impl ContractDocument {
@@ -82,102 +90,161 @@ impl ContractDocument {
         contracts: &Path,
         source: &Path,
         canonical_source: &Path,
+        usage: &mut ContractYamlUsage<'_>,
     ) -> Result<Self, CliError> {
-        let document_path = contracts.join(path.as_catalog_path().as_str());
-        let DocumentHeader { root, files, .. } = serde_yaml::from_slice::<DocumentHeader>(&bytes)
-            .map_err(|source_error| {
-            CliError::ContractLayout {
-                path: document_path.clone(),
-                message: source_error.to_string(),
-            }
-        })?;
-
-        Self::validate_root(&document_path, contracts, source, canonical_source, &root)?;
-
-        let mut source_paths = Vec::with_capacity(files.len());
-        for listed in files {
-            let logical = CatalogPath::new(listed.clone()).map_err(|source_error| {
-                CliError::ContractLayout {
-                    path: document_path.clone(),
-                    message: format!("invalid listed source path {listed:?}: {source_error}"),
-                }
-            })?;
-            let rust_source = Path::new(logical.as_str())
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"));
-            if !rust_source {
-                return Err(CliError::ContractLayout {
-                    path: document_path,
-                    message: format!(
-                        "listed source path {} must have a .rs extension",
-                        logical.as_str()
-                    ),
-                });
-            }
-            source_paths.push(logical);
+        let document = Self::from_bytes(path, bytes, usage)?;
+        let document_path = contracts.join(document.path.as_catalog_path().as_str());
+        for (document_index, plan) in document.plans.iter().enumerate() {
+            let location = ContractLocation {
+                contract_file: document.path.as_catalog_path(),
+                display_path: &document_path,
+                document_index,
+                cancellation: usage.cancellation(),
+            };
+            location.checkpoint()?;
+            Self::validate_root_binding(
+                &location,
+                contracts,
+                source,
+                canonical_source,
+                &plan.declared_root,
+            )?;
         }
-
-        Ok(Self {
-            path,
-            bytes,
-            source_paths,
-        })
+        Ok(document)
     }
 
     /// Consumes the parsed document into its aggregate-layout values.
-    pub(super) fn into_parts(self) -> (ContractDocumentPath, Vec<u8>, Vec<CatalogPath>) {
-        (self.path, self.bytes, self.source_paths)
+    pub(super) fn into_parts(self) -> (ContractDocumentPath, Vec<u8>, Vec<ContractDocumentPlan>) {
+        (self.path, self.bytes, self.plans)
     }
 
-    fn validate_root(
-        document: &Path,
+    pub(super) fn validate_bytes(
+        path: ContractDocumentPath,
+        bytes: &[u8],
+        usage: &mut ContractYamlUsage<'_>,
+    ) -> Result<(), CliError> {
+        Self::parse_plans(path.as_catalog_path(), bytes, usage).map(|_| ())
+    }
+
+    fn from_bytes(
+        path: ContractDocumentPath,
+        bytes: Vec<u8>,
+        usage: &mut ContractYamlUsage<'_>,
+    ) -> Result<Self, CliError> {
+        let plans = Self::parse_plans(path.as_catalog_path(), &bytes, usage)?;
+        Ok(Self { path, bytes, plans })
+    }
+
+    fn parse_plans(
+        contract_file: &CatalogPath,
+        bytes: &[u8],
+        usage: &mut ContractYamlUsage<'_>,
+    ) -> Result<Vec<ContractDocumentPlan>, CliError> {
+        let document_path = Path::new(contract_file.as_str());
+        let source =
+            std::str::from_utf8(bytes).map_err(|source_error| CliError::ContractLayout {
+                path: document_path.to_path_buf(),
+                message: format!("contract YAML must be valid UTF-8: {source_error}"),
+            })?;
+        let stream = ContractYamlStream::inspect(document_path, source, usage)?;
+
+        let semantic_report = Rc::new(RefCell::new(None));
+        let report_sink = Rc::clone(&semantic_report);
+        let options = serde_saphyr::options! {
+            budget: usage.semantic_parser_budget(stream.raw_report()),
+            alias_limits: usage.semantic_alias_limits(stream.raw_report()),
+            duplicate_keys: DuplicateKeyPolicy::Error,
+            merge_keys: MergeKeyPolicy::Error,
+            strict_booleans: true,
+        }
+        .with_budget_report(move |report| {
+            *report_sink.borrow_mut() = Some(report);
+        });
+        usage.cancellation().checkpoint()?;
+        let headers = serde_saphyr::from_multiple_with_options::<DocumentHeader>(source, options)
+            .map_err(|source_error| {
+            let semantic_error = source_error.without_snippet();
+            if let Some(limit) =
+                usage.semantic_limit_error(document_path, stream.raw_report(), semantic_error)
+            {
+                return limit;
+            }
+            let document_index = stream.document_index_for_error(&source_error);
+            match semantic_error {
+                serde_saphyr::Error::DuplicateMappingKey { key, location } => {
+                    CliError::from(DuplicateContractKey {
+                        path: document_path.to_path_buf(),
+                        document_index,
+                        key: key.clone(),
+                        location: *location,
+                    })
+                }
+                _ => CliError::ContractLayout {
+                    path: document_path.to_path_buf(),
+                    message: format!(
+                        "YAML document index {document_index} is invalid: {source_error}"
+                    ),
+                },
+            }
+        })?;
+        usage.cancellation().checkpoint()?;
+        let report =
+            semantic_report
+                .borrow_mut()
+                .take()
+                .ok_or_else(|| CliError::ContractLayout {
+                    path: document_path.to_path_buf(),
+                    message: "semantic YAML parser did not return its resource report".to_owned(),
+                })?;
+        usage.record_replay_report(document_path, stream.raw_report(), &report)?;
+
+        let mut plans = Vec::new();
+        for (document_index, header) in headers.into_iter().enumerate() {
+            let location = ContractLocation {
+                contract_file,
+                display_path: document_path,
+                document_index,
+                cancellation: usage.cancellation(),
+            };
+            location.checkpoint()?;
+            plans.push(header.into_plan(&location)?);
+        }
+
+        if plans.len() != stream.document_count() {
+            return Err(CliError::ContractLayout {
+                path: document_path.to_path_buf(),
+                message: format!(
+                    "semantic YAML decoding returned {} documents for a physical stream containing {}",
+                    plans.len(),
+                    stream.document_count()
+                ),
+            });
+        }
+
+        Ok(plans)
+    }
+
+    fn validate_root_binding(
+        location: &ContractLocation<'_>,
         contracts: &Path,
         source: &Path,
         canonical_source: &Path,
         declared: &str,
     ) -> Result<(), CliError> {
+        location.checkpoint()?;
         let declared_path = Path::new(declared);
-        if declared.is_empty() || declared.contains('\\') || declared_path.is_absolute() {
-            return Err(CliError::ContractLayout {
-                path: document.to_path_buf(),
-                message: format!("contract root must be a nonempty relative path: {declared:?}"),
-            });
-        }
-
-        for component in declared_path.components() {
-            match component {
-                Component::Normal(value) => PortablePathRules::validate_component(value)?,
-                Component::ParentDir => {}
-                Component::CurDir | Component::RootDir | Component::Prefix(_) => {
-                    return Err(CliError::ContractLayout {
-                        path: document.to_path_buf(),
-                        message: format!(
-                            "contract root contains an invalid component: {declared:?}"
-                        ),
-                    });
-                }
-            }
-        }
-
         let resolved = contracts.join(declared_path);
         let canonical_declared = fs_err::canonicalize(&resolved).map_err(|source_error| {
-            CliError::ContractLayout {
-                path: document.to_path_buf(),
-                message: format!(
-                    "failed to resolve contract root {declared:?} relative to the document: {source_error}"
-                ),
-            }
+            location.invalid(format!(
+                "failed to resolve contract root {declared:?} relative to the document: {source_error}"
+            ))
         })?;
         if canonical_declared != canonical_source {
-            return Err(CliError::ContractLayout {
-                path: document.to_path_buf(),
-                message: format!(
-                    "contract root {declared:?} resolves to {}, not selected source {}",
-                    canonical_declared.display(),
-                    source.display()
-                ),
-            });
+            return Err(location.invalid(format!(
+                "contract root {declared:?} resolves to {}, not selected source {}",
+                canonical_declared.display(),
+                source.display()
+            )));
         }
 
         Ok(())
@@ -191,9 +258,11 @@ mod tests {
     use assert_fs::prelude::*;
     use conkit_signature::CatalogPath;
 
-    use super::{ContractDocument, ContractDocumentPath};
+    use super::{ContractDocument, ContractDocumentPath, ContractYamlUsage};
+    use crate::context::ApplicationCancellation;
+    use crate::error::CliError;
 
-    struct DocumentFixture {
+    pub(super) struct DocumentFixture {
         root: assert_fs::TempDir,
         contracts: PathBuf,
         source: PathBuf,
@@ -201,7 +270,7 @@ mod tests {
     }
 
     impl DocumentFixture {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let root = assert_fs::TempDir::new().expect("temporary root");
             let source = root.child("src");
             source.create_dir_all().expect("source root");
@@ -217,7 +286,12 @@ mod tests {
             }
         }
 
-        fn parse(&self, bytes: &[u8]) -> Result<ContractDocument, crate::error::CliError> {
+        pub(super) fn parse(
+            &self,
+            bytes: &[u8],
+        ) -> Result<ContractDocument, crate::error::CliError> {
+            let cancellation = ApplicationCancellation::new();
+            let mut usage = ContractYamlUsage::new(&cancellation);
             ContractDocument::parse(
                 ContractDocumentPath::try_from(
                     CatalogPath::new("main.yml").expect("document path"),
@@ -227,10 +301,42 @@ mod tests {
                 &self.contracts,
                 &self.source,
                 &self.canonical_source,
+                &mut usage,
             )
         }
 
-        fn close(self) {
+        pub(super) fn document(&self, files: &[&str], crate_roots: &[(&str, &str)]) -> String {
+            let files = if files.is_empty() {
+                " []\n".to_owned()
+            } else {
+                format!(
+                    "\n{}",
+                    files
+                        .iter()
+                        .map(|file| format!("  - {file}\n"))
+                        .collect::<String>()
+                )
+            };
+            let extraction = if crate_roots.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "extraction:\n  mode: rust_syntax_v2\n  profile: rust_api_v1\n  crates:\n{}",
+                    crate_roots
+                        .iter()
+                        .map(|(id, root)| {
+                            format!("    - id: {id}\n      root: {root}\n      kind: library\n")
+                        })
+                        .collect::<String>()
+                )
+            };
+
+            format!(
+                "contract_version: 2\nroot: ../src\nfiles:{files}{extraction}signatures: []\nsketches: []\n"
+            )
+        }
+
+        pub(super) fn close(self) {
             self.root.close().expect("close temporary root");
         }
     }
@@ -249,53 +355,171 @@ mod tests {
     }
 
     #[test]
-    fn parses_header_and_preserves_original_bytes_and_rust_paths() {
+    fn parses_header_and_preserves_original_bytes_and_listed_rust_paths() {
         let fixture = DocumentFixture::new();
-        let bytes = b"root: ../src\nfiles: [lib.RS]\nsignatures: [42]\nsketches: [not: semantic]\n";
+        let first = fixture.document(&["lib.RS"], &[("primary", "lib.RS")]);
+        let second = fixture.document(
+            &["nested/transport.rs"],
+            &[("transport", "nested/transport.rs")],
+        );
+        let bytes = format!("{first}---\n{second}").into_bytes();
 
-        let document = fixture.parse(bytes).expect("valid document");
-        let (path, parsed_bytes, sources) = document.into_parts();
+        let document = fixture.parse(&bytes).expect("valid document stream");
+        let (path, parsed_bytes, plans) = document.into_parts();
 
         assert_eq!(path.as_catalog_path().as_str(), "main.yml");
         assert_eq!(parsed_bytes, bytes);
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].as_str(), "lib.RS");
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].source_paths[0].as_str(), "lib.RS");
+        assert_eq!(plans[1].source_paths[0].as_str(), "nested/transport.rs");
         fixture.close();
     }
 
     #[test]
-    fn rejects_malformed_or_unknown_header_fields() {
+    fn duplicate_keys_use_a_cloneable_typed_error_with_the_physical_document_location() {
         let fixture = DocumentFixture::new();
+        let nested = fixture
+            .document(&["lib.rs"], &[("primary", "lib.rs")])
+            .replacen(
+                "  mode: rust_syntax_v2\n",
+                "  mode: rust_syntax_v2\n  mode: rust_syntax_v2\n",
+                1,
+            );
+        let nested_error = fixture
+            .parse(nested.as_bytes())
+            .expect_err("duplicate nested key must fail");
+        let nested_duplicate = match nested_error {
+            CliError::DuplicateContractKey(duplicate) => duplicate,
+            other => panic!("expected typed duplicate-key error, received {other}"),
+        };
+        assert_eq!(nested_duplicate.document_index, 0);
+        assert_eq!(nested_duplicate.key.as_deref(), Some("mode"));
+
+        let first = fixture.document(&["lib.rs"], &[("primary", "lib.rs")]);
+        let second = fixture
+            .document(&["other.rs"], &[("other", "other.rs")])
+            .replacen("root: ../src\n", "root: ../src\nroot: ../src\n", 1);
+        let expected_line = first.lines().count() as u64 + 4;
+        let error = fixture
+            .parse(format!("{first}---\n{second}").as_bytes())
+            .expect_err("duplicate key in the second physical document must fail");
+
+        let duplicate = match error {
+            CliError::DuplicateContractKey(duplicate) => duplicate,
+            other => panic!("expected typed duplicate-key error, received {other}"),
+        };
+        let cloned = duplicate.clone();
+
+        assert_eq!(duplicate, cloned);
+        assert_eq!(duplicate.path, PathBuf::from("main.yml"));
+        assert_eq!(duplicate.document_index, 1);
+        assert_eq!(duplicate.key.as_deref(), Some("root"));
+        assert_eq!(duplicate.location.line(), expected_line);
+        assert_eq!(duplicate.location.column(), 1);
+        fixture.close();
+    }
+
+    #[test]
+    fn enforces_strict_nested_yaml_fields_and_merge_policy() {
+        let fixture = DocumentFixture::new();
+        let valid = fixture.document(&["lib.rs"], &[("primary", "lib.rs")]);
 
         for (document, expected) in [
-            ("root: ../src\nfiles: []\n", "missing field `signatures`"),
             (
-                "root: ../src\nfiles: []\nsignatures: value\n",
-                "expected a sequence",
-            ),
-            (
-                "root: ../src\nfiles: []\nsignatures: []\nsketches: value\n",
-                "expected a sequence",
-            ),
-            (
-                "root: ../src\nfiles: []\nsignatures: []\nunknown: true\n",
+                valid.replacen(
+                    "      kind: library\n",
+                    "      kind: library\n      unknown: true\n",
+                    1,
+                ),
                 "unknown field `unknown`",
             ),
             (
-                "version: 1\nlanguage: rust\nsignatures: []\n",
-                "unknown field `version`",
+                valid.replacen(
+                    "  mode: rust_syntax_v2\n",
+                    "  <<: &defaults { mode: rust_syntax_v2 }\n  mode: rust_syntax_v2\n",
+                    1,
+                ),
+                "merge",
             ),
         ] {
-            let error = match fixture.parse(document.as_bytes()) {
-                Ok(_) => panic!("invalid header must be rejected"),
-                Err(error) => error,
-            };
+            let error = fixture
+                .parse(document.as_bytes())
+                .expect_err("strict nested YAML policy must reject the input");
             assert!(
-                error.to_string().contains(expected),
+                error.to_string().to_lowercase().contains(expected),
                 "expected {expected:?} in {error}"
             );
         }
 
+        fixture.close();
+    }
+
+    #[test]
+    fn accepts_anchors_aliases_and_explicit_tags_in_domain_owned_payloads() {
+        let fixture = DocumentFixture::new();
+        let document = fixture
+            .document(&["lib.rs"], &[("primary", "lib.rs")])
+            .replace("  - lib.rs\n", "  - &source_file lib.rs\n")
+            .replace("      root: lib.rs\n", "      root: *source_file\n")
+            .replace("signatures: []", "signatures: [!signature domain-owned]")
+            .replace("sketches: []", "sketches: !sketches [domain-owned]");
+
+        fixture
+            .parse(document.as_bytes())
+            .expect("anchors, aliases, and opaque explicit tags are accepted");
+        fixture.close();
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_before_yaml_decoding() {
+        let fixture = DocumentFixture::new();
+        let error = fixture
+            .parse(&[0xff])
+            .expect_err("contract bytes must be UTF-8");
+
+        assert!(error.to_string().contains("valid UTF-8"), "{error}");
+        fixture.close();
+    }
+
+    #[test]
+    fn cancellation_stops_aggregate_header_validation_before_parsing() {
+        let fixture = DocumentFixture::new();
+        let document = fixture.document(&["lib.rs"], &[("primary", "lib.rs")]);
+        let canceled = ApplicationCancellation::new();
+        canceled.request();
+        let mut usage = ContractYamlUsage::new(&canceled);
+        let error = ContractDocument::validate_bytes(
+            ContractDocumentPath::try_from(
+                CatalogPath::new("canceled.yml").expect("canceled document path"),
+            )
+            .expect("checked canceled path"),
+            document.as_bytes(),
+            &mut usage,
+        )
+        .expect_err("cancellation must stop header validation before parsing");
+
+        assert!(matches!(error, CliError::OperationCanceled));
+        fixture.close();
+    }
+
+    #[test]
+    fn reports_the_zero_based_document_index_for_later_document_failures() {
+        let fixture = DocumentFixture::new();
+        let first = fixture.document(&["lib.rs"], &[("primary", "lib.rs")]);
+        let second = fixture
+            .document(&["other.rs"], &[("other", "other.rs")])
+            .replacen("root: ../src", "root: ../missing", 1);
+        let error = fixture
+            .parse(format!("{first}---\n{second}").as_bytes())
+            .expect_err("second document must fail");
+
+        assert!(error.to_string().contains("document index 1"), "{error}");
+
+        let malformed = format!("{first}---\ncontract_version: 2\nroot: ../src\nfiles: [lib.rs\n");
+        let error = fixture
+            .parse(malformed.as_bytes())
+            .expect_err("raw YAML syntax failure in the second document must retain its index");
+        assert!(error.to_string().contains("document index 1"), "{error}");
         fixture.close();
     }
 
@@ -308,44 +532,14 @@ mod tests {
             .create_dir_all()
             .expect("other root");
 
-        let error =
-            match fixture.parse(b"root: ../other\nfiles: []\nsignatures: []\nsketches: []\n") {
-                Ok(_) => panic!("root mismatch must fail"),
-                Err(error) => error,
-            };
+        let document = fixture
+            .document(&[], &[])
+            .replacen("root: ../src", "root: ../other", 1);
+        let error = fixture
+            .parse(document.as_bytes())
+            .expect_err("root mismatch must fail");
 
         assert!(error.to_string().contains("not selected source"));
-        fixture.close();
-    }
-
-    #[test]
-    fn rejects_invalid_root_components_and_backslashes() {
-        let fixture = DocumentFixture::new();
-
-        for declared in ["", ".", "../src\\nested", "../invalid."] {
-            let bytes = format!("root: {declared:?}\nfiles: []\nsignatures: []\nsketches: []\n");
-            assert!(
-                fixture.parse(bytes.as_bytes()).is_err(),
-                "accepted {declared:?}"
-            );
-        }
-
-        fixture.close();
-    }
-
-    #[test]
-    fn rejects_invalid_or_non_rust_source_allowlist_paths() {
-        let fixture = DocumentFixture::new();
-
-        for listed in ["notes.txt", "nested/../lib.rs"] {
-            let bytes =
-                format!("root: ../src\nfiles: [{listed:?}]\nsignatures: []\nsketches: []\n");
-            assert!(
-                fixture.parse(bytes.as_bytes()).is_err(),
-                "accepted {listed:?}"
-            );
-        }
-
         fixture.close();
     }
 }

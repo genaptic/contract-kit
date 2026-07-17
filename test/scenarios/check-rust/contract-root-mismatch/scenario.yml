@@ -23,7 +23,7 @@ steps:
       stderr:
         kind: exact
         value: |
-          invalid contract layout /input/contracts/main.yml: contract root "../other" resolves to /input/other, not selected source /input/src
+          invalid contract layout /input/contracts/main.yml: YAML document index 0 contract root "../other" resolves to /input/other, not selected source /input/src
   - type: assert_tree
     actual: /output
     expected: output

@@ -1,0 +1,405 @@
+# BUG_RESOLUTION_PLAN [PHASES 7, 8, 9][ADDITION + TEST]
+# Citations: BUG_RESOLUTION_PLAN.md:1228-1461, 1800-1816, 1864-1897;
+# BUG_AUDIT_FINDINGS.md:222-253, 394-409, 799-817.
+# Scheduled/manual hardening remains separate from required pull-request CI.
+# Fuzzing is bounded and nightly-only, dependency policy uses the locked
+# production graph while cargo-deny fetches the current advisory database.
+# Compiler compatibility is explicit opt-in work, and benchmark jobs are
+# non-gating.
+name: Hardening
+
+on:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      compiler_compatibility:
+        description: Run the opt-in Cargo/rustdoc compiler-extractor compatibility flow
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hardening-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_DENY_VERSION: 0.19.7
+  CARGO_FUZZ_VERSION: 0.13.2
+  COMPILER_TOOLCHAIN: nightly-2026-07-01
+  FUZZ_TOOLCHAIN: nightly-2026-07-01
+  FUZZ_SECONDS_PER_TARGET: 240
+
+jobs:
+  dependency-policy:
+    name: Dependency policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Select the repository toolchain
+        run: rustup show active-toolchain
+
+      - name: Install the pinned dependency-policy tool
+        run: cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
+
+      # --locked constrains each Cargo dependency graph. It does not disable
+      # cargo-deny's advisory fetch; neither --offline nor --disable-fetch is
+      # passed, so the policy invocations refresh and reuse the RustSec data.
+      - name: Require the independent fuzz lockfile
+        run: test -f fuzz/Cargo.lock
+
+      - name: Enforce the locked production dependency policy
+        run: cargo deny --locked check advisories bans licenses sources
+
+      - name: Enforce the locked fuzz dependency policy
+        run: >-
+          cargo deny --manifest-path fuzz/Cargo.toml --locked
+          check advisories bans licenses sources
+
+  compiler-compatibility:
+    name: Compiler/rustdoc compatibility
+    if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.compiler_compatibility) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # The workflow host explicitly provisions the one extractor toolchain
+      # supported by this revision. Contract Kit itself must never install or
+      # silently select a different toolchain for callers.
+      - name: Provision the explicitly supported compiler toolchain
+        run: rustup toolchain install "$COMPILER_TOOLCHAIN" --profile minimal
+
+      - name: Prepare isolated compatibility outputs
+        shell: bash
+        run: >-
+          mkdir -p
+          "$RUNNER_TEMP/compiler-library-contracts"
+          "$RUNNER_TEMP/compiler-binary-contracts"
+          "$RUNNER_TEMP/compiler-fixture-contracts"
+          "$RUNNER_TEMP/compiler-fixture-default-contracts"
+          "$RUNNER_TEMP/compiler-fixture-repeat-contracts"
+
+      - name: Generate a compiler-derived signature contract
+        run: >-
+          cargo run --locked -p conkit -- generate signatures
+          --source conkit-signature
+          --contracts "$RUNNER_TEMP/compiler-library-contracts"
+          --signature-extractor compiler
+          --manifest-path Cargo.toml
+          --package conkit-signature
+          --lib
+
+      - name: Strictly check the generated compiler contract
+        run: >-
+          cargo run --locked -p conkit -- check signatures
+          --source conkit-signature
+          --contracts "$RUNNER_TEMP/compiler-library-contracts"
+          --output "$RUNNER_TEMP/compiler-library-check.json"
+          --strict
+          --signature-extractor compiler
+          --manifest-path Cargo.toml
+          --package conkit-signature
+          --lib
+
+      - name: Generate a compiler-derived binary signature contract
+        run: >-
+          cargo run --locked -p conkit -- generate signatures
+          --source conkit
+          --contracts "$RUNNER_TEMP/compiler-binary-contracts"
+          --signature-extractor compiler
+          --manifest-path Cargo.toml
+          --package conkit
+          --bin conkit
+
+      - name: Strictly check the generated binary compiler contract
+        run: >-
+          cargo run --locked -p conkit -- check signatures
+          --source conkit
+          --contracts "$RUNNER_TEMP/compiler-binary-contracts"
+          --output "$RUNNER_TEMP/compiler-binary-check.json"
+          --strict
+          --signature-extractor compiler
+          --manifest-path Cargo.toml
+          --package conkit
+          --bin conkit
+
+      - name: Reject a noncompiling compiler capability fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          invalid_output="$RUNNER_TEMP/compiler-invalid-contracts"
+          mkdir -p "$invalid_output"
+
+          if cargo run --locked -p conkit -- generate signatures \
+            --source test/fixtures/compiler-api/src \
+            --contracts "$invalid_output" \
+            --signature-extractor compiler \
+            --manifest-path test/fixtures/compiler-api/Cargo.toml \
+            --package conkit-compiler-api-fixture \
+            --lib \
+            --features broken
+          then
+            echo "compiler extraction unexpectedly accepted a noncompiling crate" >&2
+            exit 1
+          fi
+
+          shopt -s nullglob
+          generated_contracts=("$invalid_output"/*.yml "$invalid_output"/*.yaml)
+          if (( ${#generated_contracts[@]} != 0 )); then
+            echo "failed compiler extraction published contract output" >&2
+            exit 1
+          fi
+
+      - name: Generate the focused compiler capability fixture
+        run: >-
+          cargo run --locked -p conkit -- generate signatures
+          --source test/fixtures/compiler-api/src
+          --contracts "$RUNNER_TEMP/compiler-fixture-contracts"
+          --signature-extractor compiler
+          --manifest-path test/fixtures/compiler-api/Cargo.toml
+          --package conkit-compiler-api-fixture
+          --lib
+          --features selected
+          --target x86_64-unknown-linux-gnu
+
+      - name: Strictly check the focused compiler capability fixture
+        run: >-
+          cargo run --locked -p conkit -- check signatures
+          --source test/fixtures/compiler-api/src
+          --contracts "$RUNNER_TEMP/compiler-fixture-contracts"
+          --output "$RUNNER_TEMP/compiler-fixture-check.json"
+          --strict
+          --signature-extractor compiler
+          --manifest-path test/fixtures/compiler-api/Cargo.toml
+          --package conkit-compiler-api-fixture
+          --lib
+          --features selected
+          --target x86_64-unknown-linux-gnu
+
+      - name: Generate the default-feature compiler projection
+        run: >-
+          cargo run --locked -p conkit -- generate signatures
+          --source test/fixtures/compiler-api/src
+          --contracts "$RUNNER_TEMP/compiler-fixture-default-contracts"
+          --signature-extractor compiler
+          --manifest-path test/fixtures/compiler-api/Cargo.toml
+          --package conkit-compiler-api-fixture
+          --lib
+          --target x86_64-unknown-linux-gnu
+
+      - name: Repeat the focused compiler projection deterministically
+        run: >-
+          cargo run --locked -p conkit -- generate signatures
+          --source test/fixtures/compiler-api/src
+          --contracts "$RUNNER_TEMP/compiler-fixture-repeat-contracts"
+          --signature-extractor compiler
+          --manifest-path test/fixtures/compiler-api/Cargo.toml
+          --package conkit-compiler-api-fixture
+          --lib
+          --features selected
+          --target x86_64-unknown-linux-gnu
+
+      - name: Assert focused compiler capability evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          contract="$(find "$RUNNER_TEMP/compiler-fixture-contracts" -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) -print -quit)"
+          test -n "$contract"
+          grep -q 'name: MacroGenerated' "$contract"
+          grep -q 'signature_type: module' "$contract"
+          grep -q 'name: public_api' "$contract"
+          grep -q 'name: PublicModuleItem' "$contract"
+          grep -q 'name: RenamedTarget' "$contract"
+          grep -q 'name: GlobTarget' "$contract"
+          grep -q 'name: NestedTarget' "$contract"
+          grep -q 'name: SelectedApi' "$contract"
+          grep -q 'name: GenericAlias' "$contract"
+          grep -q 'name: normalized_alias' "$contract"
+          grep -q 'name: ExtractedTrait' "$contract"
+          grep -q 'name: ImplementedApi' "$contract"
+          grep -q 'implementations:' "$contract"
+          grep -q 'name: Output' "$contract"
+          grep -q 'name: ENABLED' "$contract"
+          grep -q 'name: ID' "$contract"
+          grep -q 'target_triple: x86_64-unknown-linux-gnu' "$contract"
+          if grep -q 'name: DisabledApi' "$contract"; then
+            echo 'cfg-disabled API unexpectedly appeared in the compiler contract' >&2
+            exit 1
+          fi
+
+          default_contract="$(find "$RUNNER_TEMP/compiler-fixture-default-contracts" -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) -print -quit)"
+          test -n "$default_contract"
+          grep -q 'name: DisabledApi' "$default_contract"
+          if grep -q 'name: SelectedApi' "$default_contract"; then
+            echo 'selected-feature API unexpectedly appeared in the default compiler contract' >&2
+            exit 1
+          fi
+
+          repeat_contract="$(find "$RUNNER_TEMP/compiler-fixture-repeat-contracts" -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) -print -quit)"
+          test -n "$repeat_contract"
+          cmp "$contract" "$repeat_contract"
+
+      - name: Check compiler-normalized alias equivalence
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i "s/GenericAlias<'static>/\&'static [u8; 4]/" test/fixtures/compiler-api/src/lib.rs
+          cargo run --locked -p conkit -- check signatures \
+            --source test/fixtures/compiler-api/src \
+            --contracts "$RUNNER_TEMP/compiler-fixture-contracts" \
+            --output "$RUNNER_TEMP/compiler-fixture-alias-check.json" \
+            --strict \
+            --signature-extractor compiler \
+            --manifest-path test/fixtures/compiler-api/Cargo.toml \
+            --package conkit-compiler-api-fixture \
+            --lib \
+            --features selected \
+            --target x86_64-unknown-linux-gnu
+
+      - name: Upload compiler compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: compiler-compatibility-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/compiler-library-contracts
+            ${{ runner.temp }}/compiler-library-check.json
+            ${{ runner.temp }}/compiler-binary-contracts
+            ${{ runner.temp }}/compiler-binary-check.json
+            ${{ runner.temp }}/compiler-fixture-contracts
+            ${{ runner.temp }}/compiler-fixture-default-contracts
+            ${{ runner.temp }}/compiler-fixture-repeat-contracts
+            ${{ runner.temp }}/compiler-fixture-check.json
+            ${{ runner.temp }}/compiler-fixture-alias-check.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  fuzz-smoke:
+    name: Bounded weekly fuzzing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned nightly fuzz toolchain
+        run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+
+      - name: Install the pinned fuzz runner
+        run: cargo +"$FUZZ_TOOLCHAIN" install cargo-fuzz --locked --version "$CARGO_FUZZ_VERSION"
+
+      - name: Validate the independent fuzz dependency lock
+        working-directory: fuzz
+        run: cargo +"$FUZZ_TOOLCHAIN" metadata --locked --no-deps --format-version 1
+
+      - name: Run every public-boundary fuzz target with bounded resources
+        working-directory: fuzz
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in \
+            signature_yaml \
+            sketch_yaml \
+            yaml_edit \
+            signature_yaml_edit \
+            rust_syntax \
+            source_graph \
+            sketch_normalization \
+            sketch_matching
+          do
+            generated_corpus="corpus/$target"
+            mkdir -p "$generated_corpus"
+            corpora=("$generated_corpus")
+            if [[ -d "seeds/$target" ]]; then
+              corpora+=("seeds/$target")
+            fi
+
+            cargo +"$FUZZ_TOOLCHAIN" fuzz run "$target" "${corpora[@]}" -- \
+              -max_total_time="$FUZZ_SECONDS_PER_TARGET" \
+              -max_len=262144 \
+              -rss_limit_mb=2048 \
+              -timeout=10
+          done
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts-${{ github.sha }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+          retention-days: 7
+
+  benchmark-artifacts:
+    name: Non-gating benchmarks (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-latest
+          - name: macOS
+            runner: macos-latest
+          - name: Windows
+            runner: windows-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Select the repository toolchain
+        run: rustup show active-toolchain
+
+      - name: Discover implemented benchmark targets
+        id: benchmarks
+        shell: bash
+        run: |
+          if [[ -s conkit-signature/benches/source_parsing.rs ]]; then
+            echo "signature=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signature=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ -s conkit-sketch/benches/matcher.rs ]]; then
+            echo "sketch=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "sketch=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Benchmark signature source parsing
+        if: steps.benchmarks.outputs.signature == 'true'
+        run: cargo bench --locked -p conkit-signature --bench source_parsing -- --noplot
+
+      - name: Benchmark grouped sketch matching
+        if: steps.benchmarks.outputs.sketch == 'true'
+        run: cargo bench --locked -p conkit-sketch --bench matcher -- --noplot
+
+      - name: Report an intentionally empty benchmark matrix
+        if: steps.benchmarks.outputs.signature != 'true' && steps.benchmarks.outputs.sketch != 'true'
+        run: echo "No implemented benchmark targets are present at this revision."
+
+      - name: Upload Criterion results
+        if: always() && (steps.benchmarks.outputs.signature == 'true' || steps.benchmarks.outputs.sketch == 'true')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: criterion-${{ matrix.name }}-${{ github.sha }}
+          path: target/criterion
+          if-no-files-found: warn
+          retention-days: 14

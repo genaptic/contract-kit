@@ -5,8 +5,13 @@ use predicates::prelude::*;
 use std::path::PathBuf;
 use support::ConkitCli;
 
-const COMBINED_CONTRACT: &str = r#"root: ../src
+const COMBINED_CONTRACT: &str = r#"contract_version: 2
+root: ../src
 files: [lib.rs]
+extraction:
+  mode: rust_syntax_v2
+  profile: rust_api_v1
+  crates: [{ id: fixture, root: lib.rs, kind: library }]
 signatures:
   - answer_function:
       file: lib.rs
@@ -18,13 +23,23 @@ signatures:
       sketch: answer_body
 sketches:
   - answer_body:
-    signature_type: function
-    code: |
-      pub fn answer() -> u8 { 42 }
+      file: lib.rs
+      signature: answer_function
+      signature_type: function
+      matching:
+        normalization: exact_lines_v1
+        occurrence: at_least_one
+      code: |
+        pub fn answer() -> u8 { 42 }
 "#;
 
-const CHANGED_COMBINED_CONTRACT: &str = r#"root: ../src
+const CHANGED_COMBINED_CONTRACT: &str = r#"contract_version: 2
+root: ../src
 files: [lib.rs]
+extraction:
+  mode: rust_syntax_v2
+  profile: rust_api_v1
+  crates: [{ id: fixture, root: lib.rs, kind: library }]
 signatures:
   - answer_function:
       file: lib.rs
@@ -36,13 +51,23 @@ signatures:
       sketch: answer_body
 sketches:
   - answer_body:
-    signature_type: function
-    code: |
-      pub fn answer() -> u16 { 43 }
+      file: lib.rs
+      signature: answer_function
+      signature_type: function
+      matching:
+        normalization: exact_lines_v1
+        occurrence: at_least_one
+      code: |
+        pub fn answer() -> u16 { 43 }
 "#;
 
-const SKETCH_CHANGED_CONTRACT: &str = r#"root: ../src
+const SKETCH_CHANGED_CONTRACT: &str = r#"contract_version: 2
+root: ../src
 files: [lib.rs]
+extraction:
+  mode: rust_syntax_v2
+  profile: rust_api_v1
+  crates: [{ id: fixture, root: lib.rs, kind: library }]
 signatures:
   - answer_function:
       file: lib.rs
@@ -54,9 +79,14 @@ signatures:
       sketch: answer_body
 sketches:
   - answer_body:
-    signature_type: function
-    code: |
-      pub fn answer() -> u8 { 43 }
+      file: lib.rs
+      signature: answer_function
+      signature_type: function
+      matching:
+        normalization: exact_lines_v1
+        occurrence: at_least_one
+      code: |
+        pub fn answer() -> u8 { 43 }
 "#;
 
 struct ArchiveFixture {
@@ -168,7 +198,11 @@ fn omitted_gzip_creates_the_destination_and_round_trips() {
         .diff()
         .assert()
         .success()
-        .stdout("contracts unchanged\n")
+        .stdout(
+            predicate::str::starts_with("contracts unchanged\n")
+                .and(predicate::str::contains("signature contract digest v2 "))
+                .and(predicate::str::contains("sketch contract digest v2 ")),
+        )
         .stderr(predicate::str::is_empty());
 }
 
@@ -200,7 +234,11 @@ fn diff_reports_unchanged_for_the_archived_combined_catalog() {
         .diff()
         .assert()
         .success()
-        .stdout("contracts unchanged\n")
+        .stdout(
+            predicate::str::starts_with("contracts unchanged\n")
+                .and(predicate::str::contains("signature contract digest v2 "))
+                .and(predicate::str::contains("sketch contract digest v2 ")),
+        )
         .stderr(predicate::str::is_empty());
 }
 
@@ -217,7 +255,14 @@ fn diff_reports_signature_changes_by_user_label_without_failing() {
         .diff()
         .assert()
         .success()
-        .stdout("contracts changed\nsignature changed answer_function\n")
+        .stdout(
+            predicate::str::starts_with("contracts changed\n")
+                .and(predicate::str::contains("signature contract digest v2 "))
+                .and(predicate::str::contains(
+                    "signature changed answer_function ",
+                ))
+                .and(predicate::str::contains("[source_semantics]")),
+        )
         .stderr(predicate::str::is_empty());
 }
 
@@ -231,11 +276,19 @@ fn diff_reports_signatures_before_sketches_and_changed_comparisons_exit_zero() {
         .diff()
         .assert()
         .success()
-        .stdout(concat!(
-            "contracts changed\n",
-            "signature changed answer_function\n",
-            "sketch changed answer_body\n",
-        ))
+        .stdout(
+            predicate::str::starts_with("contracts changed\n")
+                .and(predicate::str::contains(
+                    "signature changed answer_function ",
+                ))
+                .and(predicate::str::contains("sketch changed answer_body [code]"))
+                .and(predicate::str::contains(
+                    "sketch previous answer_body at main.yml document 0; source lib.rs; signature answer_function (function); matching exact_lines_v1/at_least_one; code ",
+                ))
+                .and(predicate::str::contains(
+                    "sketch current answer_body at main.yml document 0; source lib.rs; signature answer_function (function); matching exact_lines_v1/at_least_one; code ",
+                )),
+        )
         .stderr(predicate::str::is_empty());
 }
 
@@ -249,12 +302,19 @@ fn diff_reports_sketch_only_semantic_changes() {
         .diff()
         .assert()
         .success()
-        .stdout("contracts changed\nsketch changed answer_body\n")
+        .stdout(
+            predicate::str::starts_with("contracts changed\n")
+                .and(predicate::str::contains(
+                    "sketch changed answer_body [code]",
+                ))
+                .and(predicate::str::contains("sketch previous answer_body"))
+                .and(predicate::str::contains("sketch current answer_body")),
+        )
         .stderr(predicate::str::is_empty());
 }
 
 #[test]
-fn diff_ignores_document_relocation_mapping_order_and_sketch_whitespace() {
+fn diff_ignores_document_relocation_and_mapping_order() {
     let fixture = ArchiveFixture::new();
     fixture.archive_contracts();
     std::fs::remove_file(fixture.contracts.child("main.yml").path()).expect("remove original");
@@ -262,12 +322,21 @@ fn diff_ignores_document_relocation_mapping_order_and_sketch_whitespace() {
         .contracts
         .child("relocated.YAML")
         .write_str(
-            r#"files: [lib.rs]
+            r#"contract_version: 2
+files: [lib.rs]
 root: ../src
+extraction:
+  mode: rust_syntax_v2
+  profile: rust_api_v1
+  crates: [{ id: fixture, root: lib.rs, kind: library }]
 sketches:
   - answer_body:
-    code: "  pub   fn answer() -> u8 { 42 }  "
-    signature_type: function
+      code: |
+        pub fn answer() -> u8 { 42 }
+      matching: { occurrence: at_least_one, normalization: exact_lines_v1 }
+      signature_type: function
+      signature: answer_function
+      file: lib.rs
 signatures:
   - answer_function:
       return_type: u8
@@ -285,23 +354,100 @@ signatures:
         .diff()
         .assert()
         .success()
-        .stdout("contracts unchanged\n")
+        .stdout(
+            predicate::str::starts_with("contracts unchanged\n")
+                .and(predicate::str::contains("signature contract digest v2 "))
+                .and(predicate::str::contains("sketch contract digest v2 ")),
+        )
         .stderr(predicate::str::is_empty());
 }
 
 #[test]
-fn diff_rejects_the_later_contract_dialect_from_an_archive() {
+fn archive_rejects_legacy_and_future_contracts_with_recreation_guidance() {
     let fixture = ArchiveFixture::new();
-    fixture.replace_contract("version: 1\nlanguage: rust\nsignatures: []\nsketches: []\n");
-    fixture.archive_contracts();
-    fixture.replace_contract(COMBINED_CONTRACT);
+    fixture.replace_contract(
+        "contract_version: 1\nroot: .\nfiles: []\nextraction: { mode: rust_syntax_v2, profile: rust_api_v1, crates: [] }\nsignatures: []\nsketches: []\n",
+    );
 
-    fixture
-        .diff()
+    ConkitCli::command()
+        .args(["archive", "--contracts"])
+        .arg(fixture.contracts.path())
+        .arg("--archive")
+        .arg(fixture.archive.path())
         .assert()
         .failure()
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("unknown field `version`"));
+        .stderr(predicate::str::contains("recreate"));
+    fixture.archive.assert(predicate::path::missing());
+
+    fixture.replace_contract(
+        "contract_version: 3\nroot: .\nfiles: []\nextraction: { mode: rust_syntax_v2, profile: rust_api_v1, crates: [] }\nsignatures: []\nsketches: []\n",
+    );
+    ConkitCli::command()
+        .args(["archive", "--contracts"])
+        .arg(fixture.contracts.path())
+        .arg("--archive")
+        .arg(fixture.archive.path())
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("contract_version 3"));
+}
+
+#[test]
+fn archive_rejects_a_lexically_invalid_root_before_publication() {
+    let fixture = ArchiveFixture::new();
+    fixture.replace_contract(&COMBINED_CONTRACT.replace("root: ../src", "root: /absolute"));
+
+    ConkitCli::command()
+        .args(["archive", "--contracts"])
+        .arg(fixture.contracts.path())
+        .arg("--archive")
+        .arg(fixture.archive.path())
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "contract root must be a nonempty relative path",
+        ));
+    fixture.archive.assert(predicate::path::missing());
+}
+
+#[test]
+fn diff_rejects_a_wire_v1_archive_containing_legacy_contracts() {
+    let fixture = ArchiveFixture::new();
+    let archive =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/archive-v1/mixed-v1.gzip");
+
+    ConkitCli::command()
+        .args(["diff", "--contracts"])
+        .arg(fixture.contracts.path())
+        .arg("--archive")
+        .arg(archive)
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("recreate"));
+}
+
+#[test]
+fn archive_rejects_one_legacy_document_inside_a_mixed_stream() {
+    let fixture = ArchiveFixture::new();
+    let mixed = format!(
+        "{COMBINED_CONTRACT}---\ncontract_version: 1\nroot: ../src\nfiles: []\nextraction: {{ mode: rust_syntax_v2, profile: rust_api_v1, crates: [] }}\nsignatures: []\nsketches: []\n"
+    );
+    fixture.replace_contract(&mixed);
+
+    ConkitCli::command()
+        .args(["archive", "--contracts"])
+        .arg(fixture.contracts.path())
+        .arg("--archive")
+        .arg(fixture.archive.path())
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("document index 1"))
+        .stderr(predicate::str::contains("recreate"));
 }
 
 #[test]

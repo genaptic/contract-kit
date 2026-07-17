@@ -3,10 +3,54 @@ Check all implemented contract families
 Usage: conkit check all [OPTIONS] --source <DIR> --contracts <DIR> --output <FILE>
 
 Options:
-      --source <DIR>     Root directory containing source files to inspect
-      --contracts <DIR>  Root directory containing contract files to compare against
-      --output <FILE>    Report file to write for the requested check
-      --default          Use the domain crate's default check mode
-      --strict           Treat contract diagnostics as check failures
-      --warning          Emit diagnostics without failing the contract check
-  -h, --help             Print help
+      --source <DIR>
+          Root directory containing source files to inspect
+
+      --contracts <DIR>
+          Root directory containing contract files to compare against
+
+      --output <FILE>
+          Report file to write for the requested check
+
+      --default
+          Enforce errors while permitting signature capability warnings
+
+      --strict
+          Also fail on signature capability warnings
+
+      --warning
+          Emit diagnostics without failing the contract check
+
+      --signature-extractor <SIGNATURE_EXTRACTOR>
+          Select portable syntax extraction or opt-in Cargo/rustdoc extraction (default: syntax)
+
+          Possible values:
+          - syntax:   Parse the exact allowlisted Rust sources without invoking Cargo
+          - compiler: Invoke Contract Kit's pinned, dated nightly Cargo/rustdoc toolchain
+
+      --manifest-path <FILE>
+          Cargo manifest used by compiler extraction
+
+      --package <SPEC>
+          Cargo package specification selected for compiler extraction
+
+      --lib
+          Select the package library target
+
+      --bin <NAME>
+          Select one named package binary target
+
+      --features <FEATURES>
+          Activate Cargo features; may be repeated or comma-delimited
+
+      --all-features
+          Activate every Cargo feature
+
+      --no-default-features
+          Do not activate the package's default Cargo features
+
+      --target <TRIPLE>
+          Concrete Rust target triple; Cargo aliases and custom target paths are unsupported
+
+  -h, --help
+          Print help (see a summary with '-h')

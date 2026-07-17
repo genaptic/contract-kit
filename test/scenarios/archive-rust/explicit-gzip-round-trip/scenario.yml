@@ -43,6 +43,8 @@ steps:
       kind: exact
       value: |
         contracts unchanged
+        signature contract digest v2 ad885c05e6ecb2a0b398f3448f2e6c70366f800b4b939a7b970207f7495f7720
+        sketch contract digest v2 4b257a97426b34331950af21f4db9f6b0faf676fd38a2355e156d8131071b363
     stderr:
       kind: empty
 - type: remove

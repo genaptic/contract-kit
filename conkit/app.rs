@@ -8,7 +8,7 @@ use clap::{CommandFactory, FromArgMatches};
 
 use crate::args::Cli;
 use crate::command::AppCommand;
-use crate::context::CommandContext;
+use crate::context::{ApplicationCancellation, CommandContext};
 
 /// Parsed CLI state plus initialized runtime dependencies.
 pub(crate) struct App {
@@ -43,7 +43,8 @@ impl App {
             .get_matches();
         let cli = Cli::from_arg_matches(&matches)?;
 
-        Self::from_cli(cli)
+        let cancellation = ApplicationCancellation::process()?;
+        Self::from_cli(cli, cancellation)
     }
 
     /// Initializes runtime state independently of process argument parsing.
@@ -51,8 +52,8 @@ impl App {
     /// # Errors
     ///
     /// Returns an error if a domain adapter cannot be initialized.
-    pub(crate) fn from_cli(cli: Cli) -> Result<Self> {
-        let context = CommandContext::initialize()?;
+    pub(crate) fn from_cli(cli: Cli, cancellation: ApplicationCancellation) -> Result<Self> {
+        let context = CommandContext::initialize(cancellation)?;
 
         Ok(Self { cli, context })
     }
@@ -63,6 +64,9 @@ impl App {
     ///
     /// Returns an error reported by the selected command.
     pub(crate) async fn run(&self) -> Result<()> {
-        self.cli.command.execute(&self.context).await
+        self.context
+            .cancellation()
+            .race(self.cli.command.execute(&self.context))
+            .await?
     }
 }

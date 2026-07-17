@@ -3,7 +3,8 @@ mod foo;
 mod foobar;
 mod utils;
 
-use bar::{Bar, Foo};
+use bar::Bar;
+use bar::Foo;
 use foo::FooStruct;
 use foobar::FooBar;
 
@@ -14,9 +15,9 @@ fn main() {
 
     assert!(foo.is_foo());
     assert!(!foo.is_bar());
-    assert_eq!(foo.reset(), Foo::new_foo());
+    assert!(foo.reset().is_foo());
     assert_eq!(wrapped.total(), 43);
-    assert_eq!(wrapped.foo(), &Foo::new_bar(42));
+    assert_eq!(wrapped.foo().value(), Some(42));
     assert_eq!(wrapped.int_field(), 1);
     assert_eq!(wrapped.describe(), "FooStruct(foo=Bar(42), int_field=1)");
 
@@ -36,6 +37,6 @@ fn main() {
     let values = [Foo::new_foo(), Foo::new_bar(3), Foo::new_bar(4)];
     assert_eq!(utils::sum_values(&values), 7);
     assert_eq!(utils::first_bar_value(&values), Some(3));
-    assert_eq!(utils::parse_positive("9"), Ok(9));
+    assert!(matches!(utils::parse_positive("9"), Ok(9)));
     assert_eq!(utils::describe_foobar(&trait_bar), "bar: Bar(7)");
 }

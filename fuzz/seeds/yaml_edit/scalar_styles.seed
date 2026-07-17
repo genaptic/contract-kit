@@ -1,0 +1,4 @@
+quoted: 'single' "double"
+block-like: |-
+  line one
+  line two

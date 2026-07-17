@@ -23,7 +23,7 @@ steps:
     stdout:
       kind: exact
       value: |
-        contract check passed: 25 signatures, 1 sketches
+        contract check passed: 14 signatures, 1 sketches
     stderr:
       kind: empty
 - type: assert_tree

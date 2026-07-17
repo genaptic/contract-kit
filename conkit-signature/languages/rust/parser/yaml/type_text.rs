@@ -1,10 +1,13 @@
 use crate::error::SignatureContractKitError;
+use crate::languages::rust::parser::source_graph::RustModulePath;
 use crate::languages::rust::parser::type_converter::RustTypeConverter;
+use crate::languages::rust::types::attributes::RustAttributes;
 use crate::languages::rust::types::callable_type::RustFunctionAbi;
 use crate::languages::rust::types::primitive_types::{
     FloatType, RustFunctionPointerParameter, RustFunctionPointerType, RustFunctionPointerVariadic,
     RustGenericMetadata, RustGenericParameter, RustType, SignedIntegerType, UnsignedIntegerType,
 };
+use crate::work::CancellationProbe;
 
 #[derive(Default)]
 pub(super) struct RustYamlGenericContext {
@@ -12,34 +15,46 @@ pub(super) struct RustYamlGenericContext {
 }
 
 impl RustYamlGenericContext {
-    pub(super) fn from_metadata(metadata: &RustGenericMetadata) -> Self {
-        Self {
-            type_parameters: metadata
-                .parameters()
-                .iter()
-                .filter_map(|parameter| match parameter {
-                    RustGenericParameter::Type { name, .. } => Some(name.clone()),
-                    RustGenericParameter::Lifetime { .. } | RustGenericParameter::Const { .. } => {
-                        None
-                    }
-                })
-                .collect(),
+    pub(super) fn from_metadata(
+        metadata: &RustGenericMetadata,
+        cancellation: &CancellationProbe,
+    ) -> Result<Self, SignatureContractKitError> {
+        let mut type_parameters = Vec::new();
+        for parameter in metadata.parameters() {
+            cancellation.checkpoint()?;
+            if let RustGenericParameter::Type { name, .. } = parameter {
+                type_parameters.push(name.clone());
+            }
         }
+        Ok(Self { type_parameters })
     }
 
-    pub(super) fn with_metadata(&self, metadata: &RustGenericMetadata) -> Self {
+    pub(super) fn with_metadata(
+        &self,
+        metadata: &RustGenericMetadata,
+        cancellation: &CancellationProbe,
+    ) -> Result<Self, SignatureContractKitError> {
+        cancellation.checkpoint()?;
         let mut type_parameters = self.type_parameters.clone();
-        type_parameters.extend(metadata.parameters().iter().filter_map(
-            |parameter| match parameter {
-                RustGenericParameter::Type { name, .. } => Some(name.clone()),
-                RustGenericParameter::Lifetime { .. } | RustGenericParameter::Const { .. } => None,
-            },
-        ));
-        Self { type_parameters }
+        for parameter in metadata.parameters() {
+            cancellation.checkpoint()?;
+            if let RustGenericParameter::Type { name, .. } = parameter {
+                type_parameters.push(name.clone());
+            }
+        }
+        Ok(Self { type_parameters })
     }
 
-    pub(super) fn type_parameters(&self) -> Vec<String> {
-        self.type_parameters.clone()
+    fn type_parameters(
+        &self,
+        cancellation: &CancellationProbe,
+    ) -> Result<Vec<String>, SignatureContractKitError> {
+        let mut parameters = Vec::with_capacity(self.type_parameters.len());
+        for parameter in &self.type_parameters {
+            cancellation.checkpoint()?;
+            parameters.push(parameter.clone());
+        }
+        Ok(parameters)
     }
 }
 
@@ -57,16 +72,21 @@ impl RustYamlTypeText {
     pub(super) fn parse(
         &self,
         context: &RustYamlGenericContext,
+        cancellation: &CancellationProbe,
     ) -> Result<RustType, SignatureContractKitError> {
-        RustTypeConverter::with_generic_parameters(context.type_parameters())
-            .convert_type_text(&self.value)
+        cancellation.checkpoint()?;
+        RustTypeConverter::with_generic_parameters(
+            context.type_parameters(cancellation)?,
+            cancellation,
+        )
+        .convert_type_text(&self.value)
     }
 }
 
-pub(super) struct RustTypeTextRenderer;
+pub(in crate::languages::rust) struct RustTypeTextRenderer;
 
 impl RustTypeTextRenderer {
-    pub(super) fn render_type(&self, value: &RustType) -> String {
+    pub(in crate::languages::rust) fn render_type(&self, value: &RustType) -> String {
         match value {
             RustType::Bool => "bool".to_owned(),
             RustType::Char => "char".to_owned(),
@@ -91,8 +111,8 @@ impl RustTypeTextRenderer {
             RustType::FunctionPointer(value) => self.render_function_pointer(value),
             RustType::TraitObject(value) => format!("dyn {}", value.bounds().join(" + ")),
             RustType::ImplTrait(value) => format!("impl {}", value.bounds().join(" + ")),
-            RustType::TypePath(value) => value.segments().join("::"),
-            RustType::GenericParameter(value) => value.clone(),
+            RustType::TypePath(value) => value.source_syntax().to_owned(),
+            RustType::GenericParameter(value) => RustModulePath::source_ident(value),
             RustType::SelfType => "Self".to_owned(),
             RustType::Inferred => "_".to_owned(),
             RustType::Parenthesized(value) => format!("({})", self.render_type(value)),
@@ -169,25 +189,26 @@ impl RustTypeTextRenderer {
     }
 
     fn render_function_pointer_parameter(&self, value: &RustFunctionPointerParameter) -> String {
-        let attributes = if value.attributes().is_empty() {
-            String::new()
-        } else {
-            format!("{} ", value.attributes().join(" "))
-        };
+        let attributes = self.render_attributes(value.attributes());
 
         format!("{attributes}{}", self.render_type(value.parameter_type()))
     }
 
     fn render_function_pointer_variadic(&self, value: &RustFunctionPointerVariadic) -> String {
-        let attributes = if value.attributes().is_empty() {
-            String::new()
-        } else {
-            format!("{} ", value.attributes().join(" "))
-        };
+        let attributes = self.render_attributes(value.attributes());
 
-        match value.name() {
-            Some(name) => format!("{attributes}{name}: ..."),
+        match value.pattern() {
+            Some(pattern) => format!("{attributes}{pattern}: ..."),
             None => format!("{attributes}..."),
+        }
+    }
+
+    fn render_attributes(&self, attributes: &RustAttributes) -> String {
+        let rendered = attributes.source_syntax();
+        if rendered.is_empty() {
+            rendered
+        } else {
+            format!("{rendered} ")
         }
     }
 
@@ -228,5 +249,42 @@ impl RustTypeTextRenderer {
             FloatType::F32 => "f32",
             FloatType::F64 => "f64",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RustTypeTextRenderer, RustYamlGenericContext, RustYamlTypeText};
+    use crate::languages::rust::types::primitive_types::RustType;
+
+    #[test]
+    fn canonical_keyword_generic_renders_as_valid_raw_rust_syntax() {
+        assert_eq!(
+            RustTypeTextRenderer.render_type(&RustType::GenericParameter("type".to_owned(),)),
+            "r#type"
+        );
+        assert_eq!(
+            RustTypeTextRenderer.render_type(&RustType::GenericParameter("Item".to_owned(),)),
+            "Item"
+        );
+    }
+
+    #[test]
+    fn raw_named_type_path_renders_and_reparses_as_valid_rust_syntax() {
+        let context = RustYamlGenericContext::default();
+        let cancellation = crate::work::CancellationProbe::new();
+        let parsed = RustYamlTypeText::from_text("r#type::r#Container<r#match, nested::r#async>")
+            .parse(&context, &cancellation)
+            .expect("raw named type path");
+        let rendered = RustTypeTextRenderer.render_type(&parsed);
+        let reparsed = RustYamlTypeText::from_text(&rendered)
+            .parse(&context, &cancellation)
+            .expect("rendered raw named type path");
+
+        assert!(rendered.starts_with("r#type::r#Container"), "{rendered}");
+        assert!(rendered.contains("r#match"), "{rendered}");
+        assert!(rendered.contains("nested :: r#async"), "{rendered}");
+        assert_eq!(parsed, reparsed);
+        assert!(!parsed.requires_capability_warning());
     }
 }

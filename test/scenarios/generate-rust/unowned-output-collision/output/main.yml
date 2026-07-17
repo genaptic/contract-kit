@@ -1,6 +1,14 @@
+contract_version: 2
 root: ../source
 files:
 - nested/extra.rs
 - nested/lib.rs
+extraction:
+  mode: rust_syntax_v2
+  profile: rust_api_v1
+  crates:
+  - id: scenario
+    root: nested/lib.rs
+    kind: library
 signatures: []
 sketches: []

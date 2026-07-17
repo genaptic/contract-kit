@@ -1,6 +1,6 @@
 version: 1
 coverage:
-- behavior.check.matrix.all.omitted.mismatching
+- behavior.check.mismatching.default-fails
 - behavior.check.report.extension.yaml
 steps:
 - type: run

@@ -1,6 +1,8 @@
-# Document relocation, comments, YAML formatting, and snippet whitespace are semantic no-ops.
+# Document relocation, comments, and YAML scalar formatting are semantic no-ops.
+contract_version: 2
 root: ../src
 files: [lib.rs]
+extraction: {profile: rust_api_v1, mode: rust_syntax_v2, crates: [{root: lib.rs, kind: library, id: fixture}]}
 signatures:
   - answer_signature:
       sketch: answer_body
@@ -11,8 +13,8 @@ signatures:
       file: lib.rs
 sketches:
   - answer_body:
-    code: |-
-
-      pub   fn   answer()  ->  u8  {   42 }
-
-    signature_type: function
+      code: "pub fn answer() -> u8 { 42 }\n"
+      matching: {occurrence: at_least_one, normalization: exact_lines_v1}
+      signature_type: function
+      signature: answer_signature
+      file: lib.rs

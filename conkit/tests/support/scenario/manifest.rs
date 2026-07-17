@@ -238,4 +238,28 @@ impl Argument {
         }
         Ok(())
     }
+
+    pub(super) fn validate_for_option(&self, option: Option<&str>) -> Result<(), String> {
+        if option != Some("--crate-root") {
+            return self.validate();
+        }
+
+        if self.0.contains('\\') {
+            return Err("backslashes are not allowed".to_owned());
+        }
+        let Some((crate_id, root)) = self.0.split_once('=') else {
+            return Err("crate-root argument must contain '='".to_owned());
+        };
+        if crate_id.is_empty() {
+            return Err("crate-root ID must not be empty".to_owned());
+        }
+        let Some((kind, path)) = root.split_once(':') else {
+            return Err("crate-root argument must contain a target kind and path".to_owned());
+        };
+        if !matches!(kind, "library" | "binary") {
+            return Err("crate-root target kind must be 'library' or 'binary'".to_owned());
+        }
+
+        ScenarioPath(path.to_owned()).validate()
+    }
 }

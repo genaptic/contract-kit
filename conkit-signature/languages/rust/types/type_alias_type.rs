@@ -1,8 +1,8 @@
-use crate::languages::rust::types::base_type::{BaseCanonical, BaseType};
+use crate::languages::rust::types::base_type::BaseType;
 use crate::languages::rust::types::primitive_types::{RustGenericMetadata, RustType};
 use serde::Serialize;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct TypeAliasType {
     base: BaseType,
     generics: RustGenericMetadata,
@@ -34,18 +34,9 @@ impl TypeAliasType {
         &self.target_type
     }
 
-    pub(in crate::languages::rust) fn canonical_form(&self) -> TypeAliasCanonical {
-        TypeAliasCanonical {
-            base: self.base.canonical_form(),
-            generics: self.generics.clone(),
-            target_type: self.target_type.clone(),
-        }
+    pub(crate) fn requires_capability_warning(&self) -> bool {
+        self.base.attributes().requires_capability_warning()
+            || self.generics.requires_capability_warning()
+            || self.target_type.requires_capability_warning()
     }
-}
-
-#[derive(Serialize)]
-pub(in crate::languages::rust) struct TypeAliasCanonical {
-    base: BaseCanonical,
-    generics: RustGenericMetadata,
-    target_type: RustType,
 }

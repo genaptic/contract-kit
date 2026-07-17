@@ -14,6 +14,10 @@
 - Keep mixed-catalog archive encoding and decoding in `conkit`;
   `conkit-signature` and `conkit-sketch` own their respective contract
   semantics, including semantic diffing.
+- Keep the application-owned shared Rayon pool and bounded filesystem catalog
+  reads in `conkit`. Preserve nominal work and resource-limit types in each
+  domain crate, with independent active/pending admission and direct domain
+  revalidation; do not add `conkit-core` or shared cross-domain error traits.
 - Keep `README.md` product-facing, `CONTRIBUTING.md` human-facing,
   `ARCHITECTURE.md` structural, `CODE_OF_CONDUCT.md` authoritative for
   community behavior and reporting, and this file operational for agents.

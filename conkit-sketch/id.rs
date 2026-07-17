@@ -1,5 +1,4 @@
-use crate::error::SketchContractKitError;
-use crate::files::CatalogPath;
+use std::borrow::Borrow;
 use std::fmt;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -8,36 +7,39 @@ pub(crate) struct SketchId {
 }
 
 impl SketchId {
-    pub(crate) fn from_contract(
-        value: impl Into<String>,
-        catalog_name: &CatalogPath,
-    ) -> Result<Self, SketchContractKitError> {
-        Self::from_user_text(value).ok_or_else(|| {
-            SketchContractKitError::parse_failed(catalog_name, "sketch id must not be empty")
-        })
-    }
+    pub(crate) fn new(value: String, maximum_bytes: usize) -> Result<Self, SketchIdError> {
+        if value.is_empty() {
+            return Err(SketchIdError::Empty { original: value });
+        }
 
-    pub(crate) fn from_seed(value: impl Into<String>) -> Result<Self, SketchContractKitError> {
-        Self::from_user_text(value).ok_or_else(|| {
-            SketchContractKitError::conversion_failed("sketch seed id must not be empty")
-        })
+        if value.trim() != value {
+            return Err(SketchIdError::SurroundingWhitespace { original: value });
+        }
+
+        let actual = value.len();
+        if actual > maximum_bytes {
+            return Err(SketchIdError::TooLong {
+                original: value,
+                maximum: maximum_bytes,
+                actual,
+            });
+        }
+
+        if let Some((index, _)) = value
+            .char_indices()
+            .find(|(_, character)| character.is_control())
+        {
+            return Err(SketchIdError::ControlCharacter {
+                original: value,
+                index,
+            });
+        }
+
+        Ok(Self { value })
     }
 
     pub(crate) fn as_str(&self) -> &str {
         &self.value
-    }
-
-    fn from_user_text(value: impl Into<String>) -> Option<Self> {
-        let value = value.into();
-        let value = value.trim();
-
-        if value.is_empty() {
-            None
-        } else {
-            Some(Self {
-                value: value.to_owned(),
-            })
-        }
     }
 }
 
@@ -47,28 +49,171 @@ impl fmt::Display for SketchId {
     }
 }
 
+impl Borrow<str> for SketchId {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SketchIdError {
+    Empty {
+        original: String,
+    },
+    SurroundingWhitespace {
+        original: String,
+    },
+    TooLong {
+        original: String,
+        maximum: usize,
+        actual: usize,
+    },
+    ControlCharacter {
+        original: String,
+        index: usize,
+    },
+}
+
+impl fmt::Display for SketchIdError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty { original } => write!(
+                formatter,
+                "sketch id \"{}\" must not be empty",
+                original.escape_debug()
+            ),
+            Self::SurroundingWhitespace { original } => write!(
+                formatter,
+                "sketch id \"{}\" must not have surrounding whitespace",
+                original.escape_debug()
+            ),
+            Self::TooLong {
+                original,
+                maximum,
+                actual,
+            } => write!(
+                formatter,
+                "sketch id \"{}\" is {actual} bytes; maximum is {maximum}",
+                original.escape_debug()
+            ),
+            Self::ControlCharacter { original, index } => write!(
+                formatter,
+                "sketch id \"{}\" contains a control character at byte index {index}",
+                original.escape_debug()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SketchIdError {}
+
 #[cfg(test)]
 mod tests {
-    use super::SketchId;
-    use crate::files::CatalogPath;
+    use super::{SketchId, SketchIdError};
+
+    const MAXIMUM_BYTES: usize = 32;
 
     #[test]
-    fn contract_and_seed_ids_keep_trimmed_nonempty_semantics() {
-        let contract = CatalogPath::new("contracts/main.yml").expect("contract path");
+    fn empty_id_is_rejected_without_losing_the_original_scalar() {
+        let error =
+            SketchId::new(String::new(), MAXIMUM_BYTES).expect_err("an empty sketch ID must fail");
 
         assert_eq!(
-            SketchId::from_contract("  answer_body  ", &contract)
-                .expect("contract ID")
-                .as_str(),
-            "answer_body"
+            error,
+            SketchIdError::Empty {
+                original: String::new(),
+            }
         );
+    }
+
+    #[test]
+    fn surrounding_unicode_whitespace_is_rejected_without_trimming() {
+        for value in [
+            " answer_body",
+            "answer_body ",
+            "\u{00a0}answer_body\u{00a0}",
+        ] {
+            let error = SketchId::new(value.to_owned(), MAXIMUM_BYTES)
+                .expect_err("surrounding whitespace must fail");
+
+            assert_eq!(
+                error,
+                SketchIdError::SurroundingWhitespace {
+                    original: value.to_owned(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn maximum_is_measured_in_bytes() {
+        let accepted = "éé";
+        let rejected = "ééx";
+
         assert_eq!(
-            SketchId::from_seed("  answer_body  ")
-                .expect("seed ID")
+            SketchId::new(accepted.to_owned(), accepted.len())
+                .expect("the exact byte limit must be accepted")
                 .as_str(),
-            "answer_body"
+            accepted
         );
-        assert!(SketchId::from_contract(" \u{00a0} ", &contract).is_err());
-        assert!(SketchId::from_seed(" \u{00a0} ").is_err());
+
+        let error = SketchId::new(rejected.to_owned(), accepted.len())
+            .expect_err("one byte beyond the limit must fail");
+        assert_eq!(
+            error,
+            SketchIdError::TooLong {
+                original: rejected.to_owned(),
+                maximum: accepted.len(),
+                actual: rejected.len(),
+            }
+        );
+    }
+
+    #[test]
+    fn unicode_control_character_reports_its_byte_index() {
+        let value = "é\0body";
+        let error = SketchId::new(value.to_owned(), MAXIMUM_BYTES)
+            .expect_err("a control character must fail");
+
+        assert_eq!(
+            error,
+            SketchIdError::ControlCharacter {
+                original: value.to_owned(),
+                index: 2,
+            }
+        );
+        assert!(!error.to_string().contains('\0'));
+        assert!(error.to_string().contains("\\0"));
+    }
+
+    #[test]
+    fn internal_non_control_whitespace_is_preserved() {
+        let value = "answer \u{00a0} body";
+        let id = SketchId::new(value.to_owned(), MAXIMUM_BYTES)
+            .expect("internal non-control whitespace must remain valid");
+
+        assert_eq!(id.as_str(), value);
+    }
+
+    #[test]
+    fn canonically_equivalent_unicode_ids_remain_byte_distinct() {
+        let composed =
+            SketchId::new("é".to_owned(), MAXIMUM_BYTES).expect("composed ID must be valid");
+        let decomposed = SketchId::new("e\u{301}".to_owned(), MAXIMUM_BYTES)
+            .expect("decomposed ID must be valid");
+
+        assert_ne!(composed, decomposed);
+        assert_eq!(composed.as_str(), "é");
+        assert_eq!(decomposed.as_str(), "e\u{301}");
+    }
+
+    #[test]
+    fn exact_duplicate_ids_remain_equal_for_callers_to_reject() {
+        let first =
+            SketchId::new("answer_body".to_owned(), MAXIMUM_BYTES).expect("first ID must be valid");
+        let duplicate = SketchId::new("answer_body".to_owned(), MAXIMUM_BYTES)
+            .expect("duplicate ID must be individually valid");
+
+        assert_eq!(first, duplicate);
     }
 }

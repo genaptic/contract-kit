@@ -51,9 +51,13 @@ Preserve the dependency and ownership boundaries in
 [ARCHITECTURE.md](ARCHITECTURE.md). The CLI owns OS/process/persistence/archive
 behavior; `conkit-signature` and `conkit-sketch` remain independent semantic
 domains over catalog bytes. `CommandContext` owns `SignatureContractKit`
-directly. Keep signature-to-sketch catalog conversion and linked-seed
-adaptation localized to `contracts/sketch.rs`, with no dependency between the
-domains or back into `conkit`.
+directly, constructs one application-owned Rayon pool for both nominal domain
+work configurations, and owns CLI filesystem catalog budgets. Keep worker
+threads independent from active and pending root-operation capacities. Keep
+signature-to-sketch catalog conversion and linked-seed
+adaptation, including the zero-based physical YAML document index, localized
+to `contracts/sketch.rs`, with no dependency between the domains or back into
+`conkit`.
 
 ## Command Boundary Rules
 
@@ -73,8 +77,9 @@ domains or back into `conkit`.
 - Preserve singular aliases `signature` and `sketch` while keeping plural
   `signatures` and `sketches` visible in help.
 - Preserve the optional, mutually exclusive check modes. Omitting a mode and
-  passing `--default` both select the domain `Default` mode; `--strict` and
-  `--warning` select their corresponding modes.
+  passing `--default` both select signature `Default` and sketch `Enforce`;
+  `--strict` selects signature `Strict` and sketch `Enforce`; `--warning`
+  selects `Warning` in both domains. Matching policy remains contract-owned.
 - Preserve the `generate all` pre-write guarantee: finish signature generation,
   linked-item resolution, and sketch refresh before calling
   `ContractsStore::write_generated`. The baseline-bound `GeneratedContracts`
@@ -94,8 +99,10 @@ domains or back into `conkit`.
   checks with domain reports disabled, then render one combined CLI report.
 - Preserve `archive --gzip` as an optional format selector. Gzip is currently
   the only archive format, so both the omitted and explicit forms select it.
-- Keep the versioned mixed-catalog archive codec in `archive.rs`. Decode once
-  in the CLI, then pass the same previous catalog to both domain diff APIs.
+- Keep the versioned mixed-catalog archive codec in `archive.rs`. Contract
+  documents inside an archive use mandatory contract format v2 while the
+  independent archive envelope remains version 1. Decode once in the CLI, then
+  pass the same previous catalog to both domain diff APIs.
 - Preserve `diff` semantics: a successful comparison exits successfully even
   when the compared contracts changed. A future opt-in flag can add diff-tool
   exit-code behavior.
@@ -109,9 +116,15 @@ domains or back into `conkit`.
   primitives in `catalog/store.rs`.
 - Keep symlink following explicit. A selected source or contracts root may
   itself be a symlink to a directory, but descendants may not traverse
-  symlinks. Selected source files are containment-checked, opened once,
-  verified against the current path identity, and read through that opened
-  handle.
+  symlinks. Every participating source or contract file is component- and
+  containment-checked, opened atomically without following its final symlink
+  or reparse point, verified against the current path identity, and read
+  through that opened handle.
+- Apply `CatalogReadLimits` while traversing and reading source and contract
+  catalogs: count only participating entries, reject metadata-known breaches
+  early, read at most the smaller per-file or remaining-total limit plus one
+  evidence byte through the opened handle, and stop at the first deterministic
+  breach. Domain crates must still revalidate their nominal limits.
 - Keep portable Windows device-name, reserved-character, C0-control, and
   trailing-space/trailing-period validation in `platform/windows_names.rs` and
   apply it through the single `PortablePathRules::validate_component` entry
@@ -129,7 +142,10 @@ domains or back into `conkit`.
   symlink or reparse-point traversal is refused. Verify any opened handle is a
   regular file and read through that same handle. Treat metadata length only as
   an early rejection, enforce the compressed-byte limit while reading, and
-  never reopen the archive path for decoding.
+  never reopen the archive path for decoding. Charge the physical archive
+  entry, actual compressed bytes, and decoded logical entries to the command's
+  existing `CatalogReadBudget`; do not reset or double-charge that ledger in
+  the codec.
 - Do not describe multi-file catalog persistence as one atomic transaction.
   Report and generated-file writes are individually atomic, generation uses a
   locked, digest-backed journal persisted by the ownership model and
@@ -149,15 +165,24 @@ Preserve the execution direction mapped in
 
 - Keep `args.rs` grammar-only and keep `App` limited to parse, initialize, and
   delegate.
+- Keep the shared Rayon pool, independent domain admission values, and CLI
+  catalog-read policy in `CommandContext`; do not construct separate domain
+  pools in command handlers or add a scheduler/core crate.
 - Keep `command.rs` as the exhaustive `AppCommand` facade. Keep check,
   generation, archive, and diff sequencing in `command/check.rs`,
   `command/generate.rs`, `command/archive.rs`, and `command/diff.rs`; these
   modules must not own contract semantics or archive codec details.
 - Keep cross-family routing in `contracts.rs`, direct-root document validation
-  in `contracts/document.rs`, combined layout/source binding in
+  in the `contracts/document` facade plus its `header` and `yaml` children,
+  requested-versus-persisted extraction reconciliation in
+  `contracts/extraction.rs`, combined layout/source binding in
   `contracts/layout.rs`, and substantive sketch adaptation in
   `contracts/sketch.rs`. Do not add a signature wrapper around the kit owned by
   `CommandContext`.
+- Keep `compiler.rs` as the concrete extractor facade. Its `extractor`,
+  `probe`, `limits`, `process`, `project`, `source`, and `error` children own
+  their named lifecycle boundaries; do not recreate a second probe family,
+  process reaper, rustdoc semantic decoder, or source-sized coordinate index.
 - Keep `catalog.rs` as a facade over `catalog/path.rs`, `catalog/source.rs`,
   `catalog/store.rs`, `catalog/ownership.rs`, and
   `catalog/reconciliation.rs`. Persisted version-3 values and intrinsic
@@ -167,7 +192,10 @@ Preserve the execution direction mapped in
   `archive/publication.rs`, and verified existing-archive reads in
   `archive/source.rs`.
 - Keep fallible human-summary writes in `output.rs`; keep report format
-  inference, rendering, and individually atomic replacement in `report.rs`.
+  inference, borrowed domain-view rendering, and individually atomic
+  replacement in `report.rs`. Keep the concrete cancellation/byte-ceiling
+  `Write` adapter in `bounded_output.rs`; archive and report callers retain
+  their distinct error and publication semantics.
 - Keep domain adapters limited to request/response and catalog adaptation, with
   no filesystem roots, terminal presentation, or process policy.
 - Keep layout, catalog, ownership, report, archive, platform, output, and error

@@ -1,9 +1,14 @@
 # Document name, key order, and YAML formatting intentionally differ.
 files: [lib.rs]
+contract_version: 2
 root: ../src
+extraction: {crates: [{kind: library, root: lib.rs, id: fixture}], profile: rust_api_v1, mode: rust_syntax_v2}
 signatures:
   - answer_signature: {return_type: u8, visibility: public, name: answer, signature_type: function, file: lib.rs, sketch: answer_body}
 sketches:
   - answer_body:
-    code: "pub fn answer() -> u8 { 42 }\n"
-    signature_type: function
+      code: "pub fn answer() -> u8 { 42 }\n"
+      matching: {occurrence: at_least_one, normalization: exact_lines_v1}
+      signature_type: function
+      signature: answer_signature
+      file: lib.rs

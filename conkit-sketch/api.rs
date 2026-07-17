@@ -1,21 +1,23 @@
-use crate::contract::SketchContracts;
+use crate::contract::{SketchContracts, SketchMatchPolicy};
 use crate::error::SketchContractKitError;
 use crate::files::{CatalogPath, FileCatalog};
-use crate::generate::SketchGenerator;
 use crate::inventory::{SketchCheckCounts, SketchDiagnostic};
+use crate::limits::SketchLimits;
 use crate::matcher::{SketchMatcher, SourceCatalog};
-use crate::report::{ReportFiles, ReportRequest};
-use crate::work::{AsyncWorkPool, WorkOptions};
+use crate::report::ReportRequest;
+use crate::work::{AsyncWorkPool, CancellationProbe, WorkOptions};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Public handle for sketch contract operations.
 ///
 /// Build a kit with [`SketchContractKit::builder`], then call the async
-/// methods with in-memory catalog requests. Each handle owns and reuses one
-/// local Rayon pool for CPU-bound work; the returned futures remain independent
-/// of any particular async runtime. The configured worker count also bounds
-/// the number of admitted root operations. See [`WorkOptions`] for the complete
-/// admission, cancellation, caller-deadline, and scheduling contract.
+/// methods with in-memory catalog requests. Each handle reuses the configured
+/// local or caller-shared Rayon pool for CPU-bound work; the returned futures
+/// remain independent of any particular async runtime. Worker threads, active
+/// operations, and pending admission are configured independently. See
+/// [`WorkOptions`] for the complete admission, cancellation, and scheduling
+/// contract.
 ///
 /// # Examples
 ///
@@ -43,7 +45,7 @@ use serde::{Deserialize, Serialize};
 ///     source_files: FileCatalog::new(),
 ///     contract_files: FileCatalog::new(),
 ///     report: ReportRequest::None,
-///     mode: CheckMode::Default,
+///     mode: CheckMode::Enforce,
 /// };
 /// let task = async move { task_kit.check(request).await };
 /// let response = futures_executor::block_on(task)?;
@@ -52,32 +54,30 @@ use serde::{Deserialize, Serialize};
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct SketchContractKit {
-    inner: SketchContractKitInner,
-}
-
-enum SketchContractKitInner {
-    Local(LocalSketchContractKit),
+    work: AsyncWorkPool,
+    limits: Arc<SketchLimits>,
 }
 
 /// Builder for [`SketchContractKit`].
 ///
-/// The default builder uses
-/// [`WorkParallelism::RuntimeDefault`](crate::WorkParallelism::RuntimeDefault),
-/// deriving root-operation admission from Rayon's selected worker count. Use
-/// [`SketchContractKitBuilder::with_work_options`] with
-/// [`WorkParallelism::Fixed`](crate::WorkParallelism::Fixed) to select one
-/// explicit non-zero value for both worker count and admitted root operations.
-/// See [`WorkOptions`] for the complete scheduling contract.
+/// The default builder uses [`WorkerPool::RuntimeDefault`](crate::WorkerPool::RuntimeDefault),
+/// one active root operation, no pending admission, and conservative
+/// [`SketchLimits`]. Callers may independently opt into a bounded queue and
+/// replace scheduling or resource budgets before building.
 ///
 /// # Examples
 ///
 /// ```
-/// use conkit_sketch::{SketchContractKitBuilder, WorkOptions, WorkParallelism};
+/// use conkit_sketch::{SketchContractKitBuilder, WorkOptions, WorkerPool};
 /// use std::num::NonZeroUsize;
 ///
 /// let kit = SketchContractKitBuilder::default()
 ///     .with_work_options(WorkOptions {
-///         parallelism: WorkParallelism::Fixed(NonZeroUsize::MIN),
+///         pool: WorkerPool::Dedicated {
+///             worker_threads: NonZeroUsize::MIN,
+///         },
+///         max_in_flight_operations: NonZeroUsize::MIN,
+///         max_pending_operations: 0,
 ///     })
 ///     .build()?;
 /// # let _ = kit;
@@ -86,24 +86,27 @@ enum SketchContractKitInner {
 #[derive(Default)]
 pub struct SketchContractKitBuilder {
     work: WorkOptions,
+    limits: SketchLimits,
 }
 
 impl SketchContractKitBuilder {
     /// Configures CPU work scheduling for the kit.
     ///
-    /// This replaces the builder's current [`WorkOptions`]. Fixed parallelism
-    /// sets both the Rayon worker count and per-kit root-operation admission
-    /// capacity; [`WorkOptions`] documents runtime independence, cancellation,
-    /// caller deadlines, host-side task bounds, and scheduling guarantees.
+    /// This replaces the builder's current [`WorkOptions`]. Worker threads,
+    /// active operations, and pending operations remain independent.
     ///
     /// # Examples
     ///
     /// ```
-    /// use conkit_sketch::{SketchContractKitBuilder, WorkOptions, WorkParallelism};
+    /// use conkit_sketch::{SketchContractKitBuilder, WorkOptions, WorkerPool};
     /// use std::num::NonZeroUsize;
     ///
     /// let builder = SketchContractKitBuilder::default().with_work_options(WorkOptions {
-    ///     parallelism: WorkParallelism::Fixed(NonZeroUsize::MIN),
+    ///     pool: WorkerPool::Dedicated {
+    ///         worker_threads: NonZeroUsize::MIN,
+    ///     },
+    ///     max_in_flight_operations: NonZeroUsize::MIN,
+    ///     max_pending_operations: 0,
     /// });
     /// let kit = builder.build()?;
     /// # let _ = kit;
@@ -111,6 +114,23 @@ impl SketchContractKitBuilder {
     /// ```
     pub fn with_work_options(mut self, work: WorkOptions) -> Self {
         self.work = work;
+        self
+    }
+
+    /// Replaces the resource budgets enforced by every operation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use conkit_sketch::{SketchContractKitBuilder, SketchLimits};
+    ///
+    /// let builder = SketchContractKitBuilder::default().with_limits(SketchLimits::default());
+    /// let kit = builder.build()?;
+    /// # let _ = kit;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn with_limits(mut self, limits: SketchLimits) -> Self {
+        self.limits = limits;
         self
     }
 
@@ -132,7 +152,8 @@ impl SketchContractKitBuilder {
     /// ```
     pub fn build(self) -> Result<SketchContractKit, SketchContractKitError> {
         Ok(SketchContractKit {
-            inner: SketchContractKitInner::Local(LocalSketchContractKit::new(self.work)?),
+            work: AsyncWorkPool::new(self.work)?,
+            limits: Arc::new(self.limits),
         })
     }
 }
@@ -158,15 +179,19 @@ impl SketchContractKit {
     /// Only direct root-level contract entries whose logical paths end in
     /// `.yaml` or `.yml` are considered. Every such entry must be a combined document containing
     /// `root`, `files`, `signatures`, and `sketches`. Signature-owned links and
-    /// flattened sketches are validated before matching begins.
+    /// nested sketches are validated before matching begins.
     ///
     /// Source entries are normalized only when referenced by a valid sketch,
-    /// although [`SketchCheckCounts::source_file_count`] includes every supplied
-    /// source entry. Malformed UTF-8 source bytes are supported through the
-    /// crate's byte-preserving normalization fallback.
+    /// although [`SketchCheckCounts::source_catalog_entry_count`] includes every supplied
+    /// source entry. Matching groups sketches by logical source path and
+    /// versioned normalization policy so each referenced source representation
+    /// is built once. [`SketchNormalization::ExactLinesV1`](crate::SketchNormalization::ExactLinesV1)
+    /// preserves arbitrary source bytes while converting CRLF to LF.
     ///
-    /// Missing source files and non-matching snippets are returned as sorted
-    /// [`SketchDiagnostic`] values. They are not operation errors.
+    /// Missing source files, non-matching snippets, and occurrence-policy
+    /// violations are returned as sorted [`SketchDiagnostic`] values with
+    /// contract/source location and bounded mismatch or occurrence evidence.
+    /// They are not operation errors.
     /// [`CheckMode`] controls whether those diagnostics set
     /// [`CheckResponse::passed`] to `false`. If requested, report bytes are
     /// returned in [`CheckResponse::report_files`]; this method performs no
@@ -177,8 +202,7 @@ impl SketchContractKit {
     /// Returns [`SketchContractKitError`] when contract YAML is malformed or
     /// violates the field, identifier, path, link, kind, or nonempty-code
     /// rules; when signature labels or sketch identifiers are duplicated; when
-    /// response invariants or report rendering fail; or when background work
-    /// cannot complete.
+    /// report rendering fails; or when background work cannot complete.
     ///
     /// # Panics
     ///
@@ -190,7 +214,7 @@ impl SketchContractKit {
     /// ```
     /// use conkit_sketch::{
     ///     CatalogPath, CheckMode, CheckRequest, FileCatalog, ReportRequest,
-    ///     SketchContractKit, SketchDiagnostic,
+    ///     SketchContractKit, SketchDiagnostic, SketchNormalization,
     /// };
     ///
     /// fn catalog_with(
@@ -205,8 +229,10 @@ impl SketchContractKit {
     /// let source_files = catalog_with("lib.rs", b"pub fn answer() -> u8 { 41 }\n")?;
     /// let contract_files = catalog_with(
     ///     "main.yml",
-    ///     br#"root: ../src
+    ///     br#"contract_version: 2
+    /// root: ../src
     /// files: [lib.rs]
+    /// extraction: { mode: rust_syntax_v2, profile: rust_api_v1, crates: [{ id: example, root: lib.rs, kind: library }] }
     /// signatures:
     ///   - answer_signature:
     ///       file: lib.rs
@@ -214,8 +240,11 @@ impl SketchContractKit {
     ///       sketch: answer_body
     /// sketches:
     ///   - answer_body:
-    ///     signature_type: function
-    ///     code: pub fn answer() -> u8 { 42 }
+    ///       file: lib.rs
+    ///       signature: answer_signature
+    ///       signature_type: function
+    ///       matching: { normalization: exact_lines_v1, occurrence: at_least_one }
+    ///       code: pub fn answer() -> u8 { 42 }
     /// "#,
     /// )?;
     /// let kit = SketchContractKit::builder().build()?;
@@ -224,36 +253,43 @@ impl SketchContractKit {
     ///     source_files,
     ///     contract_files,
     ///     report: ReportRequest::None,
-    ///     mode: CheckMode::Strict,
+    ///     mode: CheckMode::Enforce,
     /// }))?;
     ///
     /// assert!(!response.passed);
-    /// assert_eq!(
-    ///     response.diagnostics,
-    ///     vec![SketchDiagnostic::NotMatched {
-    ///         sketch_id: "answer_body".to_owned(),
-    ///         file: "lib.rs".to_owned(),
-    ///     }],
-    /// );
+    /// assert!(matches!(
+    ///     response.diagnostics.as_slice(),
+    ///     [SketchDiagnostic::NotMatched {
+    ///         sketch,
+    ///         normalization: SketchNormalization::ExactLinesV1,
+    ///         candidate: Some(_),
+    ///     }] if sketch.sketch_id == "answer_body"
+    ///         && sketch.contract_file.as_str() == "main.yml"
+    ///         && sketch.document_index == 0
+    ///         && sketch.source_file.as_str() == "lib.rs"
+    /// ));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub async fn check(
         &self,
         request: CheckRequest,
     ) -> Result<CheckResponse, SketchContractKitError> {
-        <Self as SketchContractKitBackend>::check(self, request).await
+        let limits = Arc::clone(&self.limits);
+        self.work
+            .execute(move |cancellation| request.run(&limits, &cancellation))
+            .await?
     }
 
     /// Refreshes explicitly linked sketches in combined contract documents.
     ///
-    /// Each [`SketchSeed`] identifies an existing flattened sketch and the
+    /// Each [`SketchSeed`] identifies an existing nested sketch and the
     /// signature link that produced its exact source text. Generation replaces
     /// only that sketch's `code` field. The document's `root`, `files`,
     /// `signatures`, link direction, identifier, and `signature_type` remain
     /// intact. Documents without linked sketches, nested YAML entries, and
     /// non-YAML catalog entries are returned byte-for-byte unchanged. The
-    /// response contains every input catalog entry, and its `sketch_count` is
-    /// the number of linked sketches refreshed.
+    /// response contains every input catalog entry and a cohesive count of
+    /// linked, refreshed, exact-changed, and changed-document totals.
     ///
     /// # Errors
     ///
@@ -271,12 +307,17 @@ impl SketchContractKit {
     /// # Examples
     ///
     /// ```
-    /// use conkit_sketch::{CatalogPath, FileCatalog, GenerateRequest, SketchContractKit, SketchSeed};
+    /// use conkit_sketch::{
+    ///     CatalogPath, FileCatalog, GenerateMode, GenerateRequest,
+    ///     SketchContractKit, SketchSeed,
+    /// };
     ///
     /// let contract_path = CatalogPath::new("main.yml")?;
     /// let mut contract_files = FileCatalog::new();
-    /// contract_files.insert(contract_path.clone(), br#"root: ../src
+    /// contract_files.insert(contract_path.clone(), br#"contract_version: 2
+    /// root: ../src
     /// files: [lib.rs]
+    /// extraction: { mode: rust_syntax_v2, profile: rust_api_v1, crates: [{ id: example, root: lib.rs, kind: library }] }
     /// signatures:
     ///   - answer:
     ///       file: lib.rs
@@ -284,8 +325,12 @@ impl SketchContractKit {
     ///       sketch: answer_body
     /// sketches:
     ///   - answer_body:
-    ///     signature_type: function
-    ///     code: old code
+    ///       file: lib.rs
+    ///       signature: answer
+    ///       signature_type: function
+    ///       matching: { normalization: exact_lines_v1, occurrence: at_least_one }
+    ///       code: |-
+    ///         old code
     /// "#.to_vec())?;
     /// let kit = SketchContractKit::builder().build()?;
     ///
@@ -293,17 +338,19 @@ impl SketchContractKit {
     ///     contract_files,
     ///     seeds: vec![SketchSeed {
     ///         contract_file: contract_path.clone(),
+    ///         document_index: 0,
     ///         sketch_id: "answer_body".to_owned(),
     ///         signature_type: "function".to_owned(),
     ///         file: CatalogPath::new("lib.rs")?,
     ///         code: "pub fn answer() -> u8 { 42 }".to_owned(),
     ///     }],
+    ///     mode: GenerateMode::FullRefresh,
     /// }))?;
     /// let yaml = std::str::from_utf8(
     ///     response.contract_files.get(&contract_path).expect("updated contract"),
     /// )?;
     ///
-    /// assert_eq!(response.sketch_count, 1);
+    /// assert_eq!(response.counts.refreshed_sketch_count, 1);
     /// assert!(yaml.contains("pub fn answer() -> u8 { 42 }"));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
@@ -311,20 +358,24 @@ impl SketchContractKit {
         &self,
         request: GenerateRequest,
     ) -> Result<GenerateResponse, SketchContractKitError> {
-        <Self as SketchContractKitBackend>::generate(self, request).await
+        let limits = Arc::clone(&self.limits);
+        self.work
+            .execute(move |cancellation| request.run(&limits, &cancellation))
+            .await?
     }
 
     /// Compares current sketch contracts with a previous contract catalog.
     ///
     /// Sketch identifiers are identity. For a sketch present in both catalogs,
     /// the linked logical source file, linked signature label, `signature_type`,
-    /// and normalized code are semantic. The containing contract document, YAML
-    /// formatting, YAML comments outside `code`, and mapping order are
-    /// nonsemantic.
+    /// matching policy, and normalized code are semantic. The containing
+    /// contract document, YAML formatting, YAML comments outside `code`, and
+    /// mapping order are nonsemantic.
     ///
-    /// Normalization removes blank lines and collapses whitespace within each
-    /// line, so those changes alone are ignored. Line order and every token or
-    /// comment inside `code` remain semantic.
+    /// Exact-line normalization equates CRLF with LF and ignores one final line
+    /// terminator. It preserves indentation, tabs, horizontal whitespace, blank
+    /// lines, line order, and every token or comment byte inside `code`, so
+    /// changes to any of those preserved bytes are semantic.
     ///
     /// # Errors
     ///
@@ -339,11 +390,15 @@ impl SketchContractKit {
     /// # Examples
     ///
     /// ```
-    /// use conkit_sketch::{CatalogPath, DiffEntry, DiffRequest, FileCatalog, SketchContractKit};
-    ///
+    /// use conkit_sketch::{
+    ///     CatalogPath, DiffEntry, DiffRequest, FileCatalog, SketchContractKit,
+    ///     SketchField,
+    /// };
     /// fn contract_catalog(code: &str) -> Result<FileCatalog, Box<dyn std::error::Error>> {
-    ///     let yaml = format!(r#"root: ../src
+    ///     let yaml = format!(r#"contract_version: 2
+    /// root: ../src
     /// files: [lib.rs]
+    /// extraction: {{ mode: rust_syntax_v2, profile: rust_api_v1, crates: [{{ id: example, root: lib.rs, kind: library }}] }}
     /// signatures:
     ///   - answer_signature:
     ///       file: lib.rs
@@ -351,8 +406,11 @@ impl SketchContractKit {
     ///       sketch: answer_body
     /// sketches:
     ///   - answer_body:
-    ///     signature_type: function
-    ///     code: {code}
+    ///       file: lib.rs
+    ///       signature: answer_signature
+    ///       signature_type: function
+    ///       matching: {{ normalization: exact_lines_v1, occurrence: at_least_one }}
+    ///       code: {code}
     /// "#);
     ///     let mut catalog = FileCatalog::new();
     ///     catalog.insert(CatalogPath::new("main.yml")?, yaml.into_bytes())?;
@@ -365,129 +423,20 @@ impl SketchContractKit {
     ///     previous_contract_files: contract_catalog("let value = 1;")?,
     /// }))?;
     ///
-    /// assert!(response.changed);
-    /// assert_eq!(
-    ///     response.entries,
-    ///     vec![DiffEntry::Changed {
-    ///         sketch_id: "answer_body".to_owned(),
-    ///     }],
-    /// );
+    /// assert!(response.changed());
+    /// assert!(matches!(
+    ///     response.entries.as_slice(),
+    ///     [DiffEntry::Changed { current, fields, .. }]
+    ///         if current.sketch_id == "answer_body"
+    ///             && fields.as_slice() == [SketchField::Code]
+    /// ));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub async fn diff(&self, request: DiffRequest) -> Result<DiffResponse, SketchContractKitError> {
-        <Self as SketchContractKitBackend>::diff(self, request).await
-    }
-}
-
-pub(crate) trait SketchContractKitBackend {
-    async fn check(&self, request: CheckRequest) -> Result<CheckResponse, SketchContractKitError>;
-
-    async fn generate(
-        &self,
-        request: GenerateRequest,
-    ) -> Result<GenerateResponse, SketchContractKitError>;
-
-    async fn diff(&self, request: DiffRequest) -> Result<DiffResponse, SketchContractKitError>;
-}
-
-impl SketchContractKitBackend for SketchContractKit {
-    async fn check(&self, request: CheckRequest) -> Result<CheckResponse, SketchContractKitError> {
-        match &self.inner {
-            SketchContractKitInner::Local(backend) => backend.check(request).await,
-        }
-    }
-
-    async fn generate(
-        &self,
-        request: GenerateRequest,
-    ) -> Result<GenerateResponse, SketchContractKitError> {
-        match &self.inner {
-            SketchContractKitInner::Local(backend) => backend.generate(request).await,
-        }
-    }
-
-    async fn diff(&self, request: DiffRequest) -> Result<DiffResponse, SketchContractKitError> {
-        match &self.inner {
-            SketchContractKitInner::Local(backend) => backend.diff(request).await,
-        }
-    }
-}
-
-struct LocalSketchContractKit {
-    work: AsyncWorkPool,
-}
-
-impl LocalSketchContractKit {
-    fn new(work: WorkOptions) -> Result<Self, SketchContractKitError> {
-        Ok(Self {
-            work: AsyncWorkPool::new(work)?,
-        })
-    }
-}
-
-impl SketchContractKitBackend for LocalSketchContractKit {
-    async fn check(&self, request: CheckRequest) -> Result<CheckResponse, SketchContractKitError> {
+        let limits = Arc::clone(&self.limits);
         self.work
-            .execute(move || SketchCheck::new(request).run())
+            .execute(move |cancellation| request.run(&limits, &cancellation))
             .await?
-    }
-
-    async fn generate(
-        &self,
-        request: GenerateRequest,
-    ) -> Result<GenerateResponse, SketchContractKitError> {
-        self.work
-            .execute(move || SketchGenerator::new(request).generate())
-            .await?
-    }
-
-    async fn diff(&self, request: DiffRequest) -> Result<DiffResponse, SketchContractKitError> {
-        self.work
-            .execute(move || SketchDiff::new(request).run())
-            .await?
-    }
-}
-
-struct SketchDiff {
-    request: DiffRequest,
-}
-
-impl SketchDiff {
-    fn new(request: DiffRequest) -> Self {
-        Self { request }
-    }
-
-    fn run(self) -> Result<DiffResponse, SketchContractKitError> {
-        let current = SketchContracts::from_catalog(self.request.current_contract_files)?;
-        let previous = SketchContracts::from_catalog(self.request.previous_contract_files)?;
-
-        Ok(current.diff_against(&previous))
-    }
-}
-
-struct SketchCheck {
-    request: CheckRequest,
-}
-
-impl SketchCheck {
-    fn new(request: CheckRequest) -> Self {
-        Self { request }
-    }
-
-    fn run(self) -> Result<CheckResponse, SketchContractKitError> {
-        let CheckRequest {
-            source_files,
-            contract_files,
-            report,
-            mode,
-        } = self.request;
-        let contracts = SketchContracts::from_catalog(contract_files)?;
-        let sources = SourceCatalog::from_catalog(source_files, &contracts);
-        let comparison = SketchMatcher::new(sources, contracts).check()?;
-        let mut response = comparison.into_response(mode);
-
-        response.report_files = ReportFiles::new(report).render(&response)?;
-        Ok(response)
     }
 }
 
@@ -498,22 +447,25 @@ impl SketchCheck {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CheckMode {
     /// Fail the response when one or more diagnostics are present.
-    ///
-    /// This currently has the same pass/fail behavior as [`CheckMode::Strict`].
-    Default,
-    /// Fail the response when one or more diagnostics are present.
-    ///
-    /// This currently has the same pass/fail behavior as [`CheckMode::Default`].
-    Strict,
+    Enforce,
     /// Preserve diagnostics while keeping the response passing.
     Warning,
+}
+
+impl CheckMode {
+    pub(crate) fn passed(self, diagnostics: &[SketchDiagnostic]) -> bool {
+        match self {
+            Self::Enforce => diagnostics.is_empty(),
+            Self::Warning => true,
+        }
+    }
 }
 
 /// Request for [`SketchContractKit::check`].
 ///
 /// The caller owns filesystem discovery and provides both source and contract
 /// bytes as [`FileCatalog`] values. The complete source catalog contributes to
-/// [`SketchCheckCounts::source_file_count`], while matching normalizes only
+/// [`SketchCheckCounts::source_catalog_entry_count`], while matching normalizes only
 /// source entries referenced by parsed sketches. Contract parsing considers
 /// only direct root-level `.yaml` and `.yml` entries.
 ///
@@ -526,10 +478,10 @@ pub enum CheckMode {
 ///     source_files: FileCatalog::new(),
 ///     contract_files: FileCatalog::new(),
 ///     report: ReportRequest::None,
-///     mode: CheckMode::Default,
+///     mode: CheckMode::Enforce,
 /// };
 ///
-/// assert_eq!(request.mode, CheckMode::Default);
+/// assert_eq!(request.mode, CheckMode::Enforce);
 /// assert!(request.source_files.is_empty());
 /// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -551,12 +503,41 @@ pub struct CheckRequest {
     pub mode: CheckMode,
 }
 
+impl CheckRequest {
+    fn run(
+        self,
+        limits: &SketchLimits,
+        cancellation: &CancellationProbe,
+    ) -> Result<CheckResponse, SketchContractKitError> {
+        let Self {
+            source_files,
+            contract_files,
+            report,
+            mode,
+        } = self;
+        let mut catalog_usage = limits.catalog_usage();
+        catalog_usage.record(&source_files, cancellation)?;
+        catalog_usage.record(&contract_files, cancellation)?;
+        let mut yaml_budget = limits.yaml_budget();
+        cancellation.checkpoint()?;
+        let contracts =
+            SketchContracts::from_catalog(contract_files, limits, &mut yaml_budget, cancellation)?;
+        cancellation.checkpoint()?;
+        let sources = SourceCatalog::from_catalog(source_files, &contracts, cancellation)?;
+        let comparison = SketchMatcher::new(sources, contracts).check(limits, cancellation)?;
+        cancellation.checkpoint()?;
+        let mut response = comparison.into_response(mode);
+        response.report_files = report.render(&response, &limits.output, cancellation)?;
+        Ok(response)
+    }
+}
+
 /// Response returned by [`SketchContractKit::check`].
 ///
 /// Contract syntax and validation failures are returned as
 /// [`SketchContractKitError`], not stored here. This response contains ordinary
-/// match outcomes, with diagnostics sorted deterministically by sketch
-/// identifier, optional file path, and diagnostic kind.
+/// match outcomes, with diagnostics sorted deterministically by complete
+/// contract/source location and diagnostic kind.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckResponse {
     /// Whether the check passed under the requested [`CheckMode`].
@@ -572,6 +553,16 @@ pub struct CheckResponse {
     pub report_files: FileCatalog,
 }
 
+impl CheckResponse {
+    /// Borrows the serialized report payload without `report_files`.
+    ///
+    /// The opaque view implements [`Serialize`] and is used for both
+    /// standalone domain reports and embedded combined CLI reports.
+    pub fn report_view(&self) -> impl Serialize + '_ {
+        crate::report::CheckReportView::new(self)
+    }
+}
+
 /// Request for [`SketchContractKit::generate`].
 ///
 /// Generation consumes combined contract bytes plus exact linked-sketch seeds
@@ -581,8 +572,54 @@ pub struct CheckResponse {
 pub struct GenerateRequest {
     /// Existing combined contract documents to update.
     pub contract_files: FileCatalog,
-    /// One exact refresh seed for every explicitly linked sketch.
+    /// Exact refresh seeds selected according to [`GenerateRequest::mode`].
     pub seeds: Vec<SketchSeed>,
+    /// Whether every linked sketch or only supplied sketch IDs are refreshed.
+    pub mode: GenerateMode,
+}
+
+/// Selects complete or targeted linked-sketch generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum GenerateMode {
+    /// Require and validate one seed for every linked sketch.
+    FullRefresh,
+    /// Refresh only supplied IDs and preserve every unspecified sketch.
+    PartialRefresh,
+}
+
+/// Scope and exact byte-change totals for completed sketch generation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SketchGenerationCounts {
+    /// Number of linked sketches present in the parsed contract catalog.
+    pub linked_sketch_count: usize,
+    /// Number of supplied sketches validated and targeted by the request.
+    pub refreshed_sketch_count: usize,
+    /// Number of refreshed sketches whose exact code scalar changed.
+    pub changed_sketch_count: usize,
+    /// Number of YAML documents containing at least one changed sketch.
+    pub changed_document_count: usize,
+}
+
+impl SketchGenerationCounts {
+    pub(crate) const fn new(linked_sketch_count: usize) -> Self {
+        Self {
+            linked_sketch_count,
+            refreshed_sketch_count: 0,
+            changed_sketch_count: 0,
+            changed_document_count: 0,
+        }
+    }
+
+    pub(crate) fn record_refreshed(&mut self, changed: bool) {
+        self.refreshed_sketch_count += 1;
+        if changed {
+            self.changed_sketch_count += 1;
+        }
+    }
+
+    pub(crate) fn record_changed_document(&mut self) {
+        self.changed_document_count += 1;
+    }
 }
 
 /// Response returned by [`SketchContractKit::generate`].
@@ -596,8 +633,8 @@ pub struct GenerateRequest {
 pub struct GenerateResponse {
     /// Complete contract catalog, including unchanged passthrough entries.
     pub contract_files: FileCatalog,
-    /// Number of explicitly linked sketches refreshed.
-    pub sketch_count: usize,
+    /// Linked, refreshed, exact-change, and changed-document totals.
+    pub counts: SketchGenerationCounts,
 }
 
 /// Request for [`SketchContractKit::diff`].
@@ -609,13 +646,87 @@ pub struct DiffRequest {
     pub previous_contract_files: FileCatalog,
 }
 
+impl DiffRequest {
+    fn run(
+        self,
+        limits: &SketchLimits,
+        cancellation: &CancellationProbe,
+    ) -> Result<DiffResponse, SketchContractKitError> {
+        let mut catalog_usage = limits.catalog_usage();
+        catalog_usage.record(&self.current_contract_files, cancellation)?;
+        catalog_usage.record(&self.previous_contract_files, cancellation)?;
+        let mut yaml_budget = limits.yaml_budget();
+        cancellation.checkpoint()?;
+        let current = SketchContracts::from_catalog(
+            self.current_contract_files,
+            limits,
+            &mut yaml_budget,
+            cancellation,
+        )?;
+        cancellation.checkpoint()?;
+        let previous = SketchContracts::from_catalog(
+            self.previous_contract_files,
+            limits,
+            &mut yaml_budget,
+            cancellation,
+        )?;
+        cancellation.checkpoint()?;
+        current.diff_against(&previous, cancellation)
+    }
+}
+
 /// Response returned by [`SketchContractKit::diff`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiffResponse {
-    /// Whether any sketch was added, removed, or semantically changed.
-    pub changed: bool,
+    /// Digest of the current catalog's complete semantic sketch identity.
+    pub contract_digest: String,
+    /// Canonical digest encoding version.
+    pub digest_version: u16,
     /// Deterministically ordered sketch changes.
     pub entries: Vec<DiffEntry>,
+}
+
+impl DiffResponse {
+    /// Returns whether any sketch was added, removed, or semantically changed.
+    pub fn changed(&self) -> bool {
+        !self.entries.is_empty()
+    }
+}
+
+/// Context-rich state of one sketch at one side of a semantic diff.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SketchSnapshot {
+    /// User-defined sketch identifier.
+    pub sketch_id: String,
+    /// Logical contract file containing this occurrence.
+    pub contract_file: CatalogPath,
+    /// Zero-based physical YAML document index within `contract_file`.
+    pub document_index: usize,
+    /// Logical source file referenced by the linked signature.
+    pub source_file: CatalogPath,
+    /// Signature label linked to this sketch.
+    pub linked_signature: String,
+    /// Signature kind copied from the linked signature.
+    pub signature_type: String,
+    /// Versioned normalization and occurrence semantics.
+    pub matching: SketchMatchPolicy,
+    /// Domain-separated SHA-256 digest of normalized code bytes.
+    pub code_digest: String,
+}
+
+/// Independently observable semantic sketch field.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum SketchField {
+    /// Referenced logical source path.
+    SourceFile,
+    /// Linked signature label.
+    LinkedSignature,
+    /// Linked signature kind.
+    SignatureType,
+    /// Required occurrence policy.
+    Occurrence,
+    /// Exact normalized code bytes.
+    Code,
 }
 
 /// One semantic sketch change returned by [`DiffResponse`].
@@ -623,18 +734,22 @@ pub struct DiffResponse {
 pub enum DiffEntry {
     /// A sketch exists only in the current catalog.
     Added {
-        /// User-defined sketch identifier.
-        sketch_id: String,
+        /// Current sketch state and locator.
+        current: SketchSnapshot,
     },
     /// A sketch exists only in the previous catalog.
     Removed {
-        /// User-defined sketch identifier.
-        sketch_id: String,
+        /// Previous sketch state and locator.
+        previous: SketchSnapshot,
     },
     /// A sketch exists in both catalogs with different semantic fields.
     Changed {
-        /// User-defined sketch identifier.
-        sketch_id: String,
+        /// Previous semantic state and locator.
+        previous: SketchSnapshot,
+        /// Current semantic state and locator.
+        current: SketchSnapshot,
+        /// Deterministically ordered fields that changed.
+        fields: Vec<SketchField>,
     },
 }
 
@@ -647,12 +762,15 @@ pub enum DiffEntry {
 pub struct SketchSeed {
     /// Combined document containing both the signature link and sketch.
     pub contract_file: CatalogPath,
-    /// User-facing flattened sketch identifier.
+    /// Zero-based physical YAML document index within `contract_file`.
+    pub document_index: usize,
+    /// User-facing sketch identifier.
     pub sketch_id: String,
     /// Signature kind copied from the linked signature.
     pub signature_type: String,
     /// Logical source entry declared by the linked signature.
     pub file: CatalogPath,
-    /// Exact source text, required to be nonempty after normalization.
+    /// Exact source text, required to contain at least one line after the
+    /// sketch's exact-line normalization policy is applied.
     pub code: String,
 }

@@ -55,6 +55,10 @@ before approving the release environment.
 3. Move the release notes out of `Unreleased` in `CHANGELOG.md` and add the
    version links.
 4. Open a pull request and wait for every required CI and rustdoc check to pass.
+   Confirm the scheduled or manually dispatched Hardening workflow is green for
+   the release commit; release preflight independently reruns the locked
+   production and fuzz dependency policies so advisory state cannot be inferred
+   from an older commit.
 5. Merge that pull request into `main`.
 
 ## Publish a release
@@ -62,19 +66,25 @@ before approving the release environment.
 From the Actions tab, run the `Release` workflow on `main`:
 
 - enter the manifest version without the leading `v`;
-- select `bootstrap_crates_io` only for `0.0.1` or another first publication
-  that cannot use trusted publishing yet; and
+- select `bootstrap_crates_io` only while both publishable crate names are
+  absent from crates.io and trusted publishing therefore cannot be configured;
+  preflight rejects bootstrap authentication if either name is established or
+  registry state cannot be proved; and
 - select `confirm_release` before dispatching.
 
-The workflow re-runs the checked, locked workspace gates and package dry-runs,
-builds and smoke-tests each native executable, creates checksummed archives,
-and waits for the `release` environment approval. The protected job creates a
-lightweight tag at the validated release commit, verifies that the remote tag
-resolves to that exact commit, and creates the draft GitHub Release only from
-the verified tag. It then publishes any library version that is not already on
-crates.io and makes the GitHub Release public only after both publishes succeed.
-Docs.rs automatically queues versioned documentation for each published
-library.
+The workflow requires the checked-in independent fuzz lockfile, installs the
+pinned dependency-policy tool, refreshes advisory data, enforces the locked
+production and fuzz policies, re-runs the checked workspace gates, verifies the
+declared Rust 1.97 minimum, exercises both library and binary compiler extraction
+at the exact release commit, and performs package dry-runs. It then builds and
+smoke-tests each native executable, creates checksummed archives, and waits for
+the `release`
+environment approval. The protected job creates a lightweight tag at the
+validated release commit, verifies that the remote tag resolves to that exact
+commit, and creates the draft GitHub Release only from the verified tag. It
+then publishes any library version that is not already on crates.io and makes
+the GitHub Release public only after both publishes succeed. Docs.rs
+automatically queues versioned documentation for each published library.
 
 The publish step is safe to retry after a partial crates.io publication. It
 packages each library locally, then accepts an existing version only when the

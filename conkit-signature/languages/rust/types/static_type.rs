@@ -1,8 +1,8 @@
-use crate::languages::rust::types::base_type::{BaseCanonical, BaseType};
+use crate::languages::rust::types::base_type::BaseType;
 use crate::languages::rust::types::primitive_types::RustType;
 use serde::Serialize;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct StaticType {
     base: BaseType,
     mutable: bool,
@@ -30,18 +30,8 @@ impl StaticType {
         &self.static_type
     }
 
-    pub(in crate::languages::rust) fn canonical_form(&self) -> StaticCanonical {
-        StaticCanonical {
-            base: self.base.canonical_form(),
-            mutable: self.mutable,
-            static_type: self.static_type.clone(),
-        }
+    pub(crate) fn requires_capability_warning(&self) -> bool {
+        self.base.attributes().requires_capability_warning()
+            || self.static_type.requires_capability_warning()
     }
-}
-
-#[derive(Serialize)]
-pub(in crate::languages::rust) struct StaticCanonical {
-    base: BaseCanonical,
-    mutable: bool,
-    static_type: RustType,
 }

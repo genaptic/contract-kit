@@ -3,10 +3,13 @@
 use anyhow::Context;
 
 use super::AppCommand;
-use crate::args::{CheckArgs, CheckCommand, CheckSubject};
+use crate::args::{CheckArgs, CheckCommand, CheckSubject, SignatureCheckArgs};
 use crate::catalog::{ContractsStore, PathRole, ResolvedPath, SourceTree};
 use crate::context::CommandContext;
-use crate::contracts::{ContractCheckMode, ContractLayout, ContractTarget, SketchCheckRequest};
+use crate::contracts::{
+    ContractCheckMode, ContractLayout, ContractTarget, ExtractionUse, RequestedExtraction,
+    SignatureExtractionCoordinator, SketchCheckRequest,
+};
 use crate::error::CliError;
 use crate::report::ReportDestination;
 
@@ -18,23 +21,24 @@ struct ContractCheck<'context> {
     report: ReportDestination,
     source_files: conkit_signature::FileCatalog,
     contract_files: conkit_signature::FileCatalog,
+    extraction: conkit_signature::RustExtractionInput,
 }
 
 impl AppCommand for CheckCommand {
     async fn execute(&self, context: &CommandContext) -> anyhow::Result<()> {
         match &self.subject {
             CheckSubject::All(args) => {
-                ContractCheck::prepare(args, ContractTarget::All, context)?
+                ContractCheck::prepare_signatures(args, ContractTarget::All, context)?
                     .run()
                     .await
             }
             CheckSubject::Signatures(args) => {
-                ContractCheck::prepare(args, ContractTarget::Signatures, context)?
+                ContractCheck::prepare_signatures(args, ContractTarget::Signatures, context)?
                     .run()
                     .await
             }
             CheckSubject::Sketches(args) => {
-                ContractCheck::prepare(args, ContractTarget::Sketches, context)?
+                ContractCheck::prepare(args, ContractTarget::Sketches, None, context)?
                     .run()
                     .await
             }
@@ -43,24 +47,62 @@ impl AppCommand for CheckCommand {
 }
 
 impl<'context> ContractCheck<'context> {
+    fn prepare_signatures(
+        args: &SignatureCheckArgs,
+        target: ContractTarget,
+        context: &'context CommandContext,
+    ) -> anyhow::Result<Self> {
+        let extraction = args.signature.requested_extraction()?;
+        Self::prepare(&args.common, target, Some(extraction), context)
+    }
+
     /// Validates filesystem inputs and reads the exact catalogs required by a check.
     fn prepare(
         args: &CheckArgs,
         target: ContractTarget,
+        requested: Option<RequestedExtraction<'_>>,
         context: &'context CommandContext,
     ) -> anyhow::Result<Self> {
-        let report = ReportDestination::new(args.output.clone())?;
+        let report = ReportDestination::new(
+            args.output.clone(),
+            context.catalog_read_limits().per_file_bytes(),
+            context.cancellation(),
+        )?;
         ResolvedPath::ensure_disjoint(&[
             ResolvedPath::new(PathRole::Source, args.source.clone())?,
             ResolvedPath::new(PathRole::Contracts, args.contracts.clone())?,
             ResolvedPath::new(PathRole::Report, args.output.clone())?,
         ])?;
-        let source = SourceTree::open(args.source.clone())?;
-        let contracts = ContractsStore::new(args.contracts.clone());
-        let catalog = contracts.read()?;
-        let layout = ContractLayout::load(&contracts, &source, &catalog)?;
+        let source =
+            SourceTree::open(args.source.clone())?.with_limits(context.catalog_read_limits());
+        let contracts =
+            ContractsStore::new(args.contracts.clone()).with_limits(context.catalog_read_limits());
+        let mut catalog_reads = context.catalog_read_limits().begin(context.cancellation());
+        let catalog = contracts.read_with_budget(&mut catalog_reads)?;
+        let layout = ContractLayout::load(&contracts, &source, &catalog, context.cancellation())?;
         layout.require_documents(&contracts)?;
-        let source_files = layout.read_sources(&source)?;
+        let persisted = if requested.is_some() {
+            layout.extraction(context.cancellation())?
+        } else {
+            None
+        };
+        let source_files = layout.read_sources(&source, &mut catalog_reads)?;
+        let extraction = match requested {
+            Some(requested) => {
+                let coordinator = SignatureExtractionCoordinator::new(requested, &contracts);
+                let decision = coordinator.reconcile(ExtractionUse::Check { persisted })?;
+                let (extraction, generation_crates) = decision.acquire(
+                    context,
+                    &source,
+                    &source_files,
+                    &contracts,
+                    &mut catalog_reads,
+                )?;
+                debug_assert!(generation_crates.is_empty());
+                extraction
+            }
+            None => conkit_signature::RustExtractionInput::Syntax,
+        };
         let contract_files = layout.into_documents();
 
         Ok(Self {
@@ -70,6 +112,7 @@ impl<'context> ContractCheck<'context> {
             report,
             source_files,
             contract_files,
+            extraction,
         })
     }
 
@@ -99,6 +142,7 @@ impl<'context> ContractCheck<'context> {
             report,
             source_files,
             contract_files,
+            extraction,
             target: _,
         } = self;
         let response = context
@@ -107,12 +151,13 @@ impl<'context> ContractCheck<'context> {
                 source_files,
                 contract_files,
                 report: report.to_signature_request()?,
-                scope: conkit_signature::ContractScope::Signatures,
                 mode: mode.signature(),
+                extraction,
             })
             .await
             .context("failed to check signature contracts")?;
 
+        context.cancellation().checkpoint()?;
         report.write_signature_report(&response.report_files)?;
         if !response.passed {
             return Err(CliError::CheckFailed {
@@ -132,6 +177,7 @@ impl<'context> ContractCheck<'context> {
             report,
             source_files,
             contract_files,
+            extraction: _,
             target: _,
         } = self;
         let response = context
@@ -144,6 +190,7 @@ impl<'context> ContractCheck<'context> {
             ))
             .await?;
 
+        context.cancellation().checkpoint()?;
         report.write_sketch_report(&response.report_files)?;
         if !response.passed {
             return Err(CliError::CheckFailed {
@@ -163,6 +210,7 @@ impl<'context> ContractCheck<'context> {
             report,
             source_files,
             contract_files,
+            extraction,
             target: _,
         } = self;
         let signature_response = context
@@ -171,8 +219,8 @@ impl<'context> ContractCheck<'context> {
                 source_files: source_files.clone(),
                 contract_files: contract_files.clone(),
                 report: conkit_signature::ReportRequest::None,
-                scope: conkit_signature::ContractScope::Signatures,
                 mode: mode.signature(),
+                extraction,
             })
             .await
             .context("failed to check signature contracts")?;
@@ -186,6 +234,7 @@ impl<'context> ContractCheck<'context> {
             ))
             .await?;
 
+        context.cancellation().checkpoint()?;
         report.write_all_check_report(&signature_response, &sketch_response)?;
         if !signature_response.passed || !sketch_response.passed {
             return Err(CliError::CheckFailed {

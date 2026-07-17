@@ -7,6 +7,7 @@ use crate::archive::ArchiveSource;
 use crate::args::DiffCommand;
 use crate::catalog::{ContractsStore, PathRole, ResolvedPath};
 use crate::context::CommandContext;
+use crate::contracts::ContractFormatValidator;
 
 impl AppCommand for DiffCommand {
     async fn execute(&self, context: &CommandContext) -> anyhow::Result<()> {
@@ -15,10 +16,18 @@ impl AppCommand for DiffCommand {
             ResolvedPath::new(PathRole::ArchiveFile, self.archive.clone())?,
         ])?;
 
-        let current = ContractsStore::new(self.contracts.clone()).read()?;
+        let mut catalog_reads = context.catalog_read_limits().begin(context.cancellation());
+        let current = ContractsStore::new(self.contracts.clone())
+            .with_limits(context.catalog_read_limits())
+            .read_with_budget(&mut catalog_reads)?;
+        let mut validator = ContractFormatValidator::new(context.cancellation());
+        validator.validate(&current)?;
         let previous = ArchiveSource::new(self.archive.clone())
-            .decode_contracts()
+            .decode_contracts(&mut catalog_reads)
             .context("failed to decode contract archive")?;
+        validator
+            .validate(&previous)
+            .context("archived contracts must be recreated in contract format v2")?;
         let signatures = context
             .signature()
             .diff(conkit_signature::DiffRequest {
@@ -33,7 +42,10 @@ impl AppCommand for DiffCommand {
             .await
             .context("failed to diff sketch contracts")?;
 
-        context.output().print_diff(&signatures, &sketches)?;
+        context.cancellation().checkpoint()?;
+        context
+            .output()
+            .print_diff(&signatures, &sketches, context.cancellation())?;
         Ok(())
     }
 }

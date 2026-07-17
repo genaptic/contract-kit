@@ -1,6 +1,4 @@
-pub(crate) mod alpha;
-pub(crate) mod beta;
-mod gamma;
+mod extra;
 
 pub struct DeclarationOrder {
     pub zeta: u8,

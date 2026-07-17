@@ -1,6 +1,7 @@
 passed: true
+source_shape_digest: f30d161c70cc55e968a5bf3452f880c333c54bb4c32fbeda7c35d718105d1469
+digest_version: 2
 counts:
-  source_signature_count: 25
-  contract_signature_count: 25
-inventory_digest: f14dcd00356b8a8f415a9a8ff2831441f381a07ed2f40ad7e2e6532181feec8b
+  source_signature_count: 14
+  contract_signature_count: 14
 diagnostics: []

@@ -1,5 +1,6 @@
 use crate::files::FileCatalogError;
-use crate::inventory::InventoryError;
+use crate::id::SketchIdError;
+use crate::limits::LimitExceeded;
 
 /// Error type returned by `conkit-sketch` public operations.
 ///
@@ -34,26 +35,112 @@ pub struct SketchContractKitError {
 
 #[derive(Clone, Debug, thiserror::Error)]
 enum SketchContractKitErrorKind {
+    #[error(
+        "unsupported contract version {found} in {location}; recreate this contract using contract_version: 2"
+    )]
+    UnsupportedContractVersion { location: String, found: String },
+    #[error("duplicate YAML mapping key {key} in {location} document {document_index}")]
+    DuplicateYamlKey {
+        location: String,
+        document_index: usize,
+        key: String,
+    },
     #[error("failed to parse catalog input {location}: {message}")]
     ParseFailed { location: String, message: String },
+    #[error("lossless YAML edit is unsupported for {location}: {message}")]
+    UnsupportedLosslessEdit { location: String, message: String },
+    #[error("lossless YAML edit changed contract semantics for {location}")]
+    YamlSemanticMismatch { location: String },
+    #[error(
+        "cannot refresh aliased code for sketch {sketch_id} in {location} document {document_index}; alias target mutation is not provably local"
+    )]
+    AliasedSketchCodeMutation {
+        location: String,
+        document_index: usize,
+        sketch_id: String,
+    },
+    #[error(
+        "cannot refresh anchored code for sketch {sketch_id} in {location} document {document_index}; anchor dependents cannot be proven absent"
+    )]
+    AnchoredSketchCodeMutation {
+        location: String,
+        document_index: usize,
+        sketch_id: String,
+    },
     #[error("failed to render catalog output {location}: {message}")]
     WriteFailed { location: String, message: String },
     #[error("failed to convert sketches: {message}")]
     ConversionFailed { message: String },
+    #[error("invalid sketch id in {location}: {source}")]
+    InvalidSketchId {
+        location: String,
+        #[source]
+        source: SketchIdError,
+    },
     #[error(transparent)]
     Catalog(#[from] FileCatalogError),
     #[error(transparent)]
-    Inventory(#[from] InventoryError),
+    Limit(#[from] LimitExceeded),
+    #[error("work queue is full")]
+    QueueFull,
+    #[error("operation was cancelled")]
+    OperationCancelled,
+    #[error("active plus pending work capacity overflowed usize")]
+    WorkCapacityOverflow,
     #[error("worker failed: {message}")]
     WorkerFailed { message: String },
 }
 
 impl SketchContractKitError {
+    /// Returns whether the operation was rejected because active plus pending
+    /// admission was full.
+    pub fn is_queue_full(&self) -> bool {
+        matches!(&self.kind, SketchContractKitErrorKind::QueueFull)
+    }
+
+    /// Returns typed resource-limit evidence when a configured budget stopped
+    /// the operation.
+    pub fn limit_exceeded(&self) -> Option<&LimitExceeded> {
+        match &self.kind {
+            SketchContractKitErrorKind::Limit(error) => Some(error),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn unsupported_contract_version(
+        location: impl ToString,
+        found: Option<u16>,
+    ) -> Self {
+        Self {
+            kind: SketchContractKitErrorKind::UnsupportedContractVersion {
+                location: location.to_string(),
+                found: found.map_or_else(
+                    || "missing contract_version".to_owned(),
+                    |value| value.to_string(),
+                ),
+            },
+        }
+    }
+
     pub(crate) fn parse_failed(location: impl ToString, message: impl Into<String>) -> Self {
         Self {
             kind: SketchContractKitErrorKind::ParseFailed {
                 location: location.to_string(),
                 message: message.into(),
+            },
+        }
+    }
+
+    pub(crate) fn duplicate_yaml_key(
+        location: impl ToString,
+        document_index: usize,
+        key: Option<String>,
+    ) -> Self {
+        Self {
+            kind: SketchContractKitErrorKind::DuplicateYamlKey {
+                location: location.to_string(),
+                document_index,
+                key: key.unwrap_or_else(|| "<non-scalar key>".to_owned()),
             },
         }
     }
@@ -67,11 +154,90 @@ impl SketchContractKitError {
         }
     }
 
+    pub(crate) fn unsupported_lossless_edit(
+        location: impl ToString,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: SketchContractKitErrorKind::UnsupportedLosslessEdit {
+                location: location.to_string(),
+                message: message.into(),
+            },
+        }
+    }
+
+    pub(crate) fn yaml_semantic_mismatch(location: impl ToString) -> Self {
+        Self {
+            kind: SketchContractKitErrorKind::YamlSemanticMismatch {
+                location: location.to_string(),
+            },
+        }
+    }
+
+    pub(crate) fn aliased_sketch_code_mutation(
+        location: impl ToString,
+        document_index: usize,
+        sketch_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: SketchContractKitErrorKind::AliasedSketchCodeMutation {
+                location: location.to_string(),
+                document_index,
+                sketch_id: sketch_id.into(),
+            },
+        }
+    }
+
+    pub(crate) fn anchored_sketch_code_mutation(
+        location: impl ToString,
+        document_index: usize,
+        sketch_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: SketchContractKitErrorKind::AnchoredSketchCodeMutation {
+                location: location.to_string(),
+                document_index,
+                sketch_id: sketch_id.into(),
+            },
+        }
+    }
+
     pub(crate) fn conversion_failed(message: impl Into<String>) -> Self {
         Self {
             kind: SketchContractKitErrorKind::ConversionFailed {
                 message: message.into(),
             },
+        }
+    }
+
+    pub(crate) fn invalid_sketch_id(location: impl ToString, source: SketchIdError) -> Self {
+        Self {
+            kind: SketchContractKitErrorKind::InvalidSketchId {
+                location: location.to_string(),
+                source,
+            },
+        }
+    }
+
+    pub(crate) fn queue_full() -> Self {
+        Self {
+            kind: SketchContractKitErrorKind::QueueFull,
+        }
+    }
+
+    pub(crate) fn operation_cancelled() -> Self {
+        Self {
+            kind: SketchContractKitErrorKind::OperationCancelled,
+        }
+    }
+
+    pub(crate) fn is_operation_cancelled(&self) -> bool {
+        matches!(&self.kind, SketchContractKitErrorKind::OperationCancelled)
+    }
+
+    pub(crate) fn work_capacity_overflow() -> Self {
+        Self {
+            kind: SketchContractKitErrorKind::WorkCapacityOverflow,
         }
     }
 
@@ -92,10 +258,10 @@ impl From<FileCatalogError> for SketchContractKitError {
     }
 }
 
-impl From<InventoryError> for SketchContractKitError {
-    fn from(error: InventoryError) -> Self {
+impl From<LimitExceeded> for SketchContractKitError {
+    fn from(error: LimitExceeded) -> Self {
         Self {
-            kind: SketchContractKitErrorKind::Inventory(error),
+            kind: SketchContractKitErrorKind::Limit(error),
         }
     }
 }

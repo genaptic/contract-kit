@@ -3,7 +3,48 @@ Generate every implemented contract family
 Usage: conkit generate all [OPTIONS] --source <DIR> --contracts <DIR>
 
 Options:
-      --source <DIR>     Root directory containing source files to inspect
-      --contracts <DIR>  Root directory where generated contract files should be written
-      --adopt-existing   Adopt matching pre-existing generated outputs into managed ownership
-  -h, --help             Print help
+      --source <DIR>
+          Root directory containing source files to inspect
+
+      --contracts <DIR>
+          Root directory where generated contract files should be written
+
+      --adopt-existing
+          Adopt matching pre-existing generated outputs into managed ownership
+
+      --crate-root <CRATE_ID=KIND:RELATIVE_PATH>
+          Explicit Rust crate root; KIND must be library or binary
+
+      --signature-extractor <SIGNATURE_EXTRACTOR>
+          Select portable syntax extraction or opt-in Cargo/rustdoc extraction (default: syntax)
+
+          Possible values:
+          - syntax:   Parse the exact allowlisted Rust sources without invoking Cargo
+          - compiler: Invoke Contract Kit's pinned, dated nightly Cargo/rustdoc toolchain
+
+      --manifest-path <FILE>
+          Cargo manifest used by compiler extraction
+
+      --package <SPEC>
+          Cargo package specification selected for compiler extraction
+
+      --lib
+          Select the package library target
+
+      --bin <NAME>
+          Select one named package binary target
+
+      --features <FEATURES>
+          Activate Cargo features; may be repeated or comma-delimited
+
+      --all-features
+          Activate every Cargo feature
+
+      --no-default-features
+          Do not activate the package's default Cargo features
+
+      --target <TRIPLE>
+          Concrete Rust target triple; Cargo aliases and custom target paths are unsupported
+
+  -h, --help
+          Print help (see a summary with '-h')

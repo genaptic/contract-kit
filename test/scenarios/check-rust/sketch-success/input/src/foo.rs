@@ -1,6 +1,5 @@
 use crate::bar::Foo;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FooStruct {
     foo: Foo,
     int_field: i32,
@@ -33,37 +32,5 @@ impl FooStruct {
             self.foo.describe(),
             self.int_field
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::FooStruct;
-    use crate::bar::Foo;
-
-    #[test]
-    fn foo_struct_exposes_fields_through_accessors() {
-        let value = FooStruct::new(Foo::new_bar(10), 2);
-
-        assert_eq!(value.foo(), &Foo::new_bar(10));
-        assert_eq!(value.int_field(), 2);
-        assert_eq!(value.total(), 12);
-    }
-
-    #[test]
-    fn foo_struct_can_increment_inner_foo() {
-        let mut value = FooStruct::new(Foo::new_bar(10), 2);
-
-        value.increment_foo();
-
-        assert_eq!(value.foo(), &Foo::new_bar(11));
-        assert_eq!(value.total(), 13);
-    }
-
-    #[test]
-    fn foo_struct_describes_its_fields() {
-        let value = FooStruct::new(Foo::new_foo(), 3);
-
-        assert_eq!(value.describe(), "FooStruct(foo=Foo, int_field=3)");
     }
 }
