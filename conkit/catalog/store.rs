@@ -625,9 +625,9 @@ mod tests {
             .child("main.yml")
             .write_str("root: ../src\n")
             .expect("combined document");
-        let store = ContractsStore::new(directory.path().to_path_buf());
-        let mut budget = store.limits.begin(&cancellation);
-        let catalog = store
+        let existing_store = ContractsStore::new(directory.path().to_path_buf());
+        let mut budget = existing_store.limits.begin(&cancellation);
+        let catalog = existing_store
             .read_optional_with_budget(&mut budget)
             .expect("existing root");
         assert_eq!(catalog.len(), 2, "all non-metadata files are retained");
@@ -640,6 +640,8 @@ mod tests {
             .read_optional_with_budget(&mut budget)
             .expect_err("file root");
         assert!(error.to_string().contains("is not a directory"));
+        drop(store);
+        drop(existing_store);
         temp.close().expect("close temporary root");
     }
 
@@ -672,10 +674,10 @@ mod tests {
             .write_str("manual\n")
             .expect("similarly named user directory");
 
-        let store = ContractsStore::new(contracts.path().to_path_buf());
+        let initial_store = ContractsStore::new(contracts.path().to_path_buf());
         let cancellation = crate::context::ApplicationCancellation::new();
-        let mut budget = store.limits.begin(&cancellation);
-        let catalog = store
+        let mut budget = initial_store.limits.begin(&cancellation);
+        let catalog = initial_store
             .read_with_budget(&mut budget)
             .expect("contracts catalog");
         assert_eq!(catalog.len(), 2);
@@ -700,6 +702,8 @@ mod tests {
             store.read_with_budget(&mut budget).is_err(),
             "unknown reserved entries must fail before walking"
         );
+        drop(store);
+        drop(initial_store);
         temp.close().expect("close temporary root");
     }
 
@@ -1231,6 +1235,9 @@ mod tests {
         assert_eq!(total_error.limit, 5);
         assert_eq!(total_error.observed_at_least, 6);
         assert_eq!(total_error.path, contracts.child("b.yml").path());
+        drop(total_store);
+        drop(file_store);
+        drop(entry_store);
         temp.close().expect("close temporary root");
     }
 
@@ -1264,6 +1271,7 @@ mod tests {
             catalog.get(&CatalogPath::new("main.yml").expect("document path")),
             Some(&b"four"[..])
         );
+        drop(store);
         temp.close().expect("close temporary root");
     }
 }

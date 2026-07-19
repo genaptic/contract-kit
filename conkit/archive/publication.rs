@@ -477,6 +477,7 @@ mod tests {
             .expect("next archive path");
 
         assert_eq!(path, temp.path().join("123-1-archive.gzip"));
+        drop(root);
         temp.close().expect("cleanup");
     }
 
@@ -496,6 +497,7 @@ mod tests {
         temp.close().expect("cleanup");
     }
 
+    #[cfg(unix)]
     #[test]
     fn archive_destination_root_retarget_does_not_redirect_publication() {
         let temp = TempDir::new().expect("temp dir");
@@ -616,6 +618,7 @@ mod tests {
         temp.close().expect("cleanup");
     }
 
+    #[cfg(unix)]
     #[test]
     fn abandoned_publication_cleanup_stays_with_the_anchored_root() {
         let temp = TempDir::new().expect("temp dir");

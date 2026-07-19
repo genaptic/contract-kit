@@ -661,6 +661,7 @@ mod tests {
             error.path.display()
         );
         contracts.child("main.yml").assert("before");
+        drop(store);
         temp.close().expect("close temporary root");
     }
 }

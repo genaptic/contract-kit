@@ -685,12 +685,17 @@ mod tests {
 
     #[test]
     fn format_validator_rejects_a_lexically_invalid_root_without_source_binding() {
+        let absolute_root = if cfg!(windows) {
+            r"C:\absolute"
+        } else {
+            "/absolute"
+        };
         let mut catalog = FileCatalog::new();
         catalog
             .insert(
                 CatalogPath::new("invalid-root.yml").expect("contract document path"),
                 LayoutDocument::with_source("sample", "lib.rs")
-                    .replace("root: ../src", "root: /absolute")
+                    .replace("root: ../src", &format!("root: {absolute_root}"))
                     .into_bytes(),
             )
             .expect("contract document");
@@ -901,6 +906,9 @@ mod tests {
             error.to_string().contains("context that differs"),
             "{error}"
         );
+        drop(layout);
+        drop(contracts);
+        drop(source);
         temp.close().expect("close temporary root");
     }
 
@@ -958,6 +966,8 @@ mod tests {
             panic!("expected existing-document target");
         };
         assert_eq!(documents.len(), 1);
+        drop(contracts);
+        drop(source);
         temp.close().expect("close temporary root");
     }
 
@@ -1021,6 +1031,9 @@ mod tests {
                 .len(),
             2,
         );
+        drop(layout);
+        drop(contracts);
+        drop(source);
         temp.close().expect("close temporary root");
     }
 
@@ -1046,6 +1059,9 @@ mod tests {
             .expect_err("documents are required");
 
         assert!(error.to_string().contains("no root-level"));
+        drop(layout);
+        drop(contracts);
+        drop(source);
         temp.close().expect("close temporary root");
     }
 
@@ -1094,6 +1110,8 @@ mod tests {
         assert_eq!(document.crates[0].id, "library");
         assert_eq!(document.crates[0].root.as_str(), "lib.rs");
         assert_eq!(document.crates[0].kind, RustCrateKind::Library);
+        drop(contracts);
+        drop(source);
         temp.close().expect("close temporary root");
     }
 }

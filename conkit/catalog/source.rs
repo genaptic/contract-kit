@@ -256,6 +256,7 @@ mod tests {
                 .get(&CatalogPath::new("listed.rs").expect("logical path"))
                 .is_some()
         );
+        drop(tree);
         temp.close().expect("close temporary root");
     }
 
@@ -278,6 +279,7 @@ mod tests {
                 .to_string()
                 .contains("listed source file is unavailable")
         );
+        drop(tree);
         temp.close().expect("close temporary root");
     }
 
@@ -299,6 +301,7 @@ mod tests {
             .expect_err("a selected directory is not a source file");
 
         assert!(error.to_string().contains("is not a regular file"));
+        drop(tree);
         temp.close().expect("close temporary root");
     }
 
@@ -437,6 +440,7 @@ mod tests {
         temp.close().expect("close temporary root");
     }
 
+    #[cfg(unix)]
     #[test]
     fn source_root_capability_survives_directory_rename_and_replacement() {
         let temp = assert_fs::TempDir::new().expect("temporary root");
@@ -515,6 +519,7 @@ mod tests {
             .expect("selected Unicode source");
 
         assert_eq!(catalog.get(&logical), Some(&b"pub fn snow() {}\n"[..]));
+        drop(tree);
         temp.close().expect("close temporary root");
     }
 
@@ -535,6 +540,7 @@ mod tests {
         let result = tree.read_selected_with_budget(&selected, &mut budget);
 
         assert!(result.is_err(), "a later failure must return no catalog");
+        drop(tree);
         temp.close().expect("close temporary root");
     }
 
@@ -562,6 +568,8 @@ mod tests {
         opened.read_to_end(&mut bytes).expect("read opened source");
 
         assert_eq!(bytes, b"pub fn original() {}\n");
+        drop(opened);
+        drop(tree);
         temp.close().expect("close temporary root");
     }
 
@@ -602,6 +610,8 @@ mod tests {
         assert_eq!(bytes, b"fourm");
         assert_eq!(error.resource, CatalogReadLimitResource::FileBytes);
         assert_eq!(error.observed_at_least, 5);
+        drop(opened);
+        drop(tree);
         temp.close().expect("close temporary root");
     }
 
@@ -624,6 +634,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(paths, ["a.RS", "z.rs"]);
+        drop(tree);
         temp.close().expect("close temporary root");
     }
 
@@ -662,6 +673,7 @@ mod tests {
         assert_eq!(error.limit, 4);
         assert_eq!(error.observed_at_least, 5);
         assert_eq!(error.path, temp.child("listed.rs").path());
+        drop(tree);
         temp.close().expect("close temporary root");
     }
 
@@ -700,6 +712,8 @@ mod tests {
         assert_eq!(total_error.limit, 5);
         assert_eq!(total_error.observed_at_least, 6);
         assert_eq!(total_error.path, temp.child("b.rs").path());
+        drop(total_tree);
+        drop(entry_tree);
         temp.close().expect("close temporary root");
     }
 
@@ -736,6 +750,7 @@ mod tests {
         assert_eq!(error.limit, 2);
         assert_eq!(error.observed_at_least, 3);
         assert_eq!(error.path, temp.path());
+        drop(tree);
         temp.close().expect("close temporary root");
     }
 

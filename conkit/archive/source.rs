@@ -349,6 +349,7 @@ mod tests {
             )),
             "unexpected aggregate catalog limit: {error}",
         );
+        drop(parent);
         temp.close().expect("cleanup");
     }
 
@@ -453,6 +454,7 @@ mod tests {
             .expect_err("cancellation must precede metadata size rejection");
 
         assert!(matches!(error, CliError::OperationCanceled));
+        drop(parent);
         temp.close().expect("cleanup");
     }
 
@@ -481,6 +483,7 @@ mod tests {
             .expect_err("growth beyond the compressed limit must fail");
 
         assert!(error.to_string().contains("compressed archive exceeds"));
+        drop(parent);
         temp.close().expect("cleanup");
     }
 
@@ -506,6 +509,7 @@ mod tests {
             .expect("the exact compressed limit must be accepted");
 
         assert_eq!(bytes.len(), super::super::MAX_COMPRESSED_ARCHIVE_BYTES);
+        drop(parent);
         temp.close().expect("cleanup");
     }
 
@@ -534,9 +538,12 @@ mod tests {
             .expect("read original open file");
 
         assert_eq!(bytes, original);
+        drop(replacement);
+        drop(parent);
         temp.close().expect("cleanup");
     }
 
+    #[cfg(unix)]
     #[test]
     fn archive_parent_retarget_does_not_redirect_open_or_read() {
         let temp = TempDir::new().expect("temp dir");
