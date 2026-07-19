@@ -263,7 +263,7 @@ mod tests {
     pub(super) use std::ffi::{OsStr, OsString};
     pub(super) use std::io::{Cursor, ErrorKind, Write as _};
     pub(super) use std::path::{Path, PathBuf};
-    pub(super) use std::process::{Command, Stdio};
+    pub(super) use std::process::Command;
     pub(super) use std::sync::Arc;
     pub(super) use std::sync::atomic::{AtomicBool, Ordering};
     pub(super) use std::time::{Duration, Instant};
@@ -290,7 +290,6 @@ mod tests {
         BoundedPipe, BoundedPipes, CargoEnvironment, CargoOutput, CargoProcess, CargoProgram,
         CompilerOperation, CompilerSemanticResource, CompilerStream,
         PROCESS_CLEANUP_EVIDENCE_BYTES, ProcessCleanupEvidence, ProcessReaderStartupFailure,
-        ReapTarget,
     };
     pub(super) use super::project::CargoProject;
     pub(super) use super::source::{CompilerSourceTranslator, SourceEndpointResolver};

@@ -792,7 +792,12 @@ impl CatalogLeaf {
     /// Synchronizes the parent directory where the platform supports it.
     pub(super) fn sync_parent(&self) -> Result<(), CliError> {
         #[cfg(unix)]
-        self.parent.try_clone()?.into_std_file().sync_all()?;
+        {
+            // `cap-std` uses `O_PATH` for directory capabilities on Linux,
+            // and cloning preserves that unsyncable descriptor. Reopen the
+            // directory relative to the retained capability before syncing.
+            self.parent.open(".")?.sync_all()?;
+        }
         Ok(())
     }
 

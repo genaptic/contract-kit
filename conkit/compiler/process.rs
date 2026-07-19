@@ -734,7 +734,6 @@ impl fmt::Display for CompilerStream {
 #[cfg(test)]
 mod tests {
     use crate::compiler::tests::*;
-    use command_group::CommandGroup as _;
 
     #[test]
     #[ignore = "spawned explicitly by CargoProcess unit tests"]
@@ -1033,6 +1032,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn exhausted_group_kill_uses_leader_fallback() {
+        use std::process::Stdio;
+
+        use command_group::CommandGroup as _;
+
+        use super::ReapTarget;
+
         let root = assert_fs::TempDir::new().expect("leader fallback root");
         let cargo = ProcessBehavior::Success.program(root.path());
         let mut command = Command::new(&cargo.executable);
