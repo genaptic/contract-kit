@@ -16,10 +16,21 @@ Apply this skill whenever touching the Rust shell CLI. Treat the CLI as a stable
 - Treat `conkit/args.rs` as grammar authority, `conkit/app.rs` as root runtime
   orchestration, `conkit/command.rs` as exhaustive async dispatch, the
   `conkit/command/` children as verb-owned CLI-to-domain workflows, and
-  `conkit/context.rs` as shared runtime state with a direct signature kit and
-  substantive sketch adapter.
+  `conkit/context.rs` as shared runtime state with a direct signature kit,
+  substantive sketch adapter, CLI-owned `CompilerExtractor`, filesystem
+  limits, process cancellation, and output.
+- `CommandContext` constructs one application-owned Rayon pool shared by both
+  domains. Signature and sketch work keep independent active/pending admission;
+  the CLI configures one active operation and zero pending operations per
+  domain, so worker count must never be treated as queue capacity. Do not build
+  command-local pools or queues.
 - Keep OS paths and persistence in `conkit`. Domain requests use `FileCatalog`,
   `CatalogPath`, bytes, and typed options instead of `PathBuf` roots.
+- Apply `CatalogReadLimits` through one mutable `CatalogReadBudget` spanning an
+  operation's participating filesystem reads. Keep Cargo/rustdoc process work
+  in the CLI-owned `CompilerExtractor`, reconcile requested and persisted
+  modes through `SignatureExtractionCoordinator`, and pass only typed
+  `RustExtractionInput` into `conkit-signature`.
 - Reuse the current modules, crates, and locked dependencies before proposing
   a new package or dependency.
 - Treat every `app`, `app-cli`, or CRUD example in bundled references as a
@@ -40,7 +51,9 @@ Apply this skill whenever touching the Rust shell CLI. Treat the CLI as a stable
 2. Put business logic in library crates. Domain crates must not depend on `clap`, terminal colors, stdout/stderr, shell completions, or process exits.
 3. Use `clap` only to parse, validate, render help, and produce typed `Cli`/`Command` values. Do not make `clap` the runtime app.
 4. Construct `CommandContext` after parsing. It owns the reusable signature and
-   sketch handles plus CLI output policy.
+   sketch handles, one shared Rayon pool, independent domain admission policy,
+   `CompilerExtractor`, `CatalogReadLimits`, process cancellation, and CLI
+   output policy.
 5. Route command execution through
    `pub(crate) trait AppCommand { async fn execute(&self, ctx: &CommandContext) -> anyhow::Result<()>; }`.
 6. Implement `AppCommand` for the root `Command` enum with explicit exhaustive match arms that call receiver methods on every `{Verb}Command`.
@@ -48,7 +61,8 @@ Apply this skill whenever touching the Rust shell CLI. Treat the CLI as a stable
    `generate`, `archive`, and `diff`.
 8. Use `clap` v4 derive (`Parser`, `Args`, `Subcommand`, `ValueEnum`) for grammar. Prefer nested enums for verb-subject structure.
 9. Accept filesystem paths as `PathBuf` only at OS-facing CLI boundaries. Read
-   them into validated catalogs before constructing domain requests.
+   them into validated catalogs through the operation's `CatalogReadBudget`
+   before constructing domain requests.
 10. Use typed domain request/response structs carrying catalogs, logical catalog
     paths, bytes, and domain options. Convert inside the relevant async
     `AppCommand::execute` implementation.
@@ -57,6 +71,9 @@ Apply this skill whenever touching the Rust shell CLI. Treat the CLI as a stable
 13. Add or update tests with every behavior change. Use domain tests, CLI
     integration tests, and manifest-aware E2E scenarios at their appropriate
     boundaries.
+14. Race command execution against the process cancellation source. Preserve
+    cooperative cancellation in already-started domain work and checkpoint
+    synchronous catalog/compiler boundaries before publishing output.
 
 ## Repository layout and dependencies
 
@@ -78,8 +95,10 @@ required authorization before expanding the dependency surface.
 Preserve the current grammar:
 
 ```text
-conkit check <all|signatures|sketches> --source DIR --contracts DIR --output FILE [--default|--strict|--warning]
-conkit generate <all|signatures|sketches> --source DIR --contracts DIR [--adopt-existing]
+conkit check <all|signatures> --source DIR --contracts DIR --output FILE [--default|--strict|--warning] [SIGNATURE EXTRACTION]
+conkit check sketches --source DIR --contracts DIR --output FILE [--default|--strict|--warning]
+conkit generate <all|signatures> --source DIR --contracts DIR [--crate-root CRATE_ID=KIND:RELATIVE_PATH]... [SIGNATURE EXTRACTION] [--adopt-existing]
+conkit generate sketches --source DIR --contracts DIR [--adopt-existing]
 conkit archive --contracts DIR --archive DIR [--gzip]
 conkit diff --contracts DIR --archive FILE
 ```
@@ -87,6 +106,20 @@ conkit diff --contracts DIR --archive FILE
 `signature` and `sketch` remain singular aliases. An omitted check mode is
 equivalent to `--default`. Reports infer YAML or JSON from the output extension.
 `--gzip` is optional and currently selects the only archive format.
+
+`SIGNATURE EXTRACTION` defaults to `--signature-extractor syntax`. The opt-in
+compiler form is:
+
+```text
+--signature-extractor compiler --manifest-path FILE
+  [--package SPEC] [--lib|--bin NAME]
+  [--features FEATURES|--all-features] [--no-default-features]
+  [--target TRIPLE]
+```
+
+`--features` may be repeated or comma-delimited. Generation accepts repeatable
+`--crate-root CRATE_ID=KIND:RELATIVE_PATH` only for `all` and `signatures`.
+Cargo options and compiler selection remain limited to signature-aware targets.
 
 Good CLI grammar:
 
@@ -123,18 +156,53 @@ pub(crate) trait AppCommand {
 ```
 
 Good generation execution adapts OS paths into a catalog request, computes a
-complete document catalog outside the persistent lock, and ties that result to
-the exact input baseline before reconciliation:
+complete document catalog outside the persistent lock, charges one bounded
+filesystem ledger, reconciles requested and persisted extraction in the CLI,
+and ties the result to the exact input baseline before reconciliation. This
+representative signature branch elides warning/summary/adoption rendering and
+output-policy selection:
 
 ```rust
-let source = SourceTree::open(self.source.clone())?;
-let contracts = ContractsStore::new(self.contracts.clone());
+let source = SourceTree::open(self.source.clone())?
+    .with_limits(ctx.catalog_read_limits());
+let contracts = ContractsStore::new(self.contracts.clone())
+    .with_limits(ctx.catalog_read_limits());
+let mut catalog_reads = ctx
+    .catalog_read_limits()
+    .begin(ctx.cancellation());
 
-contracts.recover_interrupted_generation()?;
-let baseline = contracts.read_optional()?;
-let layout = ContractLayout::load(&contracts, &source, &baseline)?;
-let (source_files, target) =
-    layout.into_signature_generation(&contracts, &source)?;
+contracts.recover_interrupted_generation_with_budget(&mut catalog_reads)?;
+let baseline = contracts.read_optional_with_budget(&mut catalog_reads)?;
+let layout = ContractLayout::load(
+    &contracts,
+    &source,
+    &baseline,
+    ctx.cancellation(),
+)?;
+let fresh = layout.is_empty();
+let persisted = layout.extraction(ctx.cancellation())?;
+let coordinator = SignatureExtractionCoordinator::new(requested, &contracts);
+coordinator.validate_generation_roots(fresh, &crate_roots)?;
+let source_files = layout.read_signature_sources(&source, &mut catalog_reads)?;
+let decision = coordinator.reconcile(ExtractionUse::Generation {
+    fresh,
+    persisted,
+    explicit_crates: &crate_roots,
+})?;
+let (extraction, generation_crates) = decision.acquire(
+    ctx,
+    &source,
+    &source_files,
+    &contracts,
+    &mut catalog_reads,
+)?;
+let (source_files, target) = layout.into_signature_generation(
+    &contracts,
+    &source,
+    source_files,
+    generation_crates,
+    ctx.cancellation(),
+)?;
 let conkit_signature::GenerateResponse {
     contract_files: documents,
     ..
@@ -144,10 +212,16 @@ let conkit_signature::GenerateResponse {
         source_files,
         target,
         scope: conkit_signature::ContractScope::Signatures,
+        extraction,
     })
     .await?;
 let generated = GeneratedContracts::new(baseline, documents);
-contracts.write_generated(generated, ExistingOutputPolicy::Reject)?;
+ctx.cancellation().checkpoint()?;
+contracts.write_generated_with_budget(
+    generated,
+    ExistingOutputPolicy::Reject,
+    catalog_reads,
+)?;
 ```
 
 Bad coupling:
@@ -167,6 +241,11 @@ conkit_signature::generate_from_clap_matches(matches)?;
 - Use `tempfile` or `assert_fs` in tests; never hard-code `/tmp` or Windows-only paths.
 - Reuse `ResolvedPath`, `SourceTree`, `ContractsStore`, archive/report adapters,
   and ownership reconciliation instead of creating parallel filesystem helpers.
+- Apply `CommandContext::catalog_read_limits` to source and contracts adapters,
+  then carry one `CatalogReadBudget` through bounded recovery, reads, compiler
+  source validation, archive decoding, and persistence preflight as applicable.
+  Never replace these paths with `read_to_end`, `std::fs::read`, or a fresh
+  ledger for each phase.
 - Preserve explicit overlap, symlink, collision, ownership, and rollback rules.
 
 ## Error, output, and logging rules
@@ -197,6 +276,10 @@ Test at least:
 - YAML/JSON report behavior if supported.
 - Filesystem paths with spaces and non-ASCII characters.
 - Existing destination behavior.
+- Catalog entry, per-file, and total-byte limit failures, plus cancellation
+  before output publication, when filesystem behavior changes.
+- Shared-context behavior: no command-local Rayon pool, compiler adapter,
+  cancellation source, or pending queue.
 - No accidental output on stderr for successful machine-readable commands.
 - No progress/logging on stdout.
 - Checked-in positive and negative scenarios for stable external behavior.
@@ -217,6 +300,10 @@ A change is not done until:
 - The CLI crate is still only an adapter.
 - Domain logic lives in the right library crate.
 - OS paths remain in CLI adapters; domain inputs remain catalog/byte based.
+- Compiler processes and requested-versus-persisted extraction reconciliation
+  remain CLI-owned; domain signature requests receive typed extraction input.
+- Filesystem reads share a bounded, cancellation-aware operation ledger, and
+  commands reuse the application-owned pool with zero CLI pending capacity.
 - Errors have context without leaking implementation details.
 - Output is predictable for humans and scripts.
 - Tests cover the new behavior and relevant failure modes.

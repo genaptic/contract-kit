@@ -1,8 +1,10 @@
 //! User-facing terminal output.
 //!
-//! Command handlers call this module after domain work succeeds. Keeping
-//! output here prevents domain crates from depending on stdout, formatting
-//! choices, or process-level reporting behavior.
+//! Compiler and syntax-capability warnings are written to standard error.
+//! Successful check, generation, archive, and diff summaries are written to
+//! standard output only after their owning workflow succeeds. Keeping this
+//! policy here prevents domain crates from depending on terminals or process-
+//! level presentation.
 
 use std::io::{self, Write};
 use std::path::Path;

@@ -1,4 +1,14 @@
 //! Cargo/rustdoc-backed signature extraction owned by the CLI process adapter.
+//!
+//! The extractor selects one package library or binary through locked Cargo,
+//! invokes the pinned dated nightly, captures rustdoc-specific arguments with
+//! a private one-shot probe, and runs every child in an isolated target tree.
+//! Output, artifact traversal, semantic resources, elapsed time, cancellation,
+//! and cleanup are bounded. Before returning one versioned in-memory artifact,
+//! the extractor revalidates the exact source snapshot through the caller's
+//! cumulative catalog-read ledger and translates only allowlisted local-crate
+//! spans. Cargo/rustdoc process policy stays here; signature semantics stay in
+//! `conkit-signature`.
 
 mod error;
 mod extractor;
@@ -43,9 +53,12 @@ pub(crate) struct CompilerExtractor {
     cancellation: CompilerCancellation,
 }
 
+/// Expected logical crate identity for one selected Cargo target.
 #[derive(Clone, Copy)]
 pub(crate) enum CompilerCrateSelection<'root> {
+    /// Derive the logical crate identity from the selected Cargo target.
     Inferred,
+    /// Require the selected Cargo target to match this explicit or persisted root.
     Expected(&'root RustCrateRoot),
 }
 
@@ -61,6 +74,11 @@ impl CompilerExtractor {
 
     /// Rejects a persisted or explicitly requested compiler-root set before
     /// any warning, manifest access, workspace creation, or Cargo process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an explicit or persisted selection contains any
+    /// number of crate roots other than exactly one.
     pub(crate) fn validate_expected_crates<'root>(
         &self,
         expected_crates: Option<&'root [RustCrateRoot]>,
@@ -81,6 +99,13 @@ impl CompilerExtractor {
     /// `block_on` boundary, and commands invoke this method before borrowing a
     /// domain work permit or crossing an `.await`, so no async worker or lock is
     /// blocked by the Cargo child process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on cancellation; invalid manifest, package, target, or
+    /// persisted-root selection; Cargo/rustdoc launch, output, timeout, cleanup,
+    /// or resource-limit failure; malformed or incompatible rustdoc output; a
+    /// target mismatch; source-provenance failure; or a changed source snapshot.
     pub(crate) fn extract(
         &self,
         request: &CompilerRequest<'_>,

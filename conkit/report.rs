@@ -2,8 +2,10 @@
 //!
 //! Check commands can request generated reports from domain crates. This module
 //! maps the user-selected output path to a report format and logical catalog
-//! path, renders CLI-owned all-family reports, then writes report bytes
-//! atomically.
+//! path, renders CLI-owned all-family reports, and replaces each report
+//! individually and atomically. Rendering and copying use a cancellation-aware
+//! hard byte ceiling whose first boundary failure remains authoritative through
+//! later writes and flushes before commit.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -176,6 +178,11 @@ impl ReportDestination {
     }
 
     /// Converts the local output file name into a logical report catalog path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the output has no portable UTF-8 file name or the
+    /// derived `reports/<file-name>` value is not a valid signature catalog path.
     fn signature_catalog_path(&self) -> Result<SignatureCatalogPath, CliError> {
         SignatureCatalogPath::new(self.catalog_path_value()?).map_err(CliError::from)
     }

@@ -397,7 +397,14 @@ fn archive_rejects_legacy_and_future_contracts_with_recreation_guidance() {
 #[test]
 fn archive_rejects_a_lexically_invalid_root_before_publication() {
     let fixture = ArchiveFixture::new();
-    fixture.replace_contract(&COMBINED_CONTRACT.replace("root: ../src", "root: /absolute"));
+    let absolute_root = if cfg!(windows) {
+        r"C:\absolute"
+    } else {
+        "/absolute"
+    };
+    fixture.replace_contract(
+        &COMBINED_CONTRACT.replace("root: ../src", &format!("root: {absolute_root}")),
+    );
 
     ConkitCli::command()
         .args(["archive", "--contracts"])

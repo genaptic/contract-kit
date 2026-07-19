@@ -385,6 +385,11 @@ impl<'de> Deserialize<'de> for OwnedFile {
 
 impl ContentDigest {
     /// Computes a lowercase hexadecimal SHA-256 digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when process cancellation is observed between digest
+    /// chunks or before finalization.
     pub(super) fn of(
         bytes: &[u8],
         cancellation: &ApplicationCancellation,

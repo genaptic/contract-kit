@@ -54,12 +54,13 @@ charges alias replay from the existing all-content typed parse.
 
 ## Rust extraction boundary
 
-Every signature-bearing v2 document records `mode: rust_syntax_v2`,
-`profile: rust_api_v1`, and one or more explicit crate roots whose `library` or
-`binary` kind is fixed before the document reaches the signature domain. For a
-fresh catalog, the CLI may prove exactly one conventional root-level `lib.rs`
-or `main.rs` and construct its library or binary root; zero, multiple,
-nonconventional, and disconnected layouts require explicit typed CLI roots.
+Every signature-bearing v2 document records exactly one extraction mode,
+`rust_syntax_v2` or `rust_compiler_v1`, plus `profile: rust_api_v1` and one or
+more explicit crate roots whose `library` or `binary` kind is fixed before the
+document reaches the signature domain. For a fresh catalog, the CLI may prove
+exactly one conventional root-level `lib.rs` or `main.rs` and construct its
+library or binary root; zero, multiple, nonconventional, and disconnected
+layouts require explicit typed CLI roots.
 The signature domain builds logical module identity from those roots, inline
 modules, allowlisted out-of-line `mod` declarations, and allowlisted `#[path]`
 targets rather than guessing it from arbitrary source paths. A document's
@@ -99,10 +100,12 @@ before domain work begins.
 Both domain kits expose executor-neutral async operations over owned in-memory
 catalogs. `conkit` constructs one application-owned Rayon pool and injects the
 same `Arc<ThreadPool>` into both kits. Worker threads, active root operations,
-and pending root operations are independent budgets: the CLI normally admits
-one active root operation per nominal domain configuration with a bounded
-pending queue, while the active workflow may use all shared workers internally.
-Queue saturation fails immediately. Dropping queued work releases admission;
+and pending root operations are independent budgets in both domain libraries.
+The CLI configures one active root operation per nominal domain and
+`max_pending_operations = 0`, so it has no admitted domain queue and saturation
+fails immediately; an active workflow may still use all shared workers
+internally. Embedders may configure a bounded pending queue through each
+domain's nominal work options. Dropping queued work releases admission;
 dropping running work requests cooperative cancellation at file, module,
 source-group, diagnostic, and render boundaries rather than attempting unsafe
 thread termination. The CLI installs one process-level Ctrl-C/termination

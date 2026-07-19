@@ -7,7 +7,7 @@ Use this reference when refactoring repeated logic, designing APIs, choosing abs
 - [Keep code concrete until pressure is real](#1-keep-code-concrete-until-pressure-is-real)
 - [Prefer structs with methods](#2-prefer-structs-with-methods-over-parallel-free-functions)
 - [Choose the right abstraction](#3-choose-the-right-abstraction-mechanism)
-- [Use enum dispatch for closed families](#4-use-the-enum-dispatcher-pattern-for-closed-configurable-families)
+- [Use enum dispatch for proven closed families](#4-use-enum-dispatch-only-for-proven-closed-configurable-families)
 - [Use lifetimes when borrow relationships matter](#5-use-lifetimes-only-when-the-borrow-relationship-matters)
 - [Prefer typed library errors](#6-prefer-typed-errors-in-libraries)
 - [Reserve panics for bugs and impossible invariants](#7-panic-only-for-bugs-or-impossible-invariants)
@@ -226,40 +226,45 @@ pub enum OutputFormat {
 }
 ```
 
-## 4. Use the enum-dispatcher pattern for closed configurable families
+## 4. Use enum dispatch only for proven closed configurable families
 
-This pattern is a strong default when you have:
+Do not start with enum dispatch. Use it when all of these conditions are true:
 
 - a trait representing behavior
-- a closed set of implementation-family members
+- at least two real concrete implementations
+- a deliberately closed set of implementation-family members
 - a config enum that chooses the implementation
-- a builder that validates config and returns an opaque public handle over a
-  private inner enum
+- a stable usage boundary that benefits from exhaustive routing
+
+An exported family may use a builder that validates config and returns an
+opaque public handle over a private inner enum. A crate-private family can use
+a private enum directly. A single concrete behavior owner should stay concrete
+until a second implementation proves that the routing layer is needed.
 
 Read `enum-dispatch-trait-pattern.md` before changing this pattern.
 
-In `conkit`, this is not optional for behavior dispatch. Any behavior-dispatch
-family for contract parsing, signature matching, sketch running, output
-emission, or similar closed implementation behavior must have a unique
-implementation-agnostic `pub(crate)` trait contract. Exported dispatchers use
-an opaque public handle over a private inner enum; private internal dispatch
-enums can remain plain private enums. Those private enums and build/config
-selection enums are routing mechanisms only; they must not become reusable
-implementation-family identity, provenance, capability, diagnostic-label, or
-error-label utilities. The trait is hand-written, implemented by every
-concrete family member, and entered through the dispatching handle or enum.
-Dispatcher arms must call receiver methods on those trait-implementing
-payloads, such as `runner.run(req).await`; `SketchRunner::run(runner, req).await`
-is an invalid dispatch-contract shape. Do not replace the contract with
-inherent-method parity by convention, trait objects, public facade traits,
-compatibility shims, `macro_rules!`, proc macros, generated dispatch, or
+In Contract Kit, the private `RustExtractionBackend` trait and `RustBackend`
+enum form the current closed family because syntax and compiler extraction are
+two real implementations of the same operations. Each concrete backend owns
+its impl, and `RustBackend` delegates with explicit exhaustive matches and
+receiver methods. By contrast, `SketchContractKit` has one concrete operation
+owner, so its public receiver methods stay direct: do not add a backend trait,
+inner enum, or forwarding facade without a second real implementation.
+
+For a justified family, private dispatch and build/config-selection enums are
+routing mechanisms only. They must not become reusable family identity,
+provenance, capability, diagnostic-label, or error-label utilities. Keep the
+trait hand-written and implemented by every member. Dispatcher arms call
+receiver methods on trait-implementing payloads; payload UFCS such as
+`RustExtractionBackend::generate(backend, context)` is invalid here. Do not
+replace the contract with inherent-method parity by convention, trait objects,
+public facade traits, compatibility shims, macros, generated dispatch, or
 generated tables. Shared contract modules may define only
-implementation-agnostic traits, shared handles, and default helpers; concrete impl blocks must
-live in the owning implementation subtree.
-Public root handle methods may use `<Self as Trait>::method(self, ...)` only
-to enter the handle's own private trait impl and avoid same-name
-inherent-method recursion; dispatcher arms over concrete payloads must still
-use receiver methods.
+implementation-agnostic traits, shared handles, and default helpers; concrete
+impl blocks live in the owning implementation subtree. An exported root handle
+may use `<Self as Trait>::method(self, ...)` only to enter its own private trait
+impl and avoid same-name inherent-method recursion; payload dispatch remains
+receiver-style.
 
 Private inner enum variants should wrap concrete implementation structs, and
 dispatcher methods should delegate through explicit exhaustive `match` arms.
@@ -516,18 +521,18 @@ impl MoneyPolicy {
 
 Make the refactor when repeated logic or repeated invariants are real, not before.
 
-### Keep enum dispatch explicit in `conkit`
+### Keep justified enum dispatch explicit in Contract Kit
 
-For this workspace, do not replace repeated contract, signature, sketch,
-wire, schema, or test routing code with `macro_rules!`, proc-macro
-indirection, generated dispatch, generated tables, or codegen-style hidden
-abstraction. The enum-dispatch plus builder architecture remains explicit so
-reviewers can see each supported implementation family at the operation
-boundary.
-Trait definitions stay in shared implementation-agnostic contract modules, while
-concrete impl blocks stay in the owning implementation subtree.
-Use `enum-dispatch-trait-pattern.md` for the full checklist, sync example, and
-native async trait example.
+For a proven closed family, do not replace its hand-written trait and enum
+dispatch with `macro_rules!`, proc-macro indirection, generated tables, or
+codegen-style hidden abstraction. Contract Kit's current example is the
+private syntax/compiler `RustExtractionBackend` family. Keep that dispatcher
+explicit so reviewers can see each supported extraction path at the operation
+boundary. Keep `SketchContractKit` direct because it does not have a second
+concrete implementation. Trait definitions stay in implementation-agnostic
+contract modules, while concrete impl blocks stay in the owning implementation
+subtree. Use `enum-dispatch-trait-pattern.md` for the full decision checklist,
+sync example, and native async trait example.
 
 When forwarding boilerplate grows, first improve the model underneath:
 

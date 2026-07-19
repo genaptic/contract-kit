@@ -9,7 +9,12 @@ use crate::limits::LimitExceeded;
 /// Error type returned by `conkit-signature` public operations.
 ///
 /// This wrapper preserves typed lower-level errors internally while presenting
-/// one public error type for builders and async operations.
+/// one public error type for builders and async operations. Use
+/// [`Self::limit_exceeded`] for resource-limit evidence,
+/// [`Self::compiler_artifact_failure`] for compiler-artifact validation or
+/// conversion evidence, and [`Self::is_queue_full`] for immediate admission
+/// saturation. Display text remains contextual but is not the typed inspection
+/// contract.
 ///
 /// # Examples
 ///
@@ -143,6 +148,10 @@ impl std::fmt::Display for RestrictedVisibilityTarget {
 impl SignatureContractKitError {
     /// Returns the typed resource-limit evidence when this operation failed a
     /// configured budget.
+    ///
+    /// The evidence records the configured maximum, a proven lower bound at
+    /// the first detected crossing, and a logical file when that accounting
+    /// boundary has precise file context.
     pub fn limit_exceeded(&self) -> Option<&LimitExceeded> {
         match self.kind.as_ref() {
             SignatureContractKitErrorKind::Limit(error) => Some(error),
@@ -171,6 +180,9 @@ impl SignatureContractKitError {
     }
 
     /// Returns typed compiler-artifact evidence when compiler extraction failed.
+    ///
+    /// Mode/document mismatches and ordinary contract parse failures are not
+    /// artifact failures and therefore return `None` here.
     pub fn compiler_artifact_failure(&self) -> Option<&RustCompilerArtifactFailure> {
         match self.kind.as_ref() {
             SignatureContractKitErrorKind::CompilerArtifact(error) => Some(error),
@@ -200,6 +212,9 @@ impl SignatureContractKitError {
 
     /// Returns whether this operation was rejected because every active and
     /// pending work slot was occupied.
+    ///
+    /// This is distinct from a worker-completion failure or cooperative
+    /// cancellation after admission.
     pub fn is_queue_full(&self) -> bool {
         matches!(self.kind.as_ref(), SignatureContractKitErrorKind::QueueFull)
     }

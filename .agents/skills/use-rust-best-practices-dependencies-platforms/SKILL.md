@@ -33,12 +33,19 @@ portability.
    unsafe/FFI footprint, and platform support.
 5. Isolate platform-specific behavior behind `cfg(...)` modules and portable
    path or process abstractions.
+6. In Contract Kit, preserve the Rust 1.97 MSRV and pinned 1.97.0 toolchain,
+   edition 2024, workspace-inherited package/dependency/lint policy, and the
+   checked-in `deny.toml` hardening policy. Keep `fuzz` excluded from the
+   three-member production workspace and independently locked.
 
 ## Output Rules
 
 - Treat project-maintained docs and repo-local policy as authoritative.
 - For `conkit` production code, do not add compiler-private crate dependencies
   whose names contain the `rust[c]` prefix.
+- Keep `rustdoc-types` as an allowed compiler-output DTO dependency owned only
+  by `conkit-signature`; do not treat it as permission for compiler-private
+  dependencies or spread it to other production crates.
 - Prefer `Path`/`PathBuf` and `std::process::Command` over stringly-typed OS
   assumptions.
 

@@ -38,6 +38,9 @@ impl SketchLocation {
 }
 
 /// One-based inclusive source-line range for a matching occurrence or candidate.
+///
+/// Exactly-one occurrence evidence is recorded in source-start order. Ranges
+/// may overlap because every contiguous start position is counted.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SourceLineSpan {
     /// One-based first source line in the range.
@@ -53,13 +56,19 @@ impl SourceLineSpan {
 }
 
 /// Safely rendered line evidence for a failed sketch match.
+///
+/// Retained raw bytes are rendered with [`std::ascii::escape_default`], so
+/// quotes, backslashes, controls, and invalid UTF-8 are safe in text and
+/// serialized reports. Truncation is decided on the retained raw-byte prefix
+/// before escaping; escape expansion is still charged to the aggregate
+/// diagnostic-byte budget.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DiagnosticExcerpt {
     /// Escaped source or expected bytes that are safe for text reports.
     Bytes {
-        /// Escaped representation of the retained byte prefix.
+        /// ASCII-escaped representation of the retained raw-byte prefix.
         escaped: String,
-        /// Whether the complete escaped line exceeded the evidence budget.
+        /// Whether the complete raw line exceeded the excerpt-retention budget.
         truncated: bool,
     },
     /// No aligned line exists. The current matcher emits this for the actual
@@ -74,6 +83,13 @@ impl DiagnosticExcerpt {
 }
 
 /// Bounded evidence for the closest aligned source window after a mismatch.
+///
+/// Candidate scanning happens only after exact matching finds no occurrence.
+/// Every possible source start is scored by the number of expected lines equal
+/// to their aligned source lines. The highest score wins; an equal score keeps
+/// the earliest source start. Evidence identifies the first differing expected
+/// line. When the expected snippet extends past the selected source window,
+/// [`Self::actual`] is [`DiagnosticExcerpt::Missing`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MatchCandidate {
     /// One-based inclusive source range covered by the aligned candidate.
@@ -121,6 +137,45 @@ impl MatchCandidate {
 /// ordered deterministically by their complete [`SketchLocation`] and then by
 /// diagnostic kind. Evidence does not affect ordering. File values are logical
 /// catalog paths, not operating-system paths or language-specific parser data.
+///
+/// # Examples
+///
+/// Inspect exact occurrence totals separately from bounded span evidence.
+///
+/// ```
+/// use conkit_sketch::{
+///     CatalogPath, SketchDiagnostic, SketchLocation, SketchOccurrence,
+///     SourceLineSpan,
+/// };
+///
+/// let diagnostic = SketchDiagnostic::OccurrenceMismatch {
+///     sketch: SketchLocation {
+///         sketch_id: "pair".to_owned(),
+///         contract_file: CatalogPath::new("main.yml")?,
+///         document_index: 0,
+///         source_file: CatalogPath::new("lib.rs")?,
+///     },
+///     expected: SketchOccurrence::ExactlyOne,
+///     actual: 3,
+///     spans: vec![SourceLineSpan { start: 1, end: 2 }],
+///     spans_truncated: true,
+/// };
+///
+/// match diagnostic {
+///     SketchDiagnostic::OccurrenceMismatch {
+///         actual,
+///         spans,
+///         spans_truncated,
+///         ..
+///     } => {
+///         assert_eq!(actual, 3);
+///         assert_eq!(spans[0], SourceLineSpan { start: 1, end: 2 });
+///         assert!(spans_truncated);
+///     }
+///     _ => unreachable!("constructed an occurrence diagnostic"),
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SketchDiagnostic {
     /// The sketch references a logical file absent from the source catalog.
@@ -143,11 +198,14 @@ pub enum SketchDiagnostic {
         sketch: SketchLocation,
         /// Occurrence policy required by the contract.
         expected: SketchOccurrence,
-        /// Exact number of matching occurrences found in the source.
+        /// Exact number of matching occurrences found in the source, including
+        /// overlapping occurrences.
         actual: usize,
-        /// Bounded one-based inclusive occurrence ranges in source order.
+        /// Bounded one-based inclusive occurrence ranges in source-start order.
         spans: Vec<SourceLineSpan>,
         /// Whether additional occurrence ranges were omitted from `spans`.
+        ///
+        /// Omission affects evidence only; the `actual` member remains exact.
         spans_truncated: bool,
     },
 }

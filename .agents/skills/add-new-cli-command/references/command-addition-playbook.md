@@ -5,10 +5,14 @@ architecture from `$use-rust-shell-cli-best-practices`.
 
 > **`conkit` mapping:** The `app archive project` walkthrough below is a generic,
 > non-normative example. In this repository, define grammar in `conkit/args.rs`,
-> implement native async `AppCommand` dispatch in `conkit/command.rs`, keep OS
-> paths and writes in CLI adapters, and pass catalogs, logical catalog paths,
-> bytes, and typed requests to `conkit-signature` or `conkit-sketch`. Do not introduce the
-> example's `crates/app-*` layout or synchronous signatures into `conkit`.
+> implement native async `AppCommand` dispatch in `conkit/command.rs`, and reuse
+> the `CommandContext`-owned shared Rayon pool, independent domain admission,
+> zero-pending CLI policy, process cancellation, `CompilerExtractor`, and
+> `CatalogReadLimits`. Keep OS paths, bounded `CatalogReadBudget` accounting,
+> Cargo processes, and writes in CLI adapters; reconcile signature extraction with
+> `SignatureExtractionCoordinator` and pass catalogs, bytes, and typed
+> extraction to the domains. Do not introduce the example's `crates/app-*`
+> layout or synchronous signatures into `conkit`.
 
 ## Table of contents
 

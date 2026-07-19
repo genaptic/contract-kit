@@ -1,9 +1,13 @@
 //! Versioned mixed-catalog archive encoding and decoding.
 //!
 //! Archives contain the complete mixed signature-and-sketch catalog, so their
-//! versioned gzip wire format belongs to the CLI persistence boundary. Domain
-//! crates receive decoded catalogs and remain responsible for their own diff
-//! semantics.
+//! versioned deterministic gzip wire format belongs to the CLI persistence
+//! boundary. Archive orchestration validates mandatory-v2 combined documents
+//! before encoding and collision-safe publication. Decoding charges the
+//! verified physical entry, compressed bytes, and decoded logical entries to
+//! the caller's cumulative catalog ledger; diff orchestration validates v2
+//! again. Domain crates receive the same decoded catalog and remain responsible
+//! for their own diff semantics.
 
 mod publication;
 mod source;

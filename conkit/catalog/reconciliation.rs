@@ -2,9 +2,9 @@
 //!
 //! Domain work finishes before this module is entered. Reconciliation then
 //! holds the generation lock while it recovers any interrupted journal,
-//! validates the exact generation baseline, preflights every mutation, and
-//! coordinates individually atomic file replacements with version-3
-//! ownership state.
+//! validates the exact generation baseline, preflights and reserves every
+//! mutation, coordinates individually atomic file replacements, compensates
+//! failed progress, and verifies final version-3 ownership state.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, TryLockError};
@@ -90,6 +90,12 @@ pub(super) struct CatalogReconciliation<'store> {
 
 impl ContractsStore {
     /// Recovers interrupted ownership through the caller's operation ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on cancellation, catalog-budget or filesystem failure,
+    /// invalid reserved metadata or ownership state, lock contention, or when
+    /// the interrupted outputs cannot be reconciled with either journal state.
     pub(crate) fn recover_interrupted_generation_with_budget(
         &self,
         budget: &mut CatalogReadBudget,

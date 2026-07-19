@@ -80,8 +80,9 @@ Public boundary types:
 - `SketchCheckCounts`, `SketchDiagnostic`, `SketchLocation`,
   `SourceLineSpan`, `MatchCandidate`, and `DiagnosticExcerpt`
 - `ReportRequest` and `ReportFormat`
-- `GenerateRequest`, `GenerateResponse`, and `SketchSeed`
-- `DiffRequest`, `DiffResponse`, and `DiffEntry`
+- `GenerateRequest`, `GenerateResponse`, `GenerateMode`, and `SketchSeed`
+- `DiffRequest`, `DiffResponse`, `DiffEntry`, `SketchSnapshot`, and
+  `SketchField`
 - `WorkOptions`, `WorkerPool`, and the public sketch limit types
 
 Public DTOs use in-memory catalog bytes and logical catalog paths. They do not
@@ -295,15 +296,20 @@ nonsemantic. Comments and other bytes inside the `code` scalar pass through
 exact-line normalization with the rest of the code, so they remain semantic.
 Added and removed entries carry the snapshot from the side where the sketch
 exists; changed entries carry previous/current snapshots plus deterministically
-ordered typed field flags. Snapshot contract path and document index are
-locator evidence only. Code and complete-current-contract SHA-256 digests use
-version 2, explicit domain separators, stable policy tags, and length-framed
-semantic bytes; `changed()` is derived from whether diff entries exist.
+ordered typed field flags. The `fields` member of `DiffEntry::Changed` is the
+canonical `Vec<SketchField>`; there is no `Normalization` field because
+`exact_lines_v1` is the required normalization policy. Snapshot contract path
+and document index are locator evidence only. Code and
+complete-current-contract SHA-256 digests use version 2, explicit domain
+separators, stable policy tags, and length-framed semantic bytes; `changed()` is
+derived from whether diff entries exist.
 
 A sketch checks only the logical source path named by its linked signature.
 Sketches are grouped by `(source path, normalization)` so a referenced source is
 normalized once per policy and forms the coarse scheduling unit. Matching stays
-on the grouped linear baseline until Phase 9 benchmarks justify an index.
+on the grouped linear baseline because current benchmark evidence does not
+justify a speculative index; any future index must earn its complexity through
+measured workloads.
 One operation-wide matching ledger bounds exact normalized-line comparisons and
 encountered occurrence candidates across every source group. Crossing either
 budget returns typed `LimitExceeded` evidence for the participating source
@@ -542,10 +548,12 @@ according to `CheckMode`.
 
 Unit tests live beside private implementation details. The local `work.rs`
 tests deterministically cover worker execution, bounded admission, cancellation
-before admission, best-effort queued cancellation, started-job completion,
-maximum active root work, panic forwarding, and worker-channel loss. Their
-coordination uses channels, atomics, explicit manual polling, and bounded wake
-guards rather than sleeps or production test seams.
+before admission, best-effort queued cancellation, cooperative cancellation
+after submission, retention of a started job's permit until completion, permit
+release before completion becomes observable, maximum active root work, panic
+forwarding, and worker-channel loss. Their coordination uses channels, atomics,
+explicit manual polling, and bounded wake guards rather than sleeps or
+production test seams.
 
 Public API behavior, serialization, and async-contract tests live under
 `conkit-sketch/tests`.

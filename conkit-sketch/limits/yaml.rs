@@ -4,6 +4,16 @@ use serde::{Deserialize, Serialize};
 use serde_saphyr::granit_parser::{Event, Tag};
 
 /// YAML stream and materialization budgets.
+///
+/// One budget owner spans every selected physical YAML file in an operation,
+/// both sides of a diff, and every changed-document verification reparse during
+/// generation. Document, node, alias, and scalar/tag-byte counters accumulate
+/// across those parses; depth bounds the maximum nesting in each physical
+/// stream. Raw event scanning charges those resources before typed parsing.
+/// Typed parsing then charges only alias-replayed nodes and scalar bytes beyond
+/// that raw report, so ordinary events are not double-counted. Alias replay
+/// failures are converted to the corresponding public resource with a proven
+/// lower-bound observation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct YamlLimits {
     /// Maximum semantic documents parsed across one complete operation.

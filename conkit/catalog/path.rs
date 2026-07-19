@@ -339,12 +339,22 @@ impl CatalogDirectory {
     /// Returns a clone of the root capability, opening the selected ambient
     /// path only once. A symlink used as the selected root is followed at this
     /// one authority boundary; all descendant operations are handle-relative.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the retained capability cannot be locked or cloned,
+    /// or the selected path cannot be securely opened as a directory.
     pub(super) fn capability(&self) -> Result<Dir, CliError> {
         self.acquire_root(CatalogTraversal::Existing)
     }
 
     /// Returns whether the selected root is lexically absent and has not
     /// already been retained. A dangling root symlink is not absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if retained-capability state is poisoned or the ambient
+    /// path cannot be inspected.
     pub(super) fn is_lexically_absent(&self) -> Result<bool, CliError> {
         if self
             .root
@@ -412,6 +422,11 @@ impl CatalogDirectory {
     ///
     /// Missing components retain the operating system error so callers can
     /// preserve exact diagnostics while deciding whether absence is optional.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the relative path is invalid, the root cannot be
+    /// opened, or an existing ancestor cannot be traversed securely.
     pub(super) fn existing_leaf(
         &self,
         relative: &Path,
@@ -422,6 +437,11 @@ impl CatalogDirectory {
 
     /// Resolves one final name, creating absent parent directories relative to
     /// the retained root capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the relative path is invalid, the root cannot be
+    /// opened, or an ancestor cannot be securely opened or created.
     pub(super) fn create_leaf(
         &self,
         relative: &Path,
@@ -531,6 +551,11 @@ impl CatalogDirectory {
 
     /// Enumerates one retained directory, accounting before allocation and
     /// sorting the bounded result by exact host spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on cancellation, directory iteration failure, or a
+    /// traversal-entry limit breach.
     pub(super) fn sorted_entries(
         &self,
         directory: &Dir,
@@ -553,6 +578,11 @@ impl CatalogDirectory {
 
     /// Opens a discovered directory without following its entry if it is
     /// replaced by a symlink or reparse point.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the component is nonportable, changes into a
+    /// symlink or non-directory, or cannot be inspected or opened.
     pub(super) fn open_directory_child(
         &self,
         parent: &Dir,
@@ -583,6 +613,11 @@ impl CatalogDirectory {
 
     /// Opens one existing directory child or creates it relative to its
     /// already-open parent, never following a competing symlink.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the component is nonportable, is or becomes a
+    /// symlink or non-directory, or cannot be inspected, created, or opened.
     pub(super) fn create_directory_child(
         &self,
         parent: &Dir,
@@ -619,6 +654,11 @@ impl CatalogDirectory {
     }
 
     /// Anchors a name returned by a capability-relative directory traversal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the discovered component is nonportable or the
+    /// parent directory capability cannot be cloned.
     pub(super) fn discovered_leaf(
         &self,
         parent: &Dir,
@@ -643,6 +683,10 @@ impl CatalogLeaf {
 
     /// Duplicates the parent capability while preserving the same anchored
     /// filesystem directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parent directory capability cannot be cloned.
     pub(super) fn try_clone(&self) -> Result<Self, CliError> {
         Ok(Self {
             parent: self.parent.try_clone()?,
@@ -653,6 +697,11 @@ impl CatalogLeaf {
     }
 
     /// Returns the opened parent directory's entry names in deterministic order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on cancellation, directory iteration failure, or a
+    /// traversal-entry limit breach.
     pub(super) fn sorted_sibling_names(
         &self,
         budget: &mut CatalogReadBudget,
@@ -676,6 +725,11 @@ impl CatalogLeaf {
     /// Descendant directory components were already opened no-follow when this
     /// value was built. A missing final name remains the original I/O error so
     /// the owning workflow can either surface it or treat it as optional.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the final name cannot be inspected or opened, or is
+    /// a symlink or non-regular file.
     pub(super) fn open_regular(&self) -> Result<Option<File>, CliError> {
         let metadata = match self.parent.symlink_metadata(&self.name) {
             Ok(metadata) => metadata,
@@ -705,6 +759,11 @@ impl CatalogLeaf {
     /// Opens or creates the regular read/write file used for the generation
     /// lock and converts that same capability-opened handle for standard file
     /// locking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock name is a symlink or non-regular file, or
+    /// cannot be inspected, securely opened, created, or converted.
     pub(super) fn open_lock_file(&self) -> Result<std::fs::File, CliError> {
         match self.parent.symlink_metadata(&self.name) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -731,6 +790,12 @@ impl CatalogLeaf {
 
     /// Creates this final name exclusively, writes and synchronizes all bytes,
     /// and removes only that same anchored name if the write fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if exclusive creation, regular-file validation, writing,
+    /// flushing, or synchronization fails. Cleanup failure is attached to a
+    /// failed write when the incomplete file cannot be removed.
     pub(super) fn write_new_synced(&self, bytes: &[u8]) -> Result<(), CliError> {
         let mut options = OpenOptions::new();
         options
@@ -761,6 +826,10 @@ impl CatalogLeaf {
 
     /// Removes this anchored final name and synchronizes its parent where the
     /// platform supports directory synchronization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if removal or parent-directory synchronization fails.
     pub(super) fn remove_file(&self) -> Result<(), CliError> {
         self.parent.remove_file(&self.name)?;
         self.sync_parent()
@@ -768,6 +837,11 @@ impl CatalogLeaf {
 
     /// Opens a collision-resistant sibling temporary with caller-selected
     /// no-follow options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sibling name is nonportable or cannot be opened
+    /// with the requested options.
     pub(super) fn open_sibling(
         &self,
         name: &OsStr,
@@ -778,6 +852,10 @@ impl CatalogLeaf {
     }
 
     /// Atomically renames one sibling over this anchored final name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the capability-relative rename fails.
     pub(super) fn rename_sibling(&self, sibling: &OsStr) -> Result<(), CliError> {
         self.parent
             .rename(sibling, &self.parent, &self.name)
@@ -785,11 +863,20 @@ impl CatalogLeaf {
     }
 
     /// Removes one sibling temporary from this anchored parent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating-system error if the sibling cannot be removed.
     pub(super) fn remove_sibling(&self, sibling: &OsStr) -> Result<(), std::io::Error> {
         self.parent.remove_file(sibling)
     }
 
     /// Synchronizes the parent directory where the platform supports it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on platforms that support directory synchronization if
+    /// the retained directory cannot be reopened or synchronized.
     pub(super) fn sync_parent(&self) -> Result<(), CliError> {
         #[cfg(unix)]
         {

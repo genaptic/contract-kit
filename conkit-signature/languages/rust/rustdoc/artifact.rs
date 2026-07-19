@@ -11,22 +11,35 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Contract Kit's version for the host-produced compiler artifact envelope.
+///
+/// Hosts must write this value into [`RustCompilerArtifact::schema_version`].
+/// Unknown older or newer envelope versions fail without conversion fallback.
 pub const RUST_COMPILER_ARTIFACT_SCHEMA_VERSION: u16 = 1;
 
 /// rustdoc JSON schema understood by the pinned `rustdoc-types` dependency.
+///
+/// The envelope and decoded rustdoc document must both report this exact
+/// format. The host remains responsible for selecting a compatible compiler
+/// and producing the rustdoc JSON bytes.
 pub const RUSTDOC_FORMAT_VERSION: u32 = rustdoc_types::FORMAT_VERSION;
 
 /// Host-resolved identity for the one local crate represented by rustdoc JSON.
+///
+/// Artifact schema version 1 accepts exactly one selected Cargo target. Its
+/// logical ID, root, and target kind must agree with the signature-bearing
+/// contract document; `root_item_id` must agree with the decoded rustdoc root.
+/// Library targets require public-only rustdoc output, while binary targets
+/// require rustdoc output that includes private items.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RustCompilerCrate {
     /// Stable contract crate ID, independent of package display names.
     pub id: String,
-    /// Cargo package name selected by the host.
+    /// Nonempty Cargo package name selected by the host.
     pub package: String,
-    /// Cargo target name selected by the host.
+    /// Nonempty Cargo target name selected by the host.
     pub target: String,
-    /// Logical source-catalog path to this target's crate root.
+    /// Allowlisted logical `.rs` path to this target's crate root.
     pub root: CatalogPath,
     /// Inner `u32` value of the rustdoc JSON crate `root` ID.
     pub root_item_id: u32,
@@ -46,6 +59,12 @@ impl RustCompilerCrate {
 }
 
 /// Explicit source provenance for one compiler-reachable rustdoc item.
+///
+/// Exact provenance is accepted only for a nonempty UTF-8-aligned byte range
+/// whose logical filename and one-indexed Unicode-scalar line/column range
+/// agree with the rustdoc span. Compiler-generated provenance is accepted only
+/// when rustdoc supplies no span and must name the selected crate root. These
+/// variants are mutually exclusive; provenance is never guessed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CompilerSourceProvenance {
@@ -53,12 +72,12 @@ pub enum CompilerSourceProvenance {
     Exact {
         /// Logical source path in the accompanying source catalog.
         file: CatalogPath,
-        /// Inclusive byte offset in `file`.
+        /// Inclusive UTF-8 byte offset in `file`.
         byte_start: u64,
-        /// Exclusive byte offset in `file`.
+        /// Exclusive UTF-8 byte offset in `file`, greater than `byte_start`.
         byte_end: u64,
     },
-    /// The compiler created the item and rustdoc cannot supply exact source text.
+    /// The compiler created the item and rustdoc supplies no exact source span.
     CompilerGenerated {
         /// Selected logical crate root that owns the generated public item.
         crate_root: CatalogPath,
@@ -66,6 +85,11 @@ pub enum CompilerSourceProvenance {
 }
 
 /// Explicit host translation from one rustdoc item to logical source provenance.
+///
+/// Mappings must be unique by local rustdoc item ID, refer only to the selected
+/// local crate, and identify an allowlisted source path. Every admitted
+/// compiler-reachable declaration needs a mapping; omitted mappings are
+/// tolerated only for rustdoc items that never enter the reachable API graph.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompilerSourcePath {
@@ -76,6 +100,55 @@ pub struct CompilerSourcePath {
 }
 
 /// Versioned, in-memory compiler extraction artifact assembled by a host.
+///
+/// The host owns toolchain selection, Cargo target resolution, feature/cfg
+/// evaluation, process execution, and rustdoc JSON production. This crate
+/// performs no subprocess or filesystem work: it validates the envelope,
+/// decodes one selected crate, validates every admitted source mapping, and
+/// lowers compiler-resolved facts into the same contract model used by syntax
+/// extraction. Unsupported or contradictory facts fail closed; compiler mode
+/// never falls back to syntax extraction.
+///
+/// A valid artifact must use [`RUST_COMPILER_ARTIFACT_SCHEMA_VERSION`] and
+/// [`RUSTDOC_FORMAT_VERSION`], contain exactly one [`RustCompilerCrate`], and
+/// agree with the selected signature-bearing document's compiler/extractor
+/// versions, target triple, normalized feature and cfg sets, package/target,
+/// crate root, root item, and target kind.
+///
+/// Producing a valid artifact requires an external Cargo/rustdoc host workflow,
+/// so this integration example is compile-checked but not run by rustdoc.
+///
+/// ```no_run
+/// use conkit_signature::{
+///     CatalogPath, CheckMode, CheckRequest, FileCatalog, ReportRequest,
+///     RustCompilerArtifact, RustExtractionInput, SignatureContractKit,
+/// };
+///
+/// fn host_file(
+///     logical: &str,
+///     physical: &str,
+/// ) -> Result<FileCatalog, Box<dyn std::error::Error>> {
+///     let mut catalog = FileCatalog::new();
+///     catalog.insert(CatalogPath::new(logical)?, std::fs::read(physical)?)?;
+///     Ok(catalog)
+/// }
+///
+/// // An external host has already selected the Cargo target, invoked rustdoc,
+/// // normalized provenance, and serialized the complete artifact envelope.
+/// let artifact: RustCompilerArtifact = serde_json::from_slice(&std::fs::read(
+///     "target/conkit/rustdoc-artifact.json",
+/// )?)?;
+/// let kit = SignatureContractKit::builder().build()?;
+/// let response = futures_executor::block_on(kit.check(CheckRequest {
+///     source_files: host_file("src/lib.rs", "src/lib.rs")?,
+///     contract_files: host_file("main.yml", "contracts/main.yml")?,
+///     extraction: RustExtractionInput::Compiler(artifact),
+///     report: ReportRequest::None,
+///     mode: CheckMode::Strict,
+/// }))?;
+/// assert!(response.passed);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RustCompilerArtifact {
@@ -89,19 +162,74 @@ pub struct RustCompilerArtifact {
     pub rustdoc_format_version: u32,
     /// Compilation target triple selected by the host.
     pub target_triple: String,
-    /// Enabled Cargo features. Input order is nonsemantic.
+    /// Enabled Cargo features; validation sorts and deduplicates this set.
     pub features: Vec<String>,
-    /// Relevant evaluated `cfg` values. Input order is nonsemantic.
+    /// Relevant evaluated `cfg` values; validation sorts and deduplicates this set.
     pub cfg_values: Vec<String>,
-    /// Local crate metadata. Schema version 1 requires exactly one entry.
+    /// Selected local target metadata; schema version 1 requires exactly one entry.
     pub crates: Vec<RustCompilerCrate>,
     /// Complete rustdoc JSON bytes for the selected target.
     pub rustdoc_json: Vec<u8>,
-    /// Host-normalized source provenance for local compiler-reachable items.
+    /// Unique host-normalized provenance for local compiler-reachable items.
     pub source_paths: Vec<CompilerSourcePath>,
 }
 
 /// Typed reason a compiler artifact could not be trusted or converted.
+///
+/// Public operations wrap this value in [`SignatureContractKitError`], where
+/// [`SignatureContractKitError::compiler_artifact_failure`] recovers it without
+/// parsing display text.
+///
+/// # Examples
+///
+/// ```
+/// use conkit_signature::{
+///     CatalogPath, ContractScope, FileCatalog, GenerateDocument, GenerateRequest,
+///     GenerateTarget, RustCompilerArtifact, RustCompilerArtifactFailure,
+///     RustCrateKind, RustCrateRoot, RustExtractionInput, SignatureContractKit,
+///     RUST_COMPILER_ARTIFACT_SCHEMA_VERSION, RUSTDOC_FORMAT_VERSION,
+/// };
+///
+/// let artifact = RustCompilerArtifact {
+///     schema_version: RUST_COMPILER_ARTIFACT_SCHEMA_VERSION + 1,
+///     extractor_version: "host-v1".to_owned(),
+///     compiler_version: "rustc host".to_owned(),
+///     rustdoc_format_version: RUSTDOC_FORMAT_VERSION,
+///     target_triple: "example-target".to_owned(),
+///     features: Vec::new(),
+///     cfg_values: Vec::new(),
+///     crates: Vec::new(),
+///     rustdoc_json: Vec::new(),
+///     source_paths: Vec::new(),
+/// };
+/// let mut source_files = FileCatalog::new();
+/// source_files.insert(CatalogPath::new("lib.rs")?, Vec::new())?;
+/// let kit = SignatureContractKit::builder().build()?;
+/// let error = futures_executor::block_on(kit.generate(GenerateRequest {
+///     source_files,
+///     target: GenerateTarget::New(GenerateDocument {
+///         contract_file: CatalogPath::new("main.yml")?,
+///         root: "../src".to_owned(),
+///         files: vec![CatalogPath::new("lib.rs")?],
+///         crates: vec![RustCrateRoot {
+///             id: "sample".to_owned(),
+///             root: CatalogPath::new("lib.rs")?,
+///             kind: RustCrateKind::Library,
+///         }],
+///     }),
+///     extraction: RustExtractionInput::Compiler(artifact),
+///     scope: ContractScope::Signatures,
+/// }))
+/// .unwrap_err();
+///
+/// assert!(matches!(
+///     error.compiler_artifact_failure(),
+///     Some(RustCompilerArtifactFailure::SchemaVersion { expected, actual })
+///         if *expected == RUST_COMPILER_ARTIFACT_SCHEMA_VERSION
+///             && *actual == RUST_COMPILER_ARTIFACT_SCHEMA_VERSION + 1
+/// ));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RustCompilerArtifactFailure {
     /// The host envelope uses an unsupported Contract Kit schema version.

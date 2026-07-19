@@ -47,6 +47,12 @@
 //! explicitly. Compiler-generated items participate in signatures but cannot
 //! supply exact source text for linked sketches.
 //!
+//! Existing-document generation is lossless. An exact semantic no-op returns
+//! the original document bytes. A real change edits only affected signature
+//! nodes, preserves retained spans, comments, presentation, and nested sketch
+//! records, then reparses the changed bytes and verifies that they equal the
+//! proposed semantic document before returning them.
+//!
 //! Functions named `main` are ordinary functions. Equivalent visibility
 //! spellings canonicalize to the same semantic visibility. Parameter patterns
 //! remain rendering metadata, while `rust_api_v1` digest bytes include callable
@@ -68,6 +74,17 @@
 //! their established wire layouts, so storage adapters can compose reports
 //! without mirroring signature-domain fields.
 //!
+//! # Resource limits
+//!
+//! Every operation applies [`SignatureLimits`] across its complete workflow,
+//! including all participating catalogs, both sides of a diff, compiler
+//! artifact nodes, diagnostics or diff entries, changed-document verification
+//! reparses, and returned output. [`SignatureContractKitError::limit_exceeded`]
+//! recovers typed [`LimitExceeded`] evidence with the configured limit, a
+//! proven observed lower bound, and a logical file when the breach is
+//! file-specific. Returned bytes and simultaneously retained generation/edit
+//! scratch have independent 512 MiB defaults.
+//!
 //! # Boundaries
 //!
 //! `conkit-signature` owns signature-domain parsing, matching, generation, and diffing
@@ -88,6 +105,11 @@
 //! [`WorkOptions`] documents the complete worker-admission and cooperative
 //! cancellation contract. Examples here use `futures_executor::block_on` only to
 //! remain self-contained; the crate does not select that executor for callers.
+//! Hosts selecting compiler extraction construct a [`RustCompilerArtifact`]
+//! using [`RUST_COMPILER_ARTIFACT_SCHEMA_VERSION`] and
+//! [`RUSTDOC_FORMAT_VERSION`]. Artifact trust or conversion failures remain
+//! available as typed [`RustCompilerArtifactFailure`] evidence through
+//! [`SignatureContractKitError::compiler_artifact_failure`].
 //!
 //! # Examples
 //!

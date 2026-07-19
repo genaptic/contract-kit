@@ -4,7 +4,7 @@
     {
       "id": "add-conkit-inspect-ownership",
       "prompt": "Add a new `conkit inspect ownership --contracts DIR` command that reports which combined contract documents are managed or unowned without modifying the contracts tree.",
-      "expected_output": "Uses this skill and its required Rust guidance, checks the command against the existing conkit grammar, adds parse-only clap data and exhaustive native async AppCommand dispatch, keeps ownership-journal reads and OS paths in conkit, renders stable output through the CLI adapter, and adds focused help, behavior, failure, and manifest-aware scenario coverage."
+      "expected_output": "Uses this skill and its required Rust guidance, checks the command against the existing conkit grammar, adds parse-only clap data and exhaustive native async AppCommand dispatch, keeps ownership-journal reads and OS paths in conkit, begins one cancellation-aware CatalogReadBudget from CommandContext-provided limits without creating a command-local pool or queue, renders stable output through the CLI adapter, and adds focused help, behavior, resource-limit, cancellation, failure, and manifest-aware scenario coverage."
     },
     {
       "id": "add-opt-in-diff-exit-code",
@@ -14,7 +14,12 @@
     {
       "id": "reject-domain-filesystem-coupling",
       "prompt": "Simplify `conkit generate signatures` by changing `conkit_signature::GenerateRequest` to accept `source_root: PathBuf` and `contracts_root: PathBuf`, then have the domain crate traverse the source tree and write generated YAML itself.",
-      "expected_output": "Uses this skill to reject the proposed boundary violation, keeps PathBuf traversal in SourceTree and ContractsStore plus ContractLayout, recovery, ownership, and persistence in conkit, passes FileCatalog data with the required typed generation target and scope into conkit-signature, and persists the completed GeneratedContracts result through ContractsStore."
+      "expected_output": "Uses this skill to reject the proposed boundary violation, keeps PathBuf traversal in SourceTree and ContractsStore plus ContractLayout, budget-aware recovery/reads/writes, ownership, and persistence in conkit, reconciles extraction with the CLI-owned SignatureExtractionCoordinator, keeps Cargo/rustdoc execution in CompilerExtractor, passes FileCatalog data with the required typed generation target, scope, and RustExtractionInput into conkit-signature, and persists the completed GeneratedContracts result through ContractsStore."
+    },
+    {
+      "id": "reject-command-local-runtime-and-unbounded-reads",
+      "prompt": "Add a `conkit generate signatures` fast path that constructs its own Rayon pool with a 32-operation pending queue, reads source files with `std::fs::read`, and asks `conkit-signature` to run Cargo when compiler extraction is selected.",
+      "expected_output": "Uses this skill to reject all three regressions: reuses the one CommandContext-owned Rayon pool, preserves independent domain admission with the CLI's zero-pending policy, carries one cancellation-aware CatalogReadBudget through bounded filesystem work, keeps SignatureExtractionCoordinator and CompilerExtractor in conkit, and passes only typed catalog bytes and RustExtractionInput to conkit-signature."
     }
   ]
 }

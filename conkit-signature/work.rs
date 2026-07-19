@@ -19,19 +19,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// [`WorkerPool::Dedicated`] create a kit-local Rayon pool, while
 /// [`WorkerPool::Shared`] lets a host reuse one pool across contract domains.
 /// One root operation may use nested Rayon work without consuming another root
-/// permit.
+/// permit. Admission semaphores remain private to each kit even when several
+/// kits share the same Rayon pool, so sharing workers does not merge their
+/// active or pending budgets.
 ///
 /// Admission is immediate: when all active and pending slots are occupied, the
 /// operation returns a queue-full error instead of growing an unbounded waiter
 /// list. An admitted operation asynchronously waits for an active slot without
-/// blocking its executor. Dropping a queued future releases admission. Dropping
-/// a running future marks its cooperative cancellation probe; finite parsing
-/// and rendering code observes that flag at group boundaries. Cancellation is
-/// cooperative and never terminates a worker thread.
+/// blocking its executor. Pending work has no FIFO ordering guarantee. Dropping
+/// a queued future releases admission. Dropping a running future marks its
+/// cooperative cancellation probe; finite parsing and rendering code observes
+/// that flag at group boundaries. Cancellation is cooperative and never
+/// terminates a worker thread.
 ///
 /// Completion crosses the worker boundary through a runtime-neutral one-shot
 /// channel. A panic from the CPU workflow is captured in the worker and resumes
 /// unwinding on the polling thread; recoverable failures remain typed errors.
+/// Active and admitted permits are released before completion is made
+/// observable, so follow-up work can be admitted as soon as a future resolves.
 /// Operations transform owned in-memory catalogs without external side
 /// effects, so discarding a completed result cannot leave partial external
 /// state.
@@ -40,17 +45,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 ///
 /// ```
 /// use conkit_signature::{SignatureContractKit, WorkOptions, WorkerPool};
+/// use rayon::ThreadPoolBuilder;
 /// use std::num::NonZeroUsize;
+/// use std::sync::Arc;
 ///
+/// let shared = Arc::new(ThreadPoolBuilder::new().num_threads(1).build()?);
 /// let kit = SignatureContractKit::builder()
 ///     .with_work_options(WorkOptions {
-///         pool: WorkerPool::Dedicated {
-///             worker_threads: NonZeroUsize::MIN,
+///         pool: WorkerPool::Shared {
+///             pool: Arc::clone(&shared),
 ///         },
 ///         max_in_flight_operations: NonZeroUsize::MIN,
 ///         max_pending_operations: 8,
 ///     })
 ///     .build()?;
+/// assert_eq!(shared.current_num_threads(), 1);
 /// # let _ = kit;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -88,6 +97,8 @@ pub enum WorkerPool {
     /// one worker set.
     Shared {
         /// Host-owned pool used for every complete root operation.
+        ///
+        /// Each kit still enforces its own active and pending admission limits.
         pool: Arc<ThreadPool>,
     },
 }

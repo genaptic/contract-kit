@@ -146,6 +146,45 @@ impl SignatureContractKitBuilder {
     }
 
     /// Replaces the resource budgets enforced for every operation.
+    ///
+    /// The supplied [`SignatureLimits`] replaces the complete default limit
+    /// set rather than merging individual fields. Limit failures are returned
+    /// as [`SignatureContractKitError`] and expose typed evidence through
+    /// [`SignatureContractKitError::limit_exceeded`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use conkit_signature::{
+    ///     CatalogLimits, CatalogPath, CheckMode, CheckRequest, FileCatalog,
+    ///     LimitResource, ReportRequest, SignatureContractKit, SignatureLimits,
+    /// };
+    ///
+    /// let limits = SignatureLimits {
+    ///     catalog: CatalogLimits {
+    ///         entry_count: 0,
+    ///         ..CatalogLimits::default()
+    ///     },
+    ///     ..SignatureLimits::default()
+    /// };
+    /// let kit = SignatureContractKit::builder().with_limits(limits).build()?;
+    /// let mut source_files = FileCatalog::new();
+    /// source_files.insert(CatalogPath::new("lib.rs")?, Vec::new())?;
+    ///
+    /// let error = futures_executor::block_on(kit.check(CheckRequest {
+    ///     source_files,
+    ///     contract_files: FileCatalog::new(),
+    ///     extraction: Default::default(),
+    ///     report: ReportRequest::None,
+    ///     mode: CheckMode::Default,
+    /// }))
+    /// .unwrap_err();
+    /// let evidence = error.limit_exceeded().expect("typed limit evidence");
+    /// assert_eq!(evidence.resource, LimitResource::CatalogEntryCount);
+    /// assert_eq!(evidence.limit, 0);
+    /// assert_eq!(evidence.observed_at_least, 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn with_limits(mut self, limits: SignatureLimits) -> Self {
         self.limits = limits;
         self
@@ -155,8 +194,10 @@ impl SignatureContractKitBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`SignatureContractKitError`] if the internal work pool cannot
-    /// be initialized.
+    /// Returns [`SignatureContractKitError`] if a local Rayon pool cannot be
+    /// initialized or if active plus pending operation capacity overflows
+    /// `usize`. A caller-supplied [`WorkerPool::Shared`](crate::WorkerPool::Shared)
+    /// is reused but still receives independent per-kit admission limits.
     ///
     /// # Examples
     ///
@@ -194,11 +235,16 @@ impl SignatureContractKit {
     /// Checks source files against contract files.
     ///
     /// Rust contract files are interpreted as mandatory `contract_version: 2`
-    /// combined documents with `rust_syntax_v2`/`rust_api_v1` extraction
-    /// metadata, explicit crate roots, an exact `files` allowlist, signatures,
-    /// and nested sketches. Rust decoding, graph traversal, owner resolution,
-    /// and inventory construction are bounded by each document's allowlist.
-    /// Callers decide how those bytes are read from or written to local files.
+    /// combined documents with `rust_syntax_v2` or `rust_compiler_v1`
+    /// extraction metadata, `profile: rust_api_v1`, explicit crate roots, an
+    /// exact `files` allowlist, signatures, and nested sketches. The request's
+    /// [`RustExtractionInput`] must match every signature-bearing document;
+    /// there is no syntax/compiler fallback. Compiler extraction requires
+    /// exactly one such document and exact agreement between its recorded
+    /// extraction context and the supplied host artifact. Rust decoding,
+    /// graph traversal, owner resolution, and inventory construction are
+    /// bounded by each document's allowlist. Callers decide how those bytes
+    /// are read from or written to local files.
     ///
     /// Syntax extraction retains modeled declarations and emits capability
     /// warnings for compiler-dependent facts such as `cfg`, macro expansion,
@@ -209,9 +255,12 @@ impl SignatureContractKit {
     ///
     /// # Errors
     ///
-    /// Returns [`SignatureContractKitError`] when source parsing, contract
-    /// parsing, comparison, or optional report rendering fails, or when
-    /// background work does not complete.
+    /// Returns [`SignatureContractKitError`] when source or contract parsing,
+    /// extraction, comparison, or optional report rendering fails. This
+    /// includes an extraction-mode mismatch, a missing or non-unique compiler
+    /// document, invalid compiler artifact or artifact/document disagreement,
+    /// a configured resource limit, immediate work-queue saturation,
+    /// cancellation, or worker completion failure.
     ///
     /// # Panics
     ///
@@ -280,16 +329,22 @@ impl SignatureContractKit {
     /// A new document requires explicit [`RustCrateRoot`] values; target kind
     /// and logical module identity are not inferred from `lib.rs`, `main.rs`, or
     /// any other filename. Existing documents retain their recorded extraction
-    /// context.
+    /// context and must match the requested extraction mode. For an existing
+    /// document, a semantic no-op returns the original bytes exactly. A real
+    /// change edits only affected signature nodes, preserves retained source
+    /// spans, comments, presentation, and sketches, and is semantically
+    /// reparsed before its bytes are returned.
     ///
     /// # Errors
     ///
     /// Returns [`SignatureContractKitError`] when Rust source decoding,
-    /// parsing, ownership resolution, or contract conversion fails; when a new
-    /// or existing document layout is invalid; when a participating existing
-    /// document fails YAML, ownership, or link validation; when labels or
-    /// output bytes cannot be rendered; or when background work does not
-    /// complete.
+    /// extraction, ownership resolution, or contract conversion fails; when a
+    /// new or existing document layout is invalid; when the requested
+    /// extraction mode disagrees with an existing document; when compiler mode
+    /// lacks exactly one selected crate or its artifact does not agree with the
+    /// document; when lossless editing, verification reparsing, label
+    /// allocation, or output rendering fails; when a configured resource limit
+    /// is exceeded; or when work is rejected, canceled, or does not complete.
     ///
     /// # Panics
     ///
@@ -367,15 +422,20 @@ impl SignatureContractKit {
     /// Structurally repeatable items with the same crate, module path, item
     /// kind, and semantic name are distinguished by one-based declaration
     /// occurrence. Contract signature order reconstructs those occurrences, so
-    /// each link selects the exact corresponding item text.
+    /// each link selects the exact corresponding item text. A compiler-created
+    /// item remains valid signature identity, but its generated provenance
+    /// cannot satisfy a linked sketch that requires exact source bytes.
     ///
     /// # Errors
     ///
     /// Returns [`SignatureContractKitError`] when Rust source bytes cannot be
-    /// decoded or parsed; when a participating combined document fails YAML,
-    /// layout, ownership, or link validation; when linked source files, exact
-    /// Rust items, or valid source spans cannot be found; or when background
-    /// work does not complete.
+    /// decoded or extracted; when a participating combined document fails
+    /// YAML, layout, ownership, link, or extraction-mode validation; when a
+    /// compiler artifact is invalid or disagrees with the one required
+    /// document; when linked source files, exact Rust items, or valid exact
+    /// source spans cannot be found (including compiler-generated provenance);
+    /// when a configured resource limit is exceeded; or when work is rejected,
+    /// canceled, or does not complete.
     ///
     /// # Panics
     ///
@@ -471,10 +531,20 @@ impl SignatureContractKit {
 
     /// Diffs current signature contract files against previous contract files.
     ///
+    /// Both catalogs are parsed as mandatory-v2 documents. Entries classify
+    /// changes to caller-visible source semantics, extraction context, user
+    /// labels, and contract-only document metadata. The response digest is the
+    /// complete current contract identity; it is not a digest of the previous
+    /// catalog or of the diff entries. Repeated semantic labels across physical
+    /// documents are paired deterministically by their sorted source and
+    /// contract digests before residual additions and removals are reported.
+    ///
     /// # Errors
     ///
-    /// Returns [`SignatureContractKitError`] when contract parsing or inventory
-    /// diffing fails, or when background work does not complete.
+    /// Returns [`SignatureContractKitError`] when either catalog contains an
+    /// invalid contract document, when inventory or deterministic duplicate-
+    /// label pairing fails, when diagnostic/diff or other configured limits
+    /// are exceeded, or when work is rejected, canceled, or does not complete.
     ///
     /// # Panics
     ///
@@ -857,7 +927,28 @@ pub enum ReportFormat {
 /// Syntax extraction is the portable default and derives signatures from the
 /// supplied source catalog plus contract crate-root metadata. Compiler
 /// extraction consumes one versioned, host-produced rustdoc artifact; this
-/// crate still performs no process, Cargo, or filesystem work.
+/// crate still performs no process, Cargo, or filesystem work. Request fields
+/// carrying this enum use its Serde default when omitted, and the tagged wire
+/// shape distinguishes `syntax` from `compiler` without an implicit fallback.
+///
+/// # Examples
+///
+/// ```
+/// use conkit_signature::RustExtractionInput;
+///
+/// assert_eq!(RustExtractionInput::default(), RustExtractionInput::Syntax);
+/// assert_eq!(
+///     serde_json::to_value(RustExtractionInput::Syntax)?,
+///     serde_json::json!({ "mode": "syntax" }),
+/// );
+/// assert_eq!(
+///     serde_json::from_value::<RustExtractionInput>(
+///         serde_json::json!({ "mode": "syntax" }),
+///     )?,
+///     RustExtractionInput::Syntax,
+/// );
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "mode", content = "artifact")]
 pub enum RustExtractionInput {
@@ -872,11 +963,15 @@ pub enum RustExtractionInput {
 ///
 /// The caller owns filesystem discovery and provides both source and contract
 /// bytes as [`FileCatalog`] values. Rust contract files use the mandatory-v2
-/// combined shape: `rust_syntax_v2`/`rust_api_v1` extraction metadata, explicit
-/// typed crate roots, `root`, an exact `files` allowlist, user-named
-/// `signatures`, and nested `sketches`. Missing, legacy, future, or unknown
-/// extraction versions fail closed. The selected [`CheckMode`] controls whether
-/// deterministic syntax-capability warnings fail an otherwise matching check.
+/// combined shape with `profile: rust_api_v1`, `rust_syntax_v2` or
+/// `rust_compiler_v1` extraction metadata, explicit typed crate roots, `root`,
+/// an exact `files` allowlist, user-named `signatures`, and nested `sketches`.
+/// Missing, legacy, future, unknown, or request-mismatched extraction versions
+/// fail closed. Compiler extraction requires exactly one signature-bearing
+/// document whose full compiler, Cargo target, crate-root, feature, cfg, and
+/// schema context agrees with the supplied artifact. The selected
+/// [`CheckMode`] controls whether deterministic syntax-capability warnings fail
+/// an otherwise matching syntax check.
 ///
 /// # Examples
 ///
@@ -894,6 +989,14 @@ pub enum RustExtractionInput {
 /// };
 ///
 /// assert_eq!(request.mode, CheckMode::Default);
+/// let mut wire = serde_json::to_value(&request)?;
+/// wire.as_object_mut().expect("request object").remove("extraction");
+/// let defaulted: CheckRequest = serde_json::from_value(wire)?;
+/// assert_eq!(
+///     defaulted.extraction,
+///     conkit_signature::RustExtractionInput::Syntax,
+/// );
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckRequest {
@@ -904,9 +1007,14 @@ pub struct CheckRequest {
     pub source_files: FileCatalog,
     /// Contract files to parse and compare against `source_files`.
     ///
-    /// Rust signature contracts must be root-level combined YAML documents.
+    /// Rust signature contracts must be direct root-level combined YAML
+    /// documents. Syntax requests reject compiler documents. Compiler requests
+    /// require exactly one signature-bearing compiler document and exact
+    /// artifact/document context agreement.
     pub contract_files: FileCatalog,
     /// Rust extraction capability and optional compiler artifact.
+    ///
+    /// Omission during deserialization selects [`RustExtractionInput::Syntax`].
     #[serde(default)]
     pub extraction: RustExtractionInput,
     /// Optional report output request.
@@ -943,17 +1051,58 @@ pub enum ReportRequest {
 }
 
 /// Response returned by [`SignatureContractKit::check`].
+///
+/// [`Self::report_view`] and [`Self::embedded_report_view`] borrow this response
+/// and expose the two stable report layouts without copying a second public
+/// report DTO. Both omit `report_files`; the embedded view changes field order
+/// for composition inside the CLI's mixed-domain report.
+///
+/// # Examples
+///
+/// ```
+/// use conkit_signature::{
+///     CatalogPath, CheckResponse, FileCatalog, SignatureCheckCounts,
+/// };
+///
+/// let mut report_files = FileCatalog::new();
+/// report_files.insert(CatalogPath::new("reports/check.json")?, b"stored".to_vec())?;
+/// let response = CheckResponse {
+///     passed: true,
+///     source_shape_digest: "digest".to_owned(),
+///     digest_version: 2,
+///     counts: SignatureCheckCounts {
+///         source_signature_count: 1,
+///         contract_signature_count: 1,
+///     },
+///     diagnostics: Vec::new(),
+///     report_files,
+/// };
+///
+/// let standalone = serde_json::to_value(response.report_view())?;
+/// let embedded = serde_json::to_value(response.embedded_report_view())?;
+/// assert_eq!(standalone["source_shape_digest"], "digest");
+/// assert_eq!(embedded["counts"]["source_signature_count"], 1);
+/// assert!(standalone.get("report_files").is_none());
+/// assert!(embedded.get("report_files").is_none());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckResponse {
     /// Whether the check passed under the requested [`CheckMode`].
     pub passed: bool,
     /// Digest for caller-visible source/API shape only.
+    ///
+    /// This excludes user signature labels, extraction context, document root,
+    /// sketch linkage, and other contract-only metadata. Use
+    /// [`DiffResponse::contract_digest`] for complete current contract identity.
     pub source_shape_digest: String,
     /// Canonical signature digest format version.
     pub digest_version: u16,
     /// Source and contract signature totals.
     pub counts: SignatureCheckCounts,
     /// Comparison errors followed by deterministic syntax-capability warnings.
+    ///
+    /// Compiler extraction produces comparison errors only.
     pub diagnostics: Vec<CheckDiagnostic>,
     /// Generated report files, or an empty catalog when no report was requested.
     pub report_files: FileCatalog,
@@ -1033,9 +1182,10 @@ pub struct SignatureCheckCounts {
 ///
 /// ```
 /// use conkit_signature::{
-///     CatalogPath, CheckDiagnostic, CheckMode, CheckRequest, ContractScope,
-///     FileCatalog, GenerateDocument, GenerateRequest, GenerateTarget, ReportRequest,
-///     RustCrateKind, RustCrateRoot, SignatureContractKit,
+///     CatalogPath, CheckDiagnostic, CheckDiagnosticCategory, CheckMode, CheckRequest,
+///     ContractScope, DiagnosticSeverity, FileCatalog, GenerateDocument,
+///     GenerateRequest, GenerateTarget, ReportRequest, RustCrateKind, RustCrateRoot,
+///     SignatureContractKit,
 /// };
 ///
 /// let kit = SignatureContractKit::builder().build()?;
@@ -1082,6 +1232,19 @@ pub struct SignatureCheckCounts {
 ///     diagnostic,
 ///     CheckDiagnostic::Extra { signature_id } if signature_id.contains("actual_only")
 /// )));
+/// let missing = response
+///     .diagnostics
+///     .iter()
+///     .find(|diagnostic| matches!(diagnostic, CheckDiagnostic::Missing { .. }))
+///     .expect("missing diagnostic");
+/// assert_eq!(missing.severity(), DiagnosticSeverity::Error);
+/// assert_eq!(missing.category(), CheckDiagnosticCategory::SourceSemantics);
+///
+/// let warning = CheckDiagnostic::Warning {
+///     message: "syntax extraction retained cfg".to_owned(),
+/// };
+/// assert_eq!(warning.severity(), DiagnosticSeverity::Warning);
+/// assert_eq!(warning.category(), CheckDiagnosticCategory::SyntaxCapability);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1175,6 +1338,8 @@ pub struct GenerateRequest {
     /// Existing combined documents to update or a typed layout for a new one.
     pub target: GenerateTarget,
     /// Rust extraction capability and optional compiler artifact.
+    ///
+    /// Omission during deserialization selects [`RustExtractionInput::Syntax`].
     #[serde(default)]
     pub extraction: RustExtractionInput,
     /// Linked-sketch cleanup policy for [`GenerateTarget::Existing`].
@@ -1195,7 +1360,11 @@ pub enum GenerateTarget {
     ///
     /// Only direct root-level `.yml` and `.yaml` entries are considered and
     /// returned. Nested YAML and non-YAML catalog entries are ignored and
-    /// omitted from [`GenerateResponse::contract_files`]. With
+    /// omitted from [`GenerateResponse::contract_files`]. The complete typed
+    /// proposal is compared before a lossless tree is loaded: an exact
+    /// semantic no-op returns the original bytes, while a real edit preserves
+    /// untouched byte spans, comments, presentation, and the sketch section,
+    /// then reparses to verify the proposed semantics. With
     /// [`ContractScope::Signatures`], generation preserves linked sketches and
     /// rejects signature removal that would orphan one. With
     /// [`ContractScope::All`], it removes the stale linked sketch record along
@@ -1213,11 +1382,19 @@ pub enum GenerateTarget {
 /// logical crate root explicitly; compiler artifacts must agree with that
 /// identity, and there is no filename-based root, target-kind, or module
 /// inference at this domain boundary.
+///
+/// The output path must be a direct root-level `.yml` or `.yaml` path, `root`
+/// must contain non-whitespace text, and `files` must be a nonempty exact
+/// allowlist of logical `.rs` paths. Crate IDs must be valid, nonempty, and
+/// unique; every crate root must occur in the allowlist. Input file and crate
+/// order is nonsemantic and generation canonicalizes it. Compiler generation
+/// additionally requires exactly one selected crate target matching the
+/// artifact.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GenerateDocument {
     /// Logical catalog path for the generated YAML document.
     pub contract_file: CatalogPath,
-    /// User-facing source root written to the document.
+    /// Nonblank user-facing source root written to the document.
     pub root: String,
     /// Exact portable Rust file allowlist owned by the document.
     pub files: Vec<CatalogPath>,
@@ -1231,11 +1408,13 @@ pub struct GenerateDocument {
     pub crates: Vec<RustCrateRoot>,
 }
 
-/// One explicit Rust crate root used by syntax extraction.
+/// One explicit Rust crate root used by Rust extraction.
 ///
 /// This identity is the root of one allowlist-bounded logical module graph.
 /// The source path may be conventional or nonconventional; [`RustCrateKind`]
-/// never derives from the basename.
+/// never derives from the basename. Syntax extraction accepts one or more
+/// unique roots. Compiler extraction requires exactly one root, and its ID,
+/// logical path, and kind must equal the selected artifact target.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct RustCrateRoot {
     /// Stable crate identity within one contract document.
@@ -1261,7 +1440,9 @@ pub enum RustCrateKind {
 /// Rust signature generation emits mandatory-v2 combined YAML with the
 /// selected versioned extraction metadata, explicit typed crate roots, `root`,
 /// an exact `files` allowlist, user-named `signatures`, and nested sketches that
-/// retain file/signature/type linkage and matching policy.
+/// retain file/signature/type linkage and matching policy. Existing semantic
+/// no-ops retain their input bytes exactly; edited documents are losslessly
+/// patched and semantically verified before return.
 ///
 /// # Examples
 ///
@@ -1348,6 +1529,11 @@ pub struct SignatureGenerationCounts {
 }
 
 /// Request for [`SignatureContractKit::resolve_sketches`].
+///
+/// The selected extraction mode must match every signature-bearing document.
+/// Compiler mode requires one document that exactly agrees with the supplied
+/// artifact. It can resolve only items with validated exact provenance;
+/// compiler-generated public items have no source text to return.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResolveSketchesRequest {
     /// Rust source bytes indexed by portable source-relative paths.
@@ -1355,6 +1541,8 @@ pub struct ResolveSketchesRequest {
     /// Combined root-level YAML documents containing links and sketches.
     pub contract_files: FileCatalog,
     /// Rust extraction capability and optional compiler artifact.
+    ///
+    /// Omission during deserialization selects [`RustExtractionInput::Syntax`].
     #[serde(default)]
     pub extraction: RustExtractionInput,
 }
@@ -1390,6 +1578,10 @@ pub struct ResolvedSketchSeed {
 }
 
 /// Request for [`SignatureContractKit::diff`].
+///
+/// Both catalogs are accumulated against one operation's catalog, YAML,
+/// signature, and diagnostic budgets. Only direct root-level `.yml` and
+/// `.yaml` contract entries participate.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiffRequest {
     /// Current contract files to compare.
@@ -1399,9 +1591,18 @@ pub struct DiffRequest {
 }
 
 /// Response returned by [`SignatureContractKit::diff`].
+///
+/// Entries are deterministic and classify differences as source semantics,
+/// extraction context, labels, or document metadata. When multiple physical
+/// groups share one semantic label, exact sorted peers are retained before
+/// residual groups are paired, added, or removed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiffResponse {
-    /// Digest for complete current contract identity, including context.
+    /// Digest for complete current contract identity, including extraction and
+    /// document context.
+    ///
+    /// This digest covers the current catalog only and is independent of entry
+    /// ordering. It is not a digest of the previous catalog or diff payload.
     pub contract_digest: String,
     /// Canonical signature digest format version.
     pub digest_version: u16,
@@ -1411,6 +1612,9 @@ pub struct DiffResponse {
 
 impl DiffResponse {
     /// Returns whether the diff contains at least one semantic entry.
+    ///
+    /// This is exactly `!self.entries.is_empty()`; the current contract digest
+    /// may be nonempty even when this method returns `false`.
     pub fn changed(&self) -> bool {
         !self.entries.is_empty()
     }
@@ -1437,6 +1641,10 @@ impl DiffResponse {
 }
 
 /// One changed top-level signature group reported by [`DiffResponse`].
+///
+/// Entries are ordered by semantic signature label and deterministic digest
+/// pairing. Physical document location is used to disambiguate parsing but is
+/// not itself the displayed semantic label.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DiffEntry {
     /// A signature group exists in the current contracts but not the previous set.

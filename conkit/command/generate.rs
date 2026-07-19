@@ -87,6 +87,12 @@ impl AppCommand for GenerateCommand {
 
 impl<'args, 'context> ContractGeneration<'args, 'context> {
     /// Validates roots and selects the generated-output collision policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when source and contracts paths cannot be resolved for
+    /// overlap validation, overlap one another, or the source root cannot be
+    /// securely opened as a directory.
     fn prepare(
         args: &GenerateArgs,
         selection: GenerationSelection<'args>,

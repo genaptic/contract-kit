@@ -76,6 +76,48 @@ impl LimitCharge {
 }
 
 /// Resource ceilings enforced independently by the sketch domain.
+///
+/// Limits are enforced at input, parsing, normalization, matching, diagnostic,
+/// rendering, and generation boundaries. Catalog and YAML meters are owned by
+/// one complete operation, so multiple request catalogs, physical YAML files,
+/// diff sides, and generation verification reparses cannot reset their
+/// respective budgets. Correctness budgets fail with typed [`LimitExceeded`]
+/// evidence; only the explicitly bounded occurrence-span and excerpt fields
+/// truncate presentation evidence.
+///
+/// # Examples
+///
+/// A zero byte budget stops the operation and preserves the first proven lower
+/// bound plus the participating logical file.
+///
+/// ```
+/// use conkit_sketch::{
+///     CatalogPath, CheckMode, CheckRequest, FileCatalog, LimitResource,
+///     ReportRequest, SketchContractKit, SketchLimits,
+/// };
+///
+/// let source_path = CatalogPath::new("lib.rs")?;
+/// let mut source_files = FileCatalog::new();
+/// source_files.insert(source_path.clone(), b"x".to_vec())?;
+/// let mut limits = SketchLimits::default();
+/// limits.catalog.total_bytes = 0;
+/// let kit = SketchContractKit::builder().with_limits(limits).build()?;
+///
+/// let error = futures_executor::block_on(kit.check(CheckRequest {
+///     source_files,
+///     contract_files: FileCatalog::new(),
+///     report: ReportRequest::None,
+///     mode: CheckMode::Enforce,
+/// }))
+/// .expect_err("one input byte must exceed a zero-byte budget");
+/// let evidence = error.limit_exceeded().expect("typed limit evidence");
+///
+/// assert_eq!(evidence.resource, LimitResource::CatalogTotalBytes);
+/// assert_eq!(evidence.limit, 0);
+/// assert_eq!(evidence.observed_at_least, 1);
+/// assert_eq!(evidence.file.as_ref(), Some(&source_path));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SketchLimits {
     /// In-memory catalog budgets.
@@ -146,6 +188,10 @@ pub enum LimitResource {
 }
 
 /// Typed evidence for one exceeded resource budget.
+///
+/// [`Self::observed_at_least`] is the lower bound proven at the point processing
+/// stopped, not a promise that the complete input was scanned. It saturates
+/// safely when platform-sized counts cannot be represented as [`u64`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LimitExceeded {
     /// Resource that exceeded its configured budget.

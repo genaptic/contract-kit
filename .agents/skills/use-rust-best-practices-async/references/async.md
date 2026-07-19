@@ -14,6 +14,7 @@ Use this reference when designing async APIs, task orchestration, shutdown logic
 - [Design graceful shutdown](#8-design-graceful-shutdown-explicitly)
 - [Use `LocalSet` for non-`Send` futures](#9-use-localset-and-spawn_local-for-send-futures)
 - [Bridge sync and async once](#10-bridge-sync-and-async-at-one-clear-boundary)
+- [Preserve Contract Kit's application and domain boundary](#preserve-contract-kits-application-and-domain-boundary)
 - [Use timeouts and cancellation consciously](#11-use-timeouts-and-cancellation-consciously)
 - [Review async practices](#12-async-dos-and-donts)
 - [Further reading](#further-reading)
@@ -483,6 +484,38 @@ async fn async_main() -> anyhow::Result<()> {
 }
 ```
 
+### Preserve Contract Kit's application and domain boundary
+
+Contract Kit uses async public APIs around synchronous CPU-domain work without
+selecting an async runtime inside either domain crate:
+
+- `CommandContext` builds one application-owned Rayon pool and shares it with
+  `conkit-signature` and `conkit-sketch`.
+- Rayon worker count is a CPU scheduling choice, not a root-operation
+  admission limit. Each domain independently owns its active and pending
+  admission budgets even though both use the same pool.
+- The CLI configures one active root operation and zero pending operations per
+  domain. An operation that cannot acquire active-plus-pending admission is
+  rejected immediately rather than queued without a bound.
+- A future admitted but still waiting for an active permit owns pending
+  capacity. Dropping it releases admission and its body must never run.
+- Dropping a submitted or running future sets the operation's cooperative
+  cancellation probe. Synchronous domain owners check that probe at bounded
+  checkpoints; cancellation does not preempt a Rayon thread.
+- `conkit` owns process cancellation: it races the command future at the
+  application boundary and passes the same cancellation state into CLI-owned
+  compiler extraction. Dropping a raced domain future activates that domain's
+  cooperative cancellation path.
+- Running work retains its active and admission permits until the worker
+  closure completes. The worker releases both permits before waking the
+  runtime-neutral completion future.
+- Public domain futures remain executor-neutral. Production runtime entry is
+  the single `futures_executor::block_on` at the `conkit` application boundary;
+  neither domain crate creates a runtime or blocks on its own future.
+
+Do not replace these independent budgets with the Rayon thread count, a shared
+cross-domain semaphore, an unbounded queue, or Tokio-specific public types.
+
 ## 11. Use timeouts and cancellation consciously
 
 Add timeouts around network or external waits so operations fail clearly instead of hanging forever.
@@ -520,6 +553,9 @@ pub enum TimedFetchError {
 - apply timeouts before enqueueing work, or while waiting for
   side-effect-free reads
 - use native async trait methods for private closed contracts
+- keep Contract Kit's shared CPU pool separate from each domain's independent
+  active and pending admission budgets
+- release active and admission permits before signaling completion
 - bound fan-out
 - own values at spawn boundaries
 - use cancellation tokens and task tracking
@@ -534,6 +570,9 @@ pub enum TimedFetchError {
   sync-engine adapter
 - return a timeout after a non-cancellable write may have started
 - call `block_on` from async code or create nested runtimes
+- add a second production `block_on` below Contract Kit's application boundary
+- describe cooperative cancellation as thread preemption or release a running
+  operation's permits before its worker actually finishes
 - use `block_in_place` where current-thread runtimes or cancellation matter
 - add `async_trait` to closed private enum-dispatch contracts
 - hold guards across `.await` casually

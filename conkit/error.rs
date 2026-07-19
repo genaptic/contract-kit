@@ -1,8 +1,10 @@
 //! Error type for CLI-owned failures.
 //!
-//! Domain crates expose their own typed errors. This module wraps those errors
-//! with filesystem, platform, reporting, archive, and target-selection failures
-//! that only the executable can produce.
+//! Domain crates expose their own typed errors. This module adds the failures
+//! owned by the executable: process cancellation and signal registration,
+//! compiler extraction, bounded catalog reads, portable path handling,
+//! mandatory-v2 YAML layout validation, reports and archives, and generated-
+//! file ownership and reconciliation.
 
 use std::path::PathBuf;
 use std::time::SystemTimeError;
@@ -30,7 +32,7 @@ pub(crate) struct DuplicateContractKey {
     pub(crate) location: serde_saphyr::Location,
 }
 
-/// Errors produced by CLI parsing adapters and filesystem boundaries.
+/// Errors produced by CLI-owned process, parsing, filesystem, and persistence boundaries.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CliError {
     /// Process-level cancellation was requested by the host operating system.

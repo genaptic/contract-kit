@@ -20,6 +20,9 @@ uses Semantic Versioning and tags coordinated workspace releases as
 
 ### Fixed
 
+- Reopen the parent directory relative to its retained `cap-std` capability
+  before Unix durability syncs so Linux does not attempt `sync_all` on an
+  unsyncable `O_PATH` descriptor.
 - Rate-limit live Cargo target-tree inspection, tolerate only transient
   descendant disappearance, and enforce one exact scan after process exit.
 - Treat the pre-rename checkpoint as the final cancellation boundary for

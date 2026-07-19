@@ -57,6 +57,12 @@ impl<'context> ContractCheck<'context> {
     }
 
     /// Validates filesystem inputs and reads the exact catalogs required by a check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid report or overlapping path, an insecure
+    /// or over-budget catalog read, invalid mandatory-v2 layout or extraction
+    /// reconciliation, compiler acquisition failure, or cancellation.
     fn prepare(
         args: &CheckArgs,
         target: ContractTarget,

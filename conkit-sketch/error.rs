@@ -7,8 +7,9 @@ use crate::limits::LimitExceeded;
 /// This wrapper preserves typed lower-level errors internally while presenting
 /// one public error type for builders and async operations. It represents
 /// failures that prevent an operation from producing a response, such as
-/// invalid catalog or contract input, output rendering failures, and worker
-/// failures.
+/// invalid catalog or contract input, full work admission, configured resource
+/// limits, work-capacity overflow, unsafe or unverifiable lossless edits,
+/// output rendering failures, and worker failures.
 ///
 /// Valid check outcomes such as a missing source entry or a non-matching
 /// snippet are returned as [`SketchDiagnostic`](crate::SketchDiagnostic) values
@@ -94,12 +95,19 @@ enum SketchContractKitErrorKind {
 impl SketchContractKitError {
     /// Returns whether the operation was rejected because active plus pending
     /// admission was full.
+    ///
+    /// This is distinct from builder-time work-capacity overflow and from a
+    /// worker failing after admission.
     pub fn is_queue_full(&self) -> bool {
         matches!(&self.kind, SketchContractKitErrorKind::QueueFull)
     }
 
     /// Returns typed resource-limit evidence when a configured budget stopped
     /// the operation.
+    ///
+    /// Returns `None` for queue, validation, rendering, capacity, cancellation,
+    /// and worker failures. [`LimitExceeded::observed_at_least`] is a proven
+    /// lower bound at the point work stopped rather than a final total.
     pub fn limit_exceeded(&self) -> Option<&LimitExceeded> {
         match &self.kind {
             SketchContractKitErrorKind::Limit(error) => Some(error),

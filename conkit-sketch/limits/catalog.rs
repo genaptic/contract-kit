@@ -5,11 +5,17 @@ use crate::work::CancellationProbe;
 use serde::{Deserialize, Serialize};
 
 /// Entry and byte budgets shared by every input catalog in one operation.
+///
+/// Check charges the source and contract catalogs to one meter; diff charges
+/// current and previous contract catalogs to one meter; generation charges its
+/// complete contract catalog. Entry and aggregate-byte counters therefore do
+/// not restart at request-field boundaries. Per-file bytes are checked for each
+/// entry before its bytes contribute to the aggregate counter.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CatalogLimits {
-    /// Maximum number of catalog entries.
+    /// Maximum number of entries accumulated across all request catalogs.
     pub entry_count: u64,
-    /// Maximum aggregate bytes across catalog entries.
+    /// Maximum aggregate bytes accumulated across all request catalogs.
     pub total_bytes: u64,
     /// Maximum bytes in one catalog entry.
     pub per_file_bytes: u64,

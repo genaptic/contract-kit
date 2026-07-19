@@ -3,6 +3,13 @@ use crate::files::CatalogPath;
 use serde::{Deserialize, Serialize};
 
 /// Sketch identity, normalization, matching-work, and retained-evidence budgets.
+///
+/// Line comparisons and encountered occurrence candidates accumulate across
+/// every source group and sketch in one complete check. Crossing either ceiling
+/// is a hard [`LimitExceeded`] operation failure rather than a truncated search
+/// or a false match result. `retained_occurrence_spans` is different: matching
+/// still computes the exact occurrence count and truncates only the returned
+/// span vector.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MatchingLimits {
     /// Maximum parsed sketch contracts.
@@ -24,6 +31,10 @@ pub struct MatchingLimits {
     /// Maximum exact occurrences encountered across one complete check operation.
     pub occurrence_candidates: u64,
     /// Maximum occurrence spans retained as diagnostic evidence.
+    ///
+    /// This does not cap occurrence counting. Additional spans set
+    /// [`SketchDiagnostic::OccurrenceMismatch::spans_truncated`](crate::SketchDiagnostic::OccurrenceMismatch)
+    /// while `actual` remains exact.
     pub retained_occurrence_spans: u64,
 }
 

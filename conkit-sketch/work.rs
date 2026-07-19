@@ -64,6 +64,32 @@ impl Default for WorkOptions {
 }
 
 /// Rayon worker-pool ownership policy.
+///
+/// # Examples
+///
+/// Reuse an application-owned pool instead of creating another worker set.
+///
+/// ```
+/// use conkit_sketch::{SketchContractKit, WorkOptions, WorkerPool};
+/// use rayon::ThreadPoolBuilder;
+/// use std::num::NonZeroUsize;
+/// use std::sync::Arc;
+///
+/// let shared = Arc::new(ThreadPoolBuilder::new().num_threads(1).build()?);
+/// let kit = SketchContractKit::builder()
+///     .with_work_options(WorkOptions {
+///         pool: WorkerPool::Shared {
+///             pool: Arc::clone(&shared),
+///         },
+///         max_in_flight_operations: NonZeroUsize::MIN,
+///         max_pending_operations: 1,
+///     })
+///     .build()?;
+///
+/// assert_eq!(shared.current_num_threads(), 1);
+/// # let _ = kit;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone)]
 pub enum WorkerPool {
     /// Build a kit-owned pool using Rayon's platform default worker count.
@@ -73,8 +99,10 @@ pub enum WorkerPool {
         /// Number of Rayon workers in the dedicated pool.
         worker_threads: NonZeroUsize,
     },
-    /// Reuse an application-owned pool, allowing both Contract Kit domains to
-    /// share one worker set.
+    /// Reuse an application-owned pool without creating another worker set.
+    ///
+    /// The caller retains ownership and may inject the same pool into other
+    /// domain handles.
     Shared {
         /// Application-owned Rayon pool.
         pool: Arc<ThreadPool>,

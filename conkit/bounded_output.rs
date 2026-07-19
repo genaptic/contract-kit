@@ -1,4 +1,8 @@
 //! Cancellation-aware byte ceilings for concrete CLI output writers.
+//!
+//! The wrapper records the first cancellation or size breach and keeps that
+//! failure sticky for later writes and flushes, allowing archive and report
+//! owners to translate the same boundary evidence into their distinct errors.
 
 use std::io::Write;
 
@@ -9,7 +13,9 @@ const WRITE_CHUNK_BYTES: usize = 64 * 1024;
 /// First boundary failure observed while writing one output.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BoundedOutputFailure {
+    /// Root-operation cancellation was observed before another boundary failure.
     Cancelled,
+    /// The requested write would cross the ceiling, with a lower-bound byte count.
     Limit { observed_at_least: u64 },
 }
 

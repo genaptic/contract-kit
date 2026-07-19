@@ -1,7 +1,8 @@
 //! Top-level application runtime for the executable.
 //!
-//! This module keeps `main` thin by owning clap parsing, platform-specific
-//! executable naming, context initialization, and command dispatch.
+//! This module keeps `main` thin by assigning the stable `conkit` display name,
+//! parsing clap input once, installing process cancellation, initializing the
+//! shared command context, and dispatching exactly one typed command.
 
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches};
@@ -21,7 +22,8 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns an error if application construction or command execution fails.
+    /// Returns an error if process signal registration, shared-pool or domain
+    /// initialization, cancellation, or the selected command fails.
     pub(crate) async fn from_env_and_run() -> Result<()> {
         Self::from_env()?.run().await
     }
@@ -34,8 +36,10 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns an error if validated clap matches cannot be converted to the
-    /// typed CLI state or runtime dependency initialization fails.
+    /// Returns an error if validated clap matches cannot be converted to typed
+    /// CLI state, the process signal handler cannot be installed, available
+    /// parallelism cannot be queried, the shared Rayon pool cannot be built, or
+    /// either domain service cannot be initialized.
     pub(crate) fn from_env() -> Result<Self> {
         let matches = Cli::command()
             .name(crate::platform::EXECUTABLE_NAME)
@@ -51,7 +55,8 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns an error if a domain adapter cannot be initialized.
+    /// Returns an error if available parallelism cannot be queried, the shared
+    /// Rayon pool cannot be built, or either domain service cannot be initialized.
     pub(crate) fn from_cli(cli: Cli, cancellation: ApplicationCancellation) -> Result<Self> {
         let context = CommandContext::initialize(cancellation)?;
 
@@ -62,7 +67,9 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns an error reported by the selected command.
+    /// Returns an error when process cancellation wins the command race or the
+    /// selected command reports a validation, domain, persistence, reporting,
+    /// archive, or output failure.
     pub(crate) async fn run(&self) -> Result<()> {
         self.context
             .cancellation()

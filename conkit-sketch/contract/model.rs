@@ -9,10 +9,19 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Versioned normalization applied before matching one sketch against source bytes.
+///
+/// The same policy is applied to contract snippets, generation-seed validation,
+/// referenced source bytes, semantic code comparison, and code digests.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SketchNormalization {
-    /// Normalize line endings while preserving all other line bytes exactly.
+    /// Convert CRLF to LF and treat one final LF or CRLF terminator as
+    /// nonsemantic.
+    ///
+    /// Additional final blank lines, isolated carriage returns, indentation,
+    /// tabs, leading/internal/trailing horizontal bytes, internal blank lines,
+    /// and arbitrary invalid UTF-8 bytes are preserved exactly. The policy does
+    /// not switch algorithms based on whether a line is valid UTF-8.
     ExactLinesV1,
 }
 
@@ -31,6 +40,9 @@ pub enum SketchOccurrence {
     /// Accept the first matching occurrence, including when duplicates exist.
     AtLeastOne,
     /// Require exactly one occurrence and reject both absence and duplicates.
+    ///
+    /// Every contiguous start position is considered, so overlapping matches
+    /// count as separate occurrences.
     ExactlyOne,
 }
 
@@ -44,6 +56,25 @@ impl SketchOccurrence {
 }
 
 /// Explicit, versioned matching semantics stored with every sketch contract.
+///
+/// Combined v2 documents require
+/// [`SketchNormalization::ExactLinesV1`] and explicitly choose an occurrence
+/// policy. Accessors expose both values without requiring callers to depend on
+/// the private contract representation.
+///
+/// # Examples
+///
+/// ```
+/// use conkit_sketch::{SketchMatchPolicy, SketchNormalization, SketchOccurrence};
+///
+/// let policy = SketchMatchPolicy::new(
+///     SketchNormalization::ExactLinesV1,
+///     SketchOccurrence::ExactlyOne,
+/// );
+///
+/// assert_eq!(policy.normalization(), SketchNormalization::ExactLinesV1);
+/// assert_eq!(policy.occurrence(), SketchOccurrence::ExactlyOne);
+/// ```
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct SketchMatchPolicy {

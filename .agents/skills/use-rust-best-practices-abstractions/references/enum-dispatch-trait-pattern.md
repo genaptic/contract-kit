@@ -1,7 +1,9 @@
 # Enum-dispatch trait pattern
 
 Use this reference before adding, deleting, or refactoring enum dispatch over a
-closed implementation family.
+closed implementation family. First establish that the family has multiple
+real concrete implementations; this pattern is not a default wrapper for a
+single behavior owner.
 
 ## Contents
 
@@ -56,18 +58,27 @@ Use a trait object when the implementation set is open at runtime, heterogeneous
 values must be stored behind one handle, and dynamic dispatch is an intentional
 part of the design.
 
-Use enum dispatch plus a private trait when the implementation family is closed
-inside the crate and the public root handle is the portable surface. In
-`conkit`, exported root dispatchers use opaque public structs over private
-inner enums so callers cannot name variants. This opacity wrapper is only for
-public exports; crate-private internal dispatch enums do not need struct
-wrappers when they are not exported. These private enums are still dispatch
-machinery, not a license to create reusable implementation-family identity,
+Use enum dispatch plus a private trait only when multiple concrete
+implementations already form a closed family inside the crate and callers
+benefit from one exhaustive routing surface. Exported root dispatchers can use
+opaque public structs over private inner enums so callers cannot name
+variants. This opacity wrapper is only for public exports; crate-private
+internal dispatch enums do not need struct wrappers. These private enums are
+still dispatch machinery, not a license to create reusable family identity,
 provenance, capability, diagnostic-label, or error-label utilities.
+
+In Contract Kit, `RustExtractionBackend` is the current closed family: syntax
+and compiler extraction implement the same private contract behind
+`RustBackend`. `SketchContractKit` remains a direct concrete owner and should
+not acquire this pattern unless a second real implementation appears.
 
 ## 3. Required shape
 
-1. Define one implementation-agnostic `pub(crate)` trait for the behavior family.
+Apply the following shape only after the decision checklist establishes a real
+closed multi-implementation family:
+
+1. Define one implementation-agnostic private or `pub(crate)` trait for the
+   behavior family.
 2. For exported dispatchers, expose a public struct with a private inner enum.
    For crate-private dispatchers, a plain private enum is enough.
 3. Make each private enum variant wrap a concrete implementation struct.
@@ -75,18 +86,17 @@ provenance, capability, diagnostic-label, or error-label utilities.
    subtree.
 5. Implement the trait for the public handle or private dispatcher enum in the
    dispatcher module using explicit, exhaustive `match` arms whose arms call
-   receiver methods on payloads that implement the same trait. In `conkit`,
-   matches over implementation families such as contract parsers, signature
-   matchers, sketch runners, or output emitters must live only in dispatcher
-   files that explicitly own that closed family.
+   receiver methods on payloads that implement the same trait. In Contract
+   Kit, the current domain example is `RustBackend` routing syntax/compiler
+   extraction in its owning backend module.
 6. Do not keep same-name inherent forwarding methods as the operation parity
    surface; the private trait impl on the receiver is the parity surface.
 7. Keep shared contract modules limited to implementation-agnostic traits, shared
    handles, and default helpers.
 8. Keep public builders/configs responsible for choosing and validating the
    concrete enum variant.
-9. Cover the contract with focused tests that require trait definitions,
-   opaque public handles for exported dispatchers, concrete impl placement,
+9. Cover the contract with focused tests that require the trait definition,
+   appropriate public opacity when exported, concrete impl placement,
    receiver-method dispatch, and the absence of macro-generated replacements.
 10. Keep implementation-family facts inside the owning payload or documented
     data/config type. Do not introduce shared `*ParserKind`, `*RunnerKind`,
@@ -306,7 +316,10 @@ talking to the owning payload or the private dispatch trait.
 
 ## 7. Review checklist
 
-- Does every behavior-dispatch enum have a unique private trait contract?
+- Does the family have at least two real implementations, or should it remain
+  concrete?
+- For a justified behavior-dispatch enum, does one unique private trait define
+  the contract?
 - Does every enum variant wrap a concrete struct rather than loose family
   data?
 - Does the enum trait impl use explicit match arms for every variant?
@@ -319,3 +332,5 @@ talking to the owning payload or the private dispatch trait.
   absent for implementation families?
 - Do tests fail if the trait, enum impl, concrete impl placement, or explicit
   match dispatch disappears?
+- In Contract Kit, does `RustExtractionBackend` remain the syntax/compiler
+  dispatcher while `SketchContractKit` remains direct?

@@ -1,4 +1,8 @@
 //! Aggregate binding between combined documents and source-tree paths.
+//!
+//! A loaded layout retains original combined-document bytes, builds the exact
+//! duplicate-free union of declared source allowlists, and reconciles one
+//! syntax or compiler extraction across every signature-bearing document.
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
@@ -46,6 +50,12 @@ impl<'cancellation> ContractFormatValidator<'cancellation> {
 
     /// Validates every direct-root YAML entry and retains cumulative accounting
     /// for a subsequent catalog in the same operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on cancellation, malformed or unsupported combined-
+    /// document YAML, invalid mandatory-v2 headers, or an operation-wide YAML
+    /// resource-limit breach.
     pub(crate) fn validate(&mut self, catalog: &FileCatalog) -> Result<(), CliError> {
         for (catalog_path, bytes) in catalog.iter() {
             self.yaml.cancellation().checkpoint()?;
@@ -62,13 +72,20 @@ impl<'cancellation> ContractFormatValidator<'cancellation> {
 /// loaded layout.
 #[derive(Clone, Debug)]
 pub(crate) enum LayoutExtraction {
+    /// Portable syntax extraction with the aggregate, duplicate-free crate roots.
     Syntax {
+        /// Logical roots declared across participating documents.
         crates: Vec<RustCrateRoot>,
+        /// First physical document that declared this extraction family.
         declared_at: DocumentOrigin,
     },
+    /// Cargo/rustdoc extraction with exact persisted compiler provenance.
     Compiler {
+        /// The single aggregate logical crate root required by compiler mode.
         crates: Vec<RustCrateRoot>,
+        /// Compiler, Cargo target, feature, and cfg facts persisted in contract v2.
         context: ContractCompilerContext,
+        /// First physical document that declared this extraction family.
         declared_at: DocumentOrigin,
     },
 }
@@ -175,6 +192,12 @@ impl LayoutExtraction {
 
     /// Rejects runtime Cargo context that differs from a persisted compiler
     /// document before the artifact enters an asynchronous domain request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on cancellation, when the layout is not compiler-backed,
+    /// when the artifact does not contain exactly one crate, or when any
+    /// persisted schema, extractor, compiler, target, feature, or cfg fact differs.
     pub(crate) fn validate_compiler_artifact(
         &self,
         artifact: &conkit_signature::RustCompilerArtifact,
@@ -379,6 +402,12 @@ impl ContractLayout {
 
     /// Reads the exact existing allowlist union or, for a fresh layout, the
     /// Rust catalog from which a syntax or compiler target will be selected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if source traversal or an exact allowlisted read fails,
+    /// cancellation is requested, a catalog limit is exceeded, or a logical
+    /// source path cannot be represented.
     pub(crate) fn read_signature_sources(
         &self,
         source: &SourceTree,
@@ -394,6 +423,11 @@ impl ContractLayout {
     /// Borrows the canonical extraction declared by the loaded layout.
     /// Compiler extraction additionally requires exactly one distinct
     /// aggregate crate root before source extraction or Cargo execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on cancellation or when participating documents declare
+    /// conflicting extraction families, compiler contexts, or aggregate roots.
     pub(crate) fn extraction(
         &self,
         cancellation: &ApplicationCancellation,

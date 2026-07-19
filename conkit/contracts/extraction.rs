@@ -1,4 +1,8 @@
 //! Typed CLI extraction selection and requested-versus-persisted reconciliation.
+//!
+//! Syntax and compiler are a closed capability choice. Existing extraction
+//! metadata must agree with the command, and conflicts fail before acquisition;
+//! neither direction has an implicit fallback.
 
 use std::path::Path;
 
@@ -12,7 +16,9 @@ use crate::error::CliError;
 /// One extraction capability selected after clap parsing and validation.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RequestedExtraction<'args> {
+    /// Parse the exact allowlisted Rust sources without invoking Cargo.
     Syntax,
+    /// Acquire one compiler artifact using validated Cargo-native arguments.
     Compiler(CompilerRequest<'args>),
 }
 
@@ -67,31 +73,45 @@ impl<'args> CompilerRequest<'args> {
 /// One mutually exclusive Cargo target selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CargoTarget<'args> {
+    /// Require Cargo metadata to identify one unambiguous supported target.
     Automatic,
+    /// Select the package's library target.
     Library,
+    /// Select the package binary with this exact Cargo target name.
     Binary(&'args str),
 }
 
 /// One mutually exclusive Cargo feature selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CargoFeatures<'args> {
+    /// Use the package's default Cargo features.
     Default,
+    /// Select explicit features and optionally retain the default set.
     Selected {
+        /// Duplicate-free feature names in clap input order.
         names: &'args [String],
+        /// Whether Cargo should also activate the package default features.
         include_default: bool,
     },
+    /// Activate every Cargo feature while disabling the separate default toggle.
     All,
 }
 
 /// Operation policy applied while reconciling requested and persisted modes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ExtractionUse<'layout> {
+    /// Reconcile a check request with the loaded layout, without establishing metadata.
     Check {
+        /// Canonical extraction declared by signature-bearing documents, if any.
         persisted: Option<&'layout LayoutExtraction>,
     },
+    /// Reconcile generation, which may establish extraction only for a fresh layout.
     Generation {
+        /// Whether the loaded contracts layout contains no combined documents.
         fresh: bool,
+        /// Canonical extraction declared by an existing layout, if any.
         persisted: Option<&'layout LayoutExtraction>,
+        /// Explicit roots accepted only while establishing a fresh layout.
         explicit_crates: &'layout [RustCrateRoot],
     },
 }
@@ -104,8 +124,11 @@ pub(crate) struct SignatureExtractionCoordinator<'args, 'operation> {
 
 /// Opaque validated work remaining after requested and persisted modes agree.
 pub(crate) enum ExtractionDecision<'args, 'layout> {
+    /// Submit portable syntax extraction with roots used only for fresh generation.
     Syntax(&'layout [RustCrateRoot]),
+    /// Acquire a new compiler artifact, optionally checking an explicit fresh root.
     Establish(CompilerRequest<'args>, Option<&'layout [RustCrateRoot]>),
+    /// Acquire a compiler artifact and require exact agreement with persisted context.
     Validate(CompilerRequest<'args>, &'layout LayoutExtraction),
 }
 
@@ -131,6 +154,11 @@ impl<'args, 'operation> SignatureExtractionCoordinator<'args, 'operation> {
     }
 
     /// Rejects existing-layout crate overrides at their historical pre-read boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when explicit crate roots attempt to override an
+    /// existing contracts layout.
     pub(crate) fn validate_generation_roots(
         &self,
         fresh: bool,
@@ -145,6 +173,12 @@ impl<'args, 'operation> SignatureExtractionCoordinator<'args, 'operation> {
     }
 
     /// Reconciles the one requested capability with persisted layout facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when requested syntax/compiler selection conflicts with
+    /// persisted extraction, or compiler extraction would be established where
+    /// the operation is not allowed to establish it.
     pub(crate) fn reconcile<'layout>(
         &self,
         usage: ExtractionUse<'layout>,
@@ -205,6 +239,12 @@ impl<'args, 'operation> SignatureExtractionCoordinator<'args, 'operation> {
 
 impl<'args, 'layout> ExtractionDecision<'args, 'layout> {
     /// Performs the sole compiler acquisition path before domain submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compiler-root validation, warning output, artifact
+    /// extraction, catalog accounting, or exact persisted-context validation
+    /// fails.
     pub(crate) fn acquire(
         self,
         context: &CommandContext,

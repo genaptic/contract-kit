@@ -4,6 +4,14 @@ use crate::work::CancellationProbe;
 use serde::{Deserialize, Serialize};
 
 /// Resource budgets applied to every signature-domain operation.
+///
+/// A kit owns one immutable limit set. Each public operation starts fresh
+/// usage counters and accumulates work across the complete request: all input
+/// catalogs, both contract catalogs in a diff, source and contract inventory
+/// acceptance, compiler artifact structures, diagnostics or diff entries,
+/// changed-document verification reparses, and returned bytes. Limits stop
+/// work with [`LimitExceeded`] evidence; they never truncate semantic input or
+/// output silently.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SignatureLimits {
     /// In-memory catalog budgets.
@@ -19,13 +27,17 @@ pub struct SignatureLimits {
 }
 
 /// Entry and byte budgets shared by every input catalog in one operation.
+///
+/// `entry_count` and `total_bytes` accumulate across all catalogs accepted by
+/// one request rather than restarting for source, contract, or each side of a
+/// diff. `per_file_bytes` is checked independently for every logical entry.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CatalogLimits {
-    /// Maximum number of entries.
+    /// Maximum entries encountered across all input catalogs in one operation.
     pub entry_count: u64,
-    /// Maximum aggregate bytes across entries.
+    /// Maximum aggregate bytes across all input catalog entries in one operation.
     pub total_bytes: u64,
-    /// Maximum bytes in one entry.
+    /// Maximum bytes in one logical catalog entry.
     pub per_file_bytes: u64,
 }
 
@@ -109,11 +121,17 @@ impl CatalogUsage<'_> {
 }
 
 /// YAML stream and semantic-tree budgets.
+///
+/// Document, node, alias, and scalar-materialization counts accumulate across
+/// every participating physical YAML file, both sides of a diff, and every
+/// changed-document verification parse. Nesting depth is a per-stream maximum;
+/// it resets for each physical YAML stream. Raw events are charged once, and
+/// semantic alias replay charges only materialization beyond that raw parse.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct YamlLimits {
     /// Maximum documents parsed or verified across one complete operation.
     pub documents: u64,
-    /// Maximum YAML nesting depth in one physical stream.
+    /// Maximum YAML nesting depth in any one physical stream.
     pub depth: u64,
     /// Maximum semantic nodes materialized across one complete operation.
     pub nodes: u64,
@@ -548,15 +566,21 @@ impl YamlUsage<'_> {
 }
 
 /// Rust source and extracted-item budgets.
+///
+/// Source participation is bounded by each document's exact allowlist. Item
+/// and grouped-signature counters are operation-owned and aggregate contract
+/// acceptance with source extraction instead of granting a fresh budget to
+/// each phase. For compiler extraction, `compiler_nodes` is the combined count
+/// of rustdoc index entries, path summaries, and host source-map entries.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RustExtractionLimits {
-    /// Maximum participating Rust source files.
+    /// Maximum participating Rust source files in one extraction.
     pub source_files: u64,
     /// Maximum bytes in one participating Rust source file.
     pub per_file_bytes: u64,
-    /// Maximum extracted Rust items.
+    /// Maximum extracted or contract-accepted Rust items in one operation.
     pub items: u64,
-    /// Maximum grouped signatures.
+    /// Maximum grouped signatures accepted across one operation.
     pub signatures: u64,
     /// Maximum bytes in one compiler-produced rustdoc JSON artifact.
     pub compiler_artifact_bytes: u64,
@@ -695,11 +719,16 @@ impl RustExtractionUsage<'_> {
 }
 
 /// Diagnostic collection and evidence budgets.
+///
+/// The same count and serialized-byte ceilings bound a check's comparison
+/// diagnostics plus syntax-capability warnings, and a diff's complete entry
+/// sequence. Evidence retained while constructing typed failures is bounded by
+/// the same nominal limits before it reaches a response or error message.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticLimits {
-    /// Maximum correctness diagnostics.
+    /// Maximum check diagnostics, capability warnings, or diff entries.
     pub count: u64,
-    /// Maximum serialized diagnostic bytes.
+    /// Maximum serialized bytes for the complete diagnostic or diff sequence.
     pub serialized_bytes: u64,
 }
 
@@ -899,12 +928,15 @@ impl std::io::Write for DiagnosticByteCounter {
 /// Generated-output budgets.
 ///
 /// Returned output and simultaneously retained scratch each default to
-/// 512 MiB and are enforced independently.
+/// 512 MiB and are enforced independently. Returned bytes accumulate across
+/// the operation's output catalog. Scratch measures only generated preview or
+/// edit text retained at the same time, releases reservations as each document
+/// finishes, and does not borrow unused capacity from returned output.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutputLimits {
     /// Maximum aggregate bytes returned by one operation.
     pub generated_bytes: u64,
-    /// Maximum simultaneously retained generated or edit-text bytes.
+    /// Maximum simultaneously retained generated preview or edit-text bytes.
     #[serde(default = "OutputLimits::default_scratch_bytes")]
     pub scratch_bytes: u64,
 }
@@ -1302,6 +1334,11 @@ impl Drop for ScratchText<'_, '_> {
 }
 
 /// Resource whose configured budget was exceeded.
+///
+/// Variants name the accounting boundary represented by
+/// [`LimitExceeded::resource`]. Count and aggregate-byte variants are generally
+/// operation-wide; depth and per-file byte variants identify a single stream
+/// or logical catalog entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LimitResource {
     /// Catalog entry count.
@@ -1332,9 +1369,9 @@ pub enum LimitResource {
     RustItemCount,
     /// Grouped signature count.
     SignatureCount,
-    /// Correctness diagnostic count.
+    /// Check diagnostic, capability-warning, or diff-entry count.
     DiagnosticCount,
-    /// Serialized diagnostic bytes.
+    /// Serialized diagnostic or diff-entry bytes.
     DiagnosticBytes,
     /// Generated output bytes.
     GeneratedOutputBytes,
@@ -1343,6 +1380,12 @@ pub enum LimitResource {
 }
 
 /// Typed evidence for one exceeded resource budget.
+///
+/// `observed_at_least` is a proven lower bound at the first detected crossing,
+/// not a promise that the entire rejected input was scanned. For incrementally
+/// materialized structures it may therefore be `limit + 1`. `file` identifies
+/// the logical catalog entry responsible when the accounting boundary has
+/// precise file context; operation-wide breaches leave it as `None`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LimitExceeded {
     /// Resource that exceeded its budget.

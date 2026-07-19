@@ -1,4 +1,10 @@
 //! Combined contract-document facade and physical-file orchestration.
+//!
+//! This module recognizes direct-root `.yml` and `.yaml` files, parses only the
+//! CLI-owned mandatory-v2 header, binds each declared root to the selected
+//! source tree, and retains original bytes. Its YAML child owns operation-wide
+//! raw and semantic resource accounting; signature and sketch payload semantics
+//! remain in their domain crates.
 
 mod header;
 pub(super) mod yaml;

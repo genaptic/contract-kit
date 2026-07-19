@@ -1,4 +1,10 @@
 //! Contracts-root catalog access and generated-document persistence.
+//!
+//! The store reads the complete non-metadata catalog through verified handles,
+//! exposes reserved ownership capabilities, and hands baseline-bound generated
+//! documents to runtime reconciliation. Each generated document is replaced
+//! individually and atomically; multi-file generation is coordinated by the
+//! digest-backed ownership journal rather than described as one atomic write.
 
 use std::ffi::OsStr;
 use std::io::{ErrorKind, Write};
@@ -242,6 +248,12 @@ impl ContractsStore {
     }
 
     /// Reads the required contracts catalog against a caller-owned operation budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the root, reserved namespace, or a participating file
+    /// cannot be traversed and read securely, cancellation is requested, a
+    /// catalog limit is exceeded, or a logical path cannot be represented.
     pub(crate) fn read_with_budget(
         &self,
         budget: &mut CatalogReadBudget,
@@ -300,6 +312,11 @@ impl ContractsStore {
     }
 
     /// Reads the optional contracts catalog against a caller-owned operation budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if root absence cannot be determined or a present
+    /// contracts catalog cannot be securely validated and read within budget.
     pub(crate) fn read_optional_with_budget(
         &self,
         budget: &mut CatalogReadBudget,
@@ -312,6 +329,12 @@ impl ContractsStore {
     }
 
     /// Reconciles generated documents against the caller's complete operation ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if ownership recovery, locking, baseline validation,
+    /// reservation, mutation, rollback, or final verification fails, or if the
+    /// operation is canceled or exceeds its catalog budget.
     pub(crate) fn write_generated_with_budget(
         &self,
         generated: GeneratedContracts,
@@ -428,6 +451,11 @@ impl ContractsStore {
 
     /// Resolves the existing ownership-manifest name without creating the
     /// selected root or reserved metadata directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if root absence cannot be determined or the existing
+    /// metadata path cannot be securely resolved.
     pub(super) fn existing_ownership_leaf(&self) -> Result<Option<CatalogLeaf>, CliError> {
         if self.directory.is_lexically_absent()? {
             return Ok(None);
@@ -445,6 +473,11 @@ impl ContractsStore {
 
     /// Resolves the ownership-manifest name and creates its anchored metadata
     /// parent when persistence is required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata path is invalid or its root and parent
+    /// directories cannot be securely opened or created.
     pub(super) fn ownership_leaf_for_write(&self) -> Result<CatalogLeaf, CliError> {
         let relative = Path::new(OwnershipManifest::DIRECTORY).join(OwnershipManifest::FILE_NAME);
         self.directory
@@ -452,6 +485,11 @@ impl ContractsStore {
     }
 
     /// Resolves the capability-relative generation-lock name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock path is invalid or its root and parent
+    /// directories cannot be securely opened or created.
     pub(super) fn generation_lock_leaf(&self) -> Result<CatalogLeaf, CliError> {
         let relative = Path::new(OwnershipManifest::DIRECTORY).join(GenerationLock::FILE_NAME);
         self.directory
@@ -459,6 +497,11 @@ impl ContractsStore {
     }
 
     /// Maps one logical catalog path to a portable relative filesystem path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any logical component is not a portable host-file
+    /// name.
     fn output_relative_for(&self, logical: &CatalogPath) -> Result<PathBuf, CliError> {
         let mut path = PathBuf::new();
         for component in logical.as_str().split('/') {
@@ -496,6 +539,11 @@ impl ContractsStore {
     /// budget and derives alias identity from a clone of that same opened
     /// handle. Metadata length is only an early check; the actual read is
     /// capped at the remaining limit plus one evidence byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on cancellation or a catalog-limit breach, or when the
+    /// anchored name cannot be securely opened, identity-bound, or read.
     pub(super) fn read_leaf(
         &self,
         leaf: &CatalogLeaf,

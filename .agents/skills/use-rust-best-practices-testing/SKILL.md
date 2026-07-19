@@ -30,9 +30,16 @@ strategy.
    with real dependencies.
 4. Add doctests for public APIs that benefit from executable examples.
 5. Use dedicated workspace e2e crates or app boundaries for full-system tests.
-6. For enum-dispatch families, add focused structural tests that fail if
-   private traits or explicit enum impls disappear, owning-module concrete
-   impls move, or restoration TODO markers return.
+6. In Contract Kit, keep structural checks focused on the real dispatch
+   contracts: native `AppCommand` dispatch in `conkit` and the private
+   `RustExtractionBackend` syntax/compiler family in `conkit-signature`.
+7. Centralize workspace source and dependency policy in
+   `conkit/tests/dependency_policy.rs`; do not restore parallel source scanners
+   in the domain crates.
+8. Cover nominal resource limits at input, parsing, extraction, and output
+   boundaries. Cover active and pending admission independently, immediate
+   saturation, queued-drop release, cooperative running cancellation, and
+   permit release before completion becomes observable.
 
 ## Output Rules
 
@@ -44,9 +51,13 @@ strategy.
 - E2E tests should validate the external contract, not internal details.
 - For `conkit`, do not invoke the `rust[c]` executable directly from tests; use
   Cargo-level validation, doctests, package tests, and scenario runners.
-- Structural tests should enforce enum-dispatch trait placement and reject
-  macro-generated replacements, dispatch-contract UFCS calls, catch-all dispatcher arms,
-  and stale restoration TODO markers.
+- Structural tests should enforce the actual `AppCommand` and
+  `RustExtractionBackend` topology, including receiver-style dispatch and
+  exhaustive arms, without imposing enum dispatch on direct owners such as
+  `SketchContractKit`.
+- Keep workspace dependency/source policy in
+  `conkit/tests/dependency_policy.rs`; do not duplicate it in domain source
+  scanners.
 
 ## References
 

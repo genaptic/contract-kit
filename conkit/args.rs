@@ -1,8 +1,10 @@
 //! Clap grammar for the `conkit` executable.
 //!
 //! The types in this module describe the stable command-line interface only.
-//! They intentionally carry raw `PathBuf` values and simple flags; command
-//! execution modules are responsible for converting parsed input into domain
+//! They retain raw `PathBuf` values and simple flags while validating the
+//! relationships between syntax/compiler selection and Cargo-only options,
+//! concrete Cargo targets and features, and repeatable typed crate roots.
+//! Command execution modules convert the resulting parser state into domain
 //! requests.
 
 use std::collections::BTreeSet;
@@ -240,6 +242,11 @@ pub(crate) struct SignatureOptions {
 
 impl SignatureOptions {
     /// Converts clap state into the one closed extraction request used at runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Cargo-only options accompany syntax extraction,
+    /// compiler extraction lacks a manifest, or a Cargo feature is repeated.
     pub(crate) fn requested_extraction(
         &self,
     ) -> Result<RequestedExtraction<'_>, SignatureOptionsError> {
@@ -428,6 +435,11 @@ pub(crate) struct CrateRootArg {
 
 impl CrateRootArg {
     /// Converts the CLI value into the signature domain's logical-path DTO.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the parsed root is not a valid portable relative
+    /// catalog path.
     pub(crate) fn to_domain(
         &self,
     ) -> Result<conkit_signature::RustCrateRoot, conkit_signature::FileCatalogError> {

@@ -14,8 +14,8 @@ agents and reviewers keep implementation changes aligned with agreed intent.
 The CLI generates contracts from a source tree, checks source against an
 existing contract catalog, archives catalogs, and compares the current catalog
 with an archive. Initial signature support targets Rust. Sketches are
-language-neutral snippets checked by normalized line matching, and both
-contract families live in the same combined contract documents.
+language-neutral snippets checked with the required `exact_lines_v1` policy,
+and both contract families live in the same combined contract documents.
 
 <a id="releases-and-api-documentation"></a>
 
@@ -134,8 +134,9 @@ the strict check to expose implementation drift before review or merge.
   parameters and return types, associated items, foreign items, reexports,
   and implementation ownership.
 - **Sketches** attach an opt-in code snippet to a named signature. Matching
-  normalizes line endings only, preserving indentation, tabs, blank lines,
-  horizontal whitespace, comments, and all other non-line-ending bytes.
+  normalizes CRLF/LF spelling and one final line terminator only. Line order,
+  indentation, tabs, blank lines, horizontal whitespace, comments, and all
+  other bytes remain semantic.
 
 Use `all` to operate on both families, or select `signatures` or `sketches`
 when only one family should participate.

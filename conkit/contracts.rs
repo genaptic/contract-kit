@@ -1,8 +1,11 @@
 //! CLI-owned contract routing, document layout, and sketch adaptation.
 //!
 //! The CLI accepts commands that target signatures, sketches, or all families.
-//! These types keep that routing local to the executable instead of leaking
-//! clap-specific enums into domain crates.
+//! This facade keeps target routing, mandatory-v2 combined-document headers,
+//! operation-wide YAML accounting, exact source allowlists, requested-versus-
+//! persisted extraction reconciliation, and signature-to-sketch adaptation at
+//! the executable boundary instead of leaking clap or filesystem state into
+//! either domain crate.
 
 mod document;
 mod extraction;

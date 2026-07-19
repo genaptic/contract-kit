@@ -2,6 +2,13 @@
 //!
 //! Source reads, contracts persistence, path security, persisted ownership,
 //! and runtime reconciliation each have one concrete owner below this facade.
+//! One mutable ledger cumulatively accounts traversal, participating entries,
+//! actual bytes, and cancellation across every catalog input in a command.
+//! Descendant paths are component- and containment-checked, opened without
+//! following their final symlink or reparse point, compared with current path
+//! identity, and read through that same verified handle. Generation recovery,
+//! baseline revalidation, reservations, mutation, rollback, and final ownership
+//! verification stay in reconciliation rather than in either domain crate.
 
 use std::fmt;
 use std::io::Read;
@@ -138,6 +145,10 @@ impl CatalogReadBudget {
     const READ_CHUNK_BYTES: usize = 64 * 1024;
 
     /// Stops a synchronous catalog boundary when the root operation was canceled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when process cancellation has been requested.
     pub(crate) fn checkpoint(&self) -> Result<(), CliError> {
         self.cancellation.checkpoint()
     }
@@ -148,6 +159,11 @@ impl CatalogReadBudget {
     }
 
     /// Reads one already-opened file in bounded chunks and commits its actual bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on cancellation or I/O failure, or when the file or
+    /// cumulative operation byte limit is exceeded.
     pub(super) fn read_file<R>(&mut self, path: &Path, reader: &mut R) -> Result<Vec<u8>, CliError>
     where
         R: Read + ?Sized,
@@ -196,6 +212,11 @@ impl CatalogReadBudget {
 
     /// Stream-compares one already-opened file with an expected snapshot while
     /// charging the same operation-wide entry and byte budgets as a normal read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on cancellation or I/O failure, or when the file or
+    /// cumulative operation byte limit is exceeded.
     pub(super) fn compare_file<R>(
         &mut self,
         path: &Path,
@@ -233,6 +254,11 @@ impl CatalogReadBudget {
     }
 
     /// Accounts one already-decoded catalog entry in this operation ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on cancellation or when the entry, per-file byte, or
+    /// cumulative byte limit is exceeded.
     pub(crate) fn record_entry_bytes(&mut self, path: &Path, bytes: usize) -> Result<(), CliError> {
         self.checkpoint()?;
         self.begin_entry(path)?;
@@ -245,6 +271,10 @@ impl CatalogReadBudget {
     ///
     /// The path names the directory being enumerated so limit evidence stays
     /// deterministic even though host directory iteration order is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this visit crosses the traversal-entry limit.
     pub(super) fn visit_traversal_entry(
         &mut self,
         directory: &Path,
@@ -263,6 +293,10 @@ impl CatalogReadBudget {
     }
 
     /// Reserves one participating entry before opening or byte allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this reservation crosses the catalog-entry limit.
     pub(crate) fn begin_entry(&mut self, path: &Path) -> Result<(), CatalogReadLimitExceeded> {
         let entries = self.entries.saturating_add(1);
         if entries > self.limits.entry_count {
@@ -278,6 +312,11 @@ impl CatalogReadBudget {
     }
 
     /// Uses opened-handle metadata only as an early byte-budget rejection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the metadata length already exceeds the per-file
+    /// limit or would cross the cumulative operation byte limit.
     pub(crate) fn preflight_file(
         &self,
         path: &Path,
@@ -316,6 +355,11 @@ impl CatalogReadBudget {
     }
 
     /// Commits actual bytes read from the already-opened file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the actual byte count exceeds the per-file limit
+    /// or crosses the cumulative operation byte limit.
     pub(crate) fn finish_file(
         &mut self,
         path: &Path,

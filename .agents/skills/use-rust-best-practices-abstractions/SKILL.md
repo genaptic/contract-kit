@@ -40,26 +40,25 @@ generics, lifetimes, error types, panic policy, or duplicated domain logic.
 4. For `conkit` reductive refactors, do not replace duplication with
    `macro_rules!`, proc-macro indirection, generated dispatch, generated
    tables, or codegen-style hidden abstraction.
-5. For `conkit` enum dispatch over implementation families such as contract
-   parsers, signature matchers, or sketch runners, keep a unique
-   implementation-agnostic `pub(crate)` trait contract. The dispatcher must route
-   through that trait, and the trait must be hand-written, not macro-generated
-   or replaced by inherent-method parity by convention. Shared contract
-   modules own only implementation-agnostic trait definitions, shared handles, and
-   default helpers; concrete impls live in the owning implementation subtree.
-   Public root handles should be opaque structs over private inner enums whose
-   variants wrap concrete structs. This struct wrapper rule is only for
-   exported dispatchers; crate-private internal dispatch enums can remain plain
-   private enums. Private dispatch and config-selection enums are routing
-   mechanisms only; do not reuse them as implementation-family identity,
-   provenance, capability, diagnostic-label, or error-label helpers.
-   Dispatcher methods should use explicit exhaustive `match` arms that
-   delegate with receiver-method syntax on values implementing the same trait.
-   Prefer
-   `backend.method(args).await`; `Trait::method(backend, args).await` is an
-   invalid dispatch shape in this workspace. Public root handle methods may
-   use `<Self as Trait>::method(self, args).await` only to enter the handle's
-   own trait impl and avoid same-name inherent-method recursion.
+5. Require enum dispatch plus a private trait only when a closed behavior
+   family has multiple real concrete implementations. Keep a unique,
+   implementation-agnostic trait contract and hand-written exhaustive dispatch
+   for that family; do not introduce the pattern for a single concrete owner.
+   In Contract Kit, `RustExtractionBackend` is the current syntax/compiler
+   example. `SketchContractKit` remains a direct concrete behavior owner and
+   must not gain a backend trait or inner dispatch enum without a second real
+   implementation. Shared contract modules own only implementation-agnostic
+   trait definitions, shared handles, and default helpers; concrete impls live
+   in the owning implementation subtree. Exported dispatchers may use opaque
+   public structs over private inner enums, while crate-private internal
+   dispatch enums can remain plain private enums. Private dispatch and config
+   selection enums are routing mechanisms only; do not reuse them as family
+   identity, provenance, capability, diagnostic-label, or error-label helpers.
+   Dispatcher methods use explicit exhaustive `match` arms and receiver-method
+   syntax. Prefer `backend.method(args).await`; payload dispatch through
+   `Trait::method(backend, args).await` is invalid in this workspace. A public
+   root handle may use `<Self as Trait>::method(self, args).await` only to enter
+   its own trait impl and avoid same-name inherent-method recursion.
 6. Introduce traits at the usage boundary when multiple implementations or test
    doubles are genuinely useful.
 7. Choose enums for closed sets, generics for static polymorphism, and trait
@@ -75,12 +74,15 @@ generics, lifetimes, error types, panic policy, or duplicated domain logic.
   inherent methods over macro-based deduplication in this workspace.
 - Reject item type aliases and lifecycle/state suffix carrier families as
   abstraction mechanisms. They are guardrail bypasses, not simplifications.
-- Preserve mandatory private enum-dispatch trait contracts; do not delete,
-  bypass, publicize, or macro-generate them.
-- Require the public root handle and every concrete variant payload receiver to
-  implement the same private dispatch trait. The handle's trait impl should
-  match over its private inner enum and call operations with receiver-method
-  syntax.
+- Preserve private enum-dispatch trait contracts where a real closed
+  multi-implementation family exists; do not delete, bypass, publicize, or
+  macro-generate them.
+- Do not manufacture a dispatcher for a single concrete owner. In particular,
+  retain direct receiver methods on `SketchContractKit`.
+- For an exported closed-family dispatcher, require the public root handle and
+  every concrete variant payload receiver to implement the same private trait.
+  The handle's trait impl should match over its private inner enum and call
+  operations with receiver-method syntax.
 - Reject reusable implementation-family kind/provenance helpers such as
   implementation-family display-name utilities, capability-label routers, or
   diagnostic/error labels. Family-specific facts belong in the owning

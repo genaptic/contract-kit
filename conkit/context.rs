@@ -1,8 +1,11 @@
 //! Runtime dependencies shared by command handlers.
 //!
-//! `CommandContext` is created after clap parsing and before command
-//! execution. It keeps command handlers explicit about which domain adapters
-//! and output policy they use.
+//! `CommandContext` is created after clap parsing and before command execution.
+//! It owns the signature service, the concrete sketch adapter, the bounded
+//! Cargo/rustdoc extractor, CLI filesystem limits, process cancellation, and
+//! terminal output. Initialization builds one application-owned Rayon pool for
+//! both domains while preserving their independent active and pending root-
+//! operation admission.
 
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -46,6 +49,10 @@ impl ApplicationCancellation {
     }
 
     /// Installs the one process-level Ctrl-C/termination handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the host process handler cannot be registered.
     fn install() -> Result<Self, CliError> {
         let cancellation = Self::new();
         let handler = cancellation.clone();
@@ -55,6 +62,11 @@ impl ApplicationCancellation {
     }
 
     /// Returns a source connected to the host process termination signals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the one process-level signal handler cannot be
+    /// installed.
     pub(crate) fn process() -> Result<Self, CliError> {
         Self::install()
     }
@@ -77,6 +89,11 @@ impl ApplicationCancellation {
     }
 
     /// Stops a synchronous command boundary before it publishes output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operation-canceled error after process cancellation has been
+    /// requested.
     pub(crate) fn checkpoint(&self) -> Result<(), CliError> {
         if self.requested.load(Ordering::Acquire) {
             Err(CliError::OperationCanceled)
@@ -86,6 +103,11 @@ impl ApplicationCancellation {
     }
 
     /// Races a command future against process cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operation-canceled error when cancellation wins before the
+    /// supplied future completes. A completed future result wins its final poll.
     pub(crate) async fn race<F>(&self, future: F) -> Result<F::Output, CliError>
     where
         F: Future,

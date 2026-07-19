@@ -61,12 +61,18 @@ Public boundary types include:
 - `FileCatalogError`: catalog path and duplicate-entry errors
 - `SignatureContractKitError`: crate-level typed error wrapper
 - `WorkOptions` and `WorkerPool`: independent worker-pool, active-operation, and pending-operation configuration
+- `SignatureLimits` and its `CatalogLimits`, `YamlLimits`,
+  `RustExtractionLimits`, `DiagnosticLimits`, and `OutputLimits` sublimits,
+  plus `LimitExceeded` and `LimitResource` evidence for rejected work
 - `RustExtractionInput`: the closed syntax/compiler operation selector
 - `RustCompilerArtifact`, `RustCompilerCrate`, `CompilerSourcePath`,
   `CompilerSourceProvenance`, and their typed validation failures: the
   versioned compiler-artifact boundary supplied by a filesystem/process-owning
   host
 - request and response DTOs in `api.rs`
+
+`SignatureContractKitBuilder::with_limits` replaces the complete set of
+resource budgets enforced independently for every operation.
 
 Public request and response DTOs do not include operating-system paths, storage
 provider details, filesystem roots, or written-file lists. Output-producing
@@ -556,10 +562,10 @@ children contain compile-time contracts for the public builder, kit, directly
 borrowed futures, and owning spawned-task shapes plus the representative
 executor-neutral boundary workflows. The local `work.rs` tests
 cover bounded admission, cancellation before admission, best-effort queued
-cancellation, run-to-completion after start, worker-thread execution, panic
-forwarding, and worker-channel loss. They coordinate with explicit channels,
-manual polling, and bounded completion guards rather than sleeps or production
-test seams.
+cancellation, cooperative cancellation after start, permit release before
+completion becomes observable, worker-thread execution, panic forwarding, and
+worker-channel loss. They coordinate with explicit channels, manual polling,
+and bounded completion guards rather than sleeps or production test seams.
 
 The `tests/public_api/boundaries.rs` child protects the architecture through
 behavioral public-surface tests for nominal request, response, limit, report,

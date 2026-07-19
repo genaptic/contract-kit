@@ -138,8 +138,10 @@ impl SketchContractKitBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`SketchContractKitError`] if the internal work pool cannot be
-    /// initialized.
+    /// Returns [`SketchContractKitError`] if a kit-owned Rayon pool cannot be
+    /// initialized or if `max_in_flight_operations + max_pending_operations`
+    /// overflows [`usize`]. A caller-supplied [`WorkerPool::Shared`](crate::WorkerPool::Shared)
+    /// is reused directly rather than initializing another pool.
     ///
     /// # Examples
     ///
@@ -199,10 +201,15 @@ impl SketchContractKit {
     ///
     /// # Errors
     ///
-    /// Returns [`SketchContractKitError`] when contract YAML is malformed or
-    /// violates the field, identifier, path, link, kind, or nonempty-code
-    /// rules; when signature labels or sketch identifiers are duplicated; when
-    /// report rendering fails; or when background work cannot complete.
+    /// Returns [`SketchContractKitError`] when admission is already at its
+    /// active-plus-pending capacity; a configured catalog, YAML, normalization,
+    /// matching-work, diagnostic, or report-output limit is exceeded; contract
+    /// YAML is malformed or violates the field, identifier, path, link, kind,
+    /// or nonempty-code rules; signature labels or sketch identifiers are
+    /// duplicated; report rendering fails; or background work cannot complete.
+    /// Use [`SketchContractKitError::is_queue_full`] and
+    /// [`SketchContractKitError::limit_exceeded`] to inspect the two typed
+    /// resource failures.
     ///
     /// # Panics
     ///
@@ -283,21 +290,34 @@ impl SketchContractKit {
     /// Refreshes explicitly linked sketches in combined contract documents.
     ///
     /// Each [`SketchSeed`] identifies an existing nested sketch and the
-    /// signature link that produced its exact source text. Generation replaces
-    /// only that sketch's `code` field. The document's `root`, `files`,
-    /// `signatures`, link direction, identifier, and `signature_type` remain
-    /// intact. Documents without linked sketches, nested YAML entries, and
-    /// non-YAML catalog entries are returned byte-for-byte unchanged. The
-    /// response contains every input catalog entry and a cohesive count of
-    /// linked, refreshed, exact-changed, and changed-document totals.
+    /// signature link that produced its exact source text. Full refresh requires
+    /// exactly one seed for every linked sketch; partial refresh targets only
+    /// supplied IDs, and an empty partial refresh is an exact catalog-byte
+    /// no-op. Seed document path/index, ID, signature type, and source path must
+    /// equal the linked contract facts exactly, without trimming or other
+    /// normalization.
+    ///
+    /// Generation replaces only a targeted sketch's `code` field. The
+    /// document's `root`, `files`, `signatures`, link direction, identifier,
+    /// matching policy, and `signature_type` remain intact. If every targeted
+    /// decoded code value in a physical contract file already equals its seed,
+    /// that file's original bytes are returned without loading the lossless
+    /// editor. A real change preserves scalar presentation where safe, fails
+    /// closed when an anchor or alias makes local mutation unsafe, and reparses
+    /// the complete edited document before returning it. Files without targeted
+    /// changes, nested YAML entries, and non-YAML catalog entries are returned
+    /// byte-for-byte unchanged.
     ///
     /// # Errors
     ///
-    /// Returns [`SketchContractKitError`] when a combined document is invalid;
-    /// when a seed is missing, duplicated, or does not exactly match its linked
-    /// document, identifier, signature type, and source file; when refreshed
-    /// code normalizes to empty; when YAML rendering fails; or when background
-    /// work cannot complete.
+    /// Returns [`SketchContractKitError`] when admission is full; a catalog,
+    /// YAML, matching, scratch, or returned-output limit is exceeded; a combined
+    /// document is invalid; a seed is missing, duplicated, unknown, or does not
+    /// exactly match its linked document, identifier, signature type, and source
+    /// file; refreshed code normalizes to empty; a changed scalar is anchored or
+    /// aliased; lossless rendering or semantic verification fails; or background
+    /// work cannot complete. Verification reparses share the request's original
+    /// cumulative YAML budget.
     ///
     /// # Panics
     ///
@@ -376,11 +396,17 @@ impl SketchContractKit {
     /// terminator. It preserves indentation, tabs, horizontal whitespace, blank
     /// lines, line order, and every token or comment byte inside `code`, so
     /// changes to any of those preserved bytes are semantic.
+    /// Returned entries are merged in exact sketch-ID order. Contract-file and
+    /// document-index values in [`SketchSnapshot`] locate authoring sites but do
+    /// not participate in identity or semantic field comparison.
     ///
     /// # Errors
     ///
-    /// Returns [`SketchContractKitError`] when either catalog contains invalid
-    /// sketch contract input or background work cannot complete.
+    /// Returns [`SketchContractKitError`] when admission is full; cumulative
+    /// catalog or YAML accounting across both sides, or sketch identity and
+    /// normalization work on either side, exceeds a configured limit; either
+    /// catalog contains invalid sketch contract input; or background work cannot
+    /// complete.
     ///
     /// # Panics
     ///
@@ -557,7 +583,39 @@ impl CheckResponse {
     /// Borrows the serialized report payload without `report_files`.
     ///
     /// The opaque view implements [`Serialize`] and is used for both
-    /// standalone domain reports and embedded combined CLI reports.
+    /// standalone domain reports and embedded combined CLI reports. It contains
+    /// exactly `passed`, `counts`, and `diagnostics`, even when the response
+    /// itself already owns generated report bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use conkit_sketch::{
+    ///     CatalogPath, CheckResponse, FileCatalog, SketchCheckCounts,
+    /// };
+    ///
+    /// let mut report_files = FileCatalog::new();
+    /// report_files.insert(CatalogPath::new("report.json")?, b"stored report".to_vec())?;
+    /// let response = CheckResponse {
+    ///     passed: true,
+    ///     counts: SketchCheckCounts {
+    ///         source_catalog_entry_count: 0,
+    ///         referenced_source_file_count: 0,
+    ///         present_referenced_source_file_count: 0,
+    ///         contract_document_count: 0,
+    ///         sketch_count: 0,
+    ///         matched_sketch_count: 0,
+    ///         failed_sketch_count: 0,
+    ///     },
+    ///     diagnostics: Vec::new(),
+    ///     report_files,
+    /// };
+    /// let report = serde_json::to_value(response.report_view())?;
+    ///
+    /// assert_eq!(report["passed"], true);
+    /// assert!(report.get("report_files").is_none());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     pub fn report_view(&self) -> impl Serialize + '_ {
         crate::report::CheckReportView::new(self)
     }
@@ -566,13 +624,18 @@ impl CheckResponse {
 /// Request for [`SketchContractKit::generate`].
 ///
 /// Generation consumes combined contract bytes plus exact linked-sketch seeds
-/// and returns the updated catalog; it never reads or writes operating-system
-/// paths.
+/// and returns the complete updated catalog; it never reads or writes
+/// operating-system paths. [`GenerateMode::FullRefresh`] requires complete seed
+/// coverage, while [`GenerateMode::PartialRefresh`] validates and updates only
+/// supplied exact IDs.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GenerateRequest {
-    /// Existing combined contract documents to update.
+    /// Existing combined contract documents to validate and selectively update.
     pub contract_files: FileCatalog,
     /// Exact refresh seeds selected according to [`GenerateRequest::mode`].
+    ///
+    /// IDs must be unique. Every seed's document path/index, sketch ID,
+    /// signature type, and source path must exactly equal one linked sketch.
     pub seeds: Vec<SketchSeed>,
     /// Whether every linked sketch or only supplied sketch IDs are refreshed.
     pub mode: GenerateMode,
@@ -581,9 +644,12 @@ pub struct GenerateRequest {
 /// Selects complete or targeted linked-sketch generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum GenerateMode {
-    /// Require and validate one seed for every linked sketch.
+    /// Require and validate exactly one seed for every linked sketch.
     FullRefresh,
     /// Refresh only supplied IDs and preserve every unspecified sketch.
+    ///
+    /// An empty seed list validates the input contracts, then returns every
+    /// original catalog byte unchanged.
     PartialRefresh,
 }
 
@@ -594,9 +660,14 @@ pub struct SketchGenerationCounts {
     pub linked_sketch_count: usize,
     /// Number of supplied sketches validated and targeted by the request.
     pub refreshed_sketch_count: usize,
-    /// Number of refreshed sketches whose exact code scalar changed.
+    /// Number of refreshed sketches whose decoded code value changed exactly.
+    ///
+    /// This is not a normalized-code comparison: spelling differences that
+    /// decode to different strings count even if matching would treat them as
+    /// equivalent.
     pub changed_sketch_count: usize,
-    /// Number of YAML documents containing at least one changed sketch.
+    /// Number of distinct physical `(contract path, document index)` pairs
+    /// containing at least one changed sketch.
     pub changed_document_count: usize,
 }
 
@@ -628,7 +699,8 @@ impl SketchGenerationCounts {
 /// deterministic logical path order, updated documents preserve their existing
 /// sketch order, and nested YAML, non-YAML entries, and untargeted root
 /// documents pass through byte-for-byte. Identical requests produce identical
-/// catalog order and bytes.
+/// catalog order and bytes. Physical contract files whose targeted decoded code
+/// values are all already equal also retain their complete original bytes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GenerateResponse {
     /// Complete contract catalog, including unchanged passthrough entries.
@@ -638,6 +710,9 @@ pub struct GenerateResponse {
 }
 
 /// Request for [`SketchContractKit::diff`].
+///
+/// Catalog and YAML resource budgets accumulate across the current and previous
+/// sides rather than restarting for each side.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiffRequest {
     /// Current sketch contract catalog.
@@ -676,24 +751,41 @@ impl DiffRequest {
 }
 
 /// Response returned by [`SketchContractKit::diff`].
+///
+/// Entries are deterministically ordered by exact sketch ID. [`Self::changed`]
+/// is derived solely from whether that entry list is empty.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiffResponse {
-    /// Digest of the current catalog's complete semantic sketch identity.
+    /// Domain-separated SHA-256 digest of the current catalog's complete
+    /// semantic sketch identity.
+    ///
+    /// Version 2 length-frames the exact ID, linked source and signature facts,
+    /// stable matching-policy tags, and normalized code lines for every sketch
+    /// in ID order. Physical contract locators and YAML presentation are absent.
     pub contract_digest: String,
-    /// Canonical digest encoding version.
+    /// Canonical digest encoding version for both contract and code digests.
+    ///
+    /// The current encoding is version `2`.
     pub digest_version: u16,
-    /// Deterministically ordered sketch changes.
+    /// Sketch changes in exact-ID order.
     pub entries: Vec<DiffEntry>,
 }
 
 impl DiffResponse {
     /// Returns whether any sketch was added, removed, or semantically changed.
+    ///
+    /// This is exactly `!self.entries.is_empty()`; the digest is descriptive and
+    /// is not compared to derive the result.
     pub fn changed(&self) -> bool {
         !self.entries.is_empty()
     }
 }
 
 /// Context-rich state of one sketch at one side of a semantic diff.
+///
+/// [`Self::contract_file`] and [`Self::document_index`] are locator evidence for
+/// presenting where this snapshot came from. They do not participate in sketch
+/// identity, semantic field comparison, or digest construction.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SketchSnapshot {
     /// User-defined sketch identifier.
@@ -710,45 +802,55 @@ pub struct SketchSnapshot {
     pub signature_type: String,
     /// Versioned normalization and occurrence semantics.
     pub matching: SketchMatchPolicy,
-    /// Domain-separated SHA-256 digest of normalized code bytes.
+    /// Version 2 domain-separated SHA-256 digest of normalized code lines.
+    ///
+    /// The encoding includes the stable normalization tag and length-frames
+    /// every line; it does not hash YAML scalar presentation.
     pub code_digest: String,
 }
 
 /// Independently observable semantic sketch field.
+///
+/// The variant declaration order is the canonical order used by the `fields`
+/// member of [`DiffEntry::Changed`]. There is no normalization variant because
+/// [`SketchNormalization::ExactLinesV1`](crate::SketchNormalization::ExactLinesV1)
+/// is mandatory for every valid v2 sketch; occurrence remains configurable and
+/// therefore independently observable.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum SketchField {
-    /// Referenced logical source path.
+    /// Exact referenced logical source path.
     SourceFile,
-    /// Linked signature label.
+    /// Exact linked signature label.
     LinkedSignature,
-    /// Linked signature kind.
+    /// Exact linked `signature_type` value.
     SignatureType,
-    /// Required occurrence policy.
+    /// Required occurrence policy (`at_least_one` or `exactly_one`).
     Occurrence,
-    /// Exact normalized code bytes.
+    /// Code lines after mandatory `exact_lines_v1` normalization.
     Code,
 }
 
 /// One semantic sketch change returned by [`DiffResponse`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DiffEntry {
-    /// A sketch exists only in the current catalog.
+    /// A sketch ID exists only in the current catalog.
     Added {
         /// Current sketch state and locator.
         current: SketchSnapshot,
     },
-    /// A sketch exists only in the previous catalog.
+    /// A sketch ID exists only in the previous catalog.
     Removed {
         /// Previous sketch state and locator.
         previous: SketchSnapshot,
     },
-    /// A sketch exists in both catalogs with different semantic fields.
+    /// The same exact sketch ID exists in both catalogs with different semantic
+    /// fields.
     Changed {
         /// Previous semantic state and locator.
         previous: SketchSnapshot,
         /// Current semantic state and locator.
         current: SketchSnapshot,
-        /// Deterministically ordered fields that changed.
+        /// Changed fields in canonical [`SketchField`] declaration order.
         fields: Vec<SketchField>,
     },
 }
@@ -757,20 +859,22 @@ pub enum DiffEntry {
 ///
 /// A signature-domain resolver can produce this runtime-neutral data from an
 /// exact source span. The `conkit-sketch` crate validates it against the combined
-/// document without depending on a signature parser.
+/// document without depending on a signature parser. Document path/index,
+/// sketch ID, signature type, and source path comparisons are exact: no field is
+/// trimmed, case-folded, or otherwise normalized before agreement is checked.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SketchSeed {
-    /// Combined document containing both the signature link and sketch.
+    /// Exact combined-document catalog path containing the link and sketch.
     pub contract_file: CatalogPath,
-    /// Zero-based physical YAML document index within `contract_file`.
+    /// Exact zero-based physical YAML document index within `contract_file`.
     pub document_index: usize,
-    /// User-facing sketch identifier.
+    /// Exact user-facing sketch identifier.
     pub sketch_id: String,
-    /// Signature kind copied from the linked signature.
+    /// Exact signature kind copied from the linked signature.
     pub signature_type: String,
-    /// Logical source entry declared by the linked signature.
+    /// Exact logical source entry declared by the linked signature.
     pub file: CatalogPath,
-    /// Exact source text, required to contain at least one line after the
-    /// sketch's exact-line normalization policy is applied.
+    /// Decoded source text to store in `code`, required to contain at least one
+    /// line after the sketch's exact-line normalization policy is applied.
     pub code: String,
 }

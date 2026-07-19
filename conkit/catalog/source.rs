@@ -45,6 +45,12 @@ impl SourceTree {
     }
 
     /// Reads every Rust source against a caller-owned operation budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source root or a participating descendant cannot
+    /// be traversed and read securely, cancellation is requested, a catalog
+    /// limit is exceeded, or a logical source path cannot be represented.
     pub(crate) fn read_rust_sources_with_budget(
         &self,
         budget: &mut CatalogReadBudget,
@@ -105,6 +111,12 @@ impl SourceTree {
     }
 
     /// Reads an exact source allowlist against a caller-owned operation budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on cancellation or a catalog-limit breach, or when an
+    /// allowlisted source cannot be securely opened, read, or inserted into the
+    /// logical catalog.
     pub(crate) fn read_selected_with_budget(
         &self,
         selected: &[CatalogPath],
@@ -135,6 +147,11 @@ impl SourceTree {
 
     /// Stream-compares the selected files with a previously read source
     /// snapshot without constructing a second catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on cancellation or a catalog-limit breach, or when an
+    /// expected source cannot be securely opened or read for comparison.
     pub(crate) fn first_changed_snapshot_with_budget(
         &self,
         expected: &FileCatalog,

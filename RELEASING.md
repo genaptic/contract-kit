@@ -31,14 +31,16 @@ GitHub Release. A merge to `main` never publishes a release.
    pull requests that should not appear in generated notes. Dependabot applies
    `dependencies` by default, and maintainers may use it for other dependency
    updates.
-5. For the initial `0.0.1` release, create a crates.io API token that is allowed
-   to publish new crates. Store it as the `CARGO_REGISTRY_TOKEN` secret on the
-   `release` environment. Revoke it immediately after both crates are published.
+5. For the one-time bootstrap while both library crate names are absent from
+   crates.io, create an API token that may publish new crates. Store it as the
+   `CARGO_REGISTRY_TOKEN` secret on the `release` environment, select
+   `bootstrap_crates_io` for that publication, and revoke the token immediately
+   after both crates are established.
 6. After `conkit-signature` and `conkit-sketch` exist on crates.io, configure a
-   trusted publisher for each crate using repository
-   `genaptic/contract-kit`, workflow `release.yml`, and environment `release`.
-   Future runs use crates.io's short-lived OIDC credential and do not need a
-   registry secret.
+   trusted publisher for each crate using repository `genaptic/contract-kit`,
+   workflow `release.yml`, and environment `release`. Leave
+   `bootstrap_crates_io` unselected for subsequent releases; they use
+   crates.io's short-lived OIDC credential and do not need a registry secret.
 7. Protect `main` and require `CI / Required` and `Rustdocs / Build preview`
    before merge. Require pull requests and disallow force pushes and tag
    rewrites.

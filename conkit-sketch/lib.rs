@@ -29,9 +29,10 @@
 //! and trailing whitespace, tabs, blank lines, isolated carriage returns, and
 //! arbitrary non-UTF-8 bytes. [`SketchOccurrence::AtLeastOne`] accepts the first
 //! contiguous match; [`SketchOccurrence::ExactlyOne`] requires one occurrence
-//! and reports duplicate source spans. Sketch identifiers are exact: the parser
-//! rejects empty values, surrounding whitespace, control characters, and
-//! over-limit values instead of trimming or Unicode-normalizing them.
+//! and counts overlapping occurrences before reporting bounded source-span
+//! evidence. Sketch identifiers are exact: the parser rejects empty values,
+//! surrounding whitespace, control characters, and over-limit values instead
+//! of trimming or Unicode-normalizing them.
 //!
 //! # Semantic diffing
 //!
@@ -39,7 +40,10 @@
 //! sketch present in both catalogs, the linked source file, linked signature
 //! label, `signature_type`, [`SketchMatchPolicy`], and normalized code are
 //! semantic. The containing contract document, YAML formatting, YAML comments
-//! outside `code`, and mapping order are nonsemantic.
+//! outside `code`, and mapping order are nonsemantic. Diff entries are ordered
+//! by exact sketch ID. Snapshot contract paths and document indexes are locator
+//! evidence, not identity. Version 2 contract and code digests use distinct
+//! domains and length-framed semantic fields.
 //!
 //! CRLF/LF spelling and one final line terminator are the only nonsemantic code
 //! differences under [`SketchNormalization::ExactLinesV1`]. Line order,
@@ -52,6 +56,11 @@
 //! link; partial generation updates only supplied exact IDs. Both refresh only
 //! the nested sketch body's `code`. They preserve the combined
 //! document's root, file allowlist, signatures, links, identifiers, and kinds.
+//! Partial generation with no seeds is an exact catalog-byte no-op. A targeted
+//! contract file whose seeded decoded code values all already match retains its
+//! original bytes without loading the lossless editor. A real edit fails closed
+//! when an anchor or alias makes local scalar mutation unsafe, and the complete
+//! edited document is semantically reparsed before its bytes are returned.
 //! The response returns the complete input catalog, including unchanged nested
 //! YAML and non-YAML passthrough entries, and counts the linked sketches that
 //! were refreshed. Returned catalog bytes are deterministic and are never
@@ -72,7 +81,9 @@
 //! [`SketchDiagnostic`] in a successful [`CheckResponse`]. Diagnostics retain
 //! [`SketchLocation`] context and may include a nearest [`MatchCandidate`] or
 //! bounded [`SourceLineSpan`] evidence. [`CheckMode`] determines whether those
-//! diagnostics make the response fail.
+//! diagnostics make the response fail. Candidate selection maximizes equal
+//! aligned lines and keeps the earliest source start on a tie; excerpts use
+//! ASCII byte escaping so arbitrary source bytes remain safe in text reports.
 //!
 //! # Runtime and storage boundaries
 //!
@@ -93,6 +104,19 @@
 //! default, dedicated, or application-shared pool, while [`WorkOptions`]
 //! independently bounds active and pending root operations. [`SketchLimits`]
 //! bounds catalog, YAML, matching, diagnostic, and generated-output resources.
+//! Catalog accounting is cumulative across every input catalog in an operation,
+//! and YAML accounting is cumulative across selected files, both diff sides,
+//! and generation verification reparses. Exhausting a correctness budget such
+//! as matching work or diagnostic count fails the operation with typed
+//! [`LimitExceeded`] evidence; only explicitly presentational span and excerpt
+//! retention is truncated.
+//!
+//! Building can fail if a local Rayon pool cannot be created or active-plus-
+//! pending capacity overflows. An operation can also fail when admission is
+//! full, a resource ceiling is crossed, input or rendering is invalid, or a
+//! worker cannot complete. Inspect [`SketchContractKitError::is_queue_full`]
+//! and [`SketchContractKitError::limit_exceeded`] for the corresponding typed
+//! cases.
 //! Catalogs, diagnostics, generated entries, and rendered output remain
 //! deterministic regardless of worker scheduling.
 //!

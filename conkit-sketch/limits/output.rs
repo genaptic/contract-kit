@@ -7,13 +7,19 @@ use std::cell::Cell;
 use std::fmt;
 
 /// Diagnostic collection and bounded-evidence budgets.
+///
+/// Diagnostic count and aggregate serialized bytes are correctness-output
+/// budgets: crossing either fails the complete check instead of dropping a
+/// diagnostic. `excerpt_bytes` is a presentation budget and truncates only the
+/// retained raw-byte prefix before it is ASCII-escaped; the serialized-byte
+/// budget accounts for the expanded escaped representation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticLimits {
     /// Maximum correctness diagnostics returned by one check.
     pub count: u64,
     /// Maximum serialized bytes for the complete correctness-diagnostic array.
     pub serialized_bytes: u64,
-    /// Maximum source bytes escaped into one expected or actual excerpt.
+    /// Maximum raw source bytes retained and escaped for one excerpt.
     pub excerpt_bytes: u64,
 }
 
@@ -36,7 +42,9 @@ impl DiagnosticLimits {
 /// Returned-output and live generated-text budgets.
 ///
 /// Returned output and simultaneously retained scratch each default to
-/// 512 MiB and are enforced independently.
+/// 512 MiB and are enforced independently. Reducing scratch capacity does not
+/// reduce the returned-byte allowance, and byte-exact generation no-ops do not
+/// allocate edit scratch.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutputLimits {
     /// Maximum aggregate bytes returned in one generated catalog.
