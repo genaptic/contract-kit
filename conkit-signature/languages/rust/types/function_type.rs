@@ -1,10 +1,8 @@
-use crate::files::CatalogPath;
-use crate::languages::rust::types::base_type::{BaseCanonical, BaseType};
+use crate::languages::rust::types::base_type::{BaseType, RustImplementationContext};
 use crate::languages::rust::types::callable_type::RustCallableSignature;
-use crate::languages::rust::types::primitive_types::Visibility;
 use serde::Serialize;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct FunctionType {
     base: BaseType,
     signature: RustCallableSignature,
@@ -23,16 +21,6 @@ impl FunctionType {
         self
     }
 
-    pub(crate) fn into_method_context(
-        mut self,
-        file: CatalogPath,
-        module_path: Vec<String>,
-        visibility: Visibility,
-    ) -> Self {
-        self.base = self.base.into_context(file, module_path, visibility);
-        self
-    }
-
     pub(crate) fn base(&self) -> &BaseType {
         &self.base
     }
@@ -41,16 +29,16 @@ impl FunctionType {
         &self.signature
     }
 
-    pub(in crate::languages::rust) fn canonical_form(&self) -> FunctionCanonical {
-        FunctionCanonical {
-            base: self.base.canonical_form(),
-            signature: self.signature.clone(),
-        }
+    pub(crate) fn requires_capability_warning(&self) -> bool {
+        self.base.attributes().requires_capability_warning()
+            || self.signature.requires_capability_warning()
     }
-}
 
-#[derive(Serialize)]
-pub(in crate::languages::rust) struct FunctionCanonical {
-    base: BaseCanonical,
-    signature: RustCallableSignature,
+    pub(crate) fn normalize_implementation_member(
+        &mut self,
+        context: &RustImplementationContext,
+        trait_owned: bool,
+    ) {
+        context.normalize_base(&mut self.base, trait_owned);
+    }
 }

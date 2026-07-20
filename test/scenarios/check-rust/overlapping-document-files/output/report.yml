@@ -1,0 +1,7 @@
+passed: true
+source_shape_digest: 747efcbd43a4cc2d7bdd81a9740297529152a84665c24c15dd22265b0693d0fa
+digest_version: 2
+counts:
+  source_signature_count: 2
+  contract_signature_count: 2
+diagnostics: []

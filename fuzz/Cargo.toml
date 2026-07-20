@@ -1,0 +1,86 @@
+# This is an independent, nightly-only hardening workspace. It is not a fourth
+# production package and is excluded from Contract Kit's three-member root
+# workspace so normal stable and cross-platform gates remain unchanged.
+[workspace]
+members = ["."]
+resolver = "3"
+
+[package]
+name = "conkit-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+conkit-signature = { version = "0.1.0", path = "../conkit-signature" }
+conkit-sketch = { version = "0.1.0", path = "../conkit-sketch" }
+futures-executor = "0.3"
+libfuzzer-sys = "0.4.13"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+# Archive payload decoding intentionally remains crate-private in the
+# binary-only `conkit` package. Its in-package unit tests are the legitimate
+# callable boundary; this workspace does not add a production API just to make
+# that private codec fuzzable.
+
+[[bin]]
+name = "signature_yaml"
+path = "fuzz_targets/signature_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sketch_yaml"
+path = "fuzz_targets/sketch_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "yaml_edit"
+path = "fuzz_targets/yaml_edit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signature_yaml_edit"
+path = "fuzz_targets/signature_yaml_edit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rust_syntax"
+path = "fuzz_targets/rust_syntax.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "source_graph"
+path = "fuzz_targets/source_graph.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sketch_normalization"
+path = "fuzz_targets/sketch_normalization.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sketch_matching"
+path = "fuzz_targets/sketch_matching.rs"
+test = false
+doc = false
+bench = false

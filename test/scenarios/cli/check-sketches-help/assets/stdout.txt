@@ -6,7 +6,7 @@ Options:
       --source <DIR>     Root directory containing source files to inspect
       --contracts <DIR>  Root directory containing contract files to compare against
       --output <FILE>    Report file to write for the requested check
-      --default          Use the domain crate's default check mode
-      --strict           Treat contract diagnostics as check failures
+      --default          Enforce errors while permitting signature capability warnings
+      --strict           Also fail on signature capability warnings
       --warning          Emit diagnostics without failing the contract check
   -h, --help             Print help

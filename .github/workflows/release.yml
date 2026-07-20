@@ -1,17 +1,24 @@
+# BUG_RESOLUTION_PLAN [PHASES 2, 7, 8][MODIFICATION + TEST]
+# Citations: BUG_RESOLUTION_PLAN.md:280-394, 1228-1376, 1864-1897.
+# During the implementation/release slice, coordinate all three packages at
+# 0.1.0, retain the exact five locked gates, verify v2 docs/artifacts and the
+# supported compiler-extractor matrix, and keep hardening jobs separate from
+# registry publication. Do not publish while v1 examples or the obsolete YAML
+# dependency remain.
 name: Release
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version without the leading v (for example, 0.0.1)
+        description: Version without the leading v (for example, 0.1.0)
         required: true
-        default: 0.0.1
+        default: 0.1.0
         type: string
       bootstrap_crates_io:
         description: Use the one-time crates.io token instead of trusted publishing
         required: true
-        default: true
+        default: false
         type: boolean
       confirm_release:
         description: Confirm permanent crates.io publication and a public GitHub Release
@@ -25,6 +32,11 @@ permissions:
 concurrency:
   group: release
   cancel-in-progress: false
+
+env:
+  CARGO_DENY_VERSION: 0.19.7
+  COMPILER_TOOLCHAIN: nightly-2026-07-01
+  SUPPORTED_RUST_VERSION: "1.97"
 
 jobs:
   preflight:
@@ -47,6 +59,7 @@ jobs:
         id: version
         shell: bash
         env:
+          BOOTSTRAP_CRATES_IO: ${{ inputs.bootstrap_crates_io }}
           CONFIRM_RELEASE: ${{ inputs.confirm_release }}
           GH_TOKEN: ${{ github.token }}
           REQUESTED_VERSION: ${{ inputs.version }}
@@ -68,12 +81,51 @@ jobs:
             exit 1
           fi
 
+          if [[ "$BOOTSTRAP_CRATES_IO" == "true" ]]; then
+            temporary_directory="$(mktemp -d)"
+            trap 'rm -rf "$temporary_directory"' EXIT
+            user_agent="contract-kit-release-preflight ($GITHUB_SERVER_URL/$GITHUB_REPOSITORY)"
+            for crate in conkit-signature conkit-sketch; do
+              status="$(
+                curl --silent --show-error --location \
+                  --connect-timeout 10 \
+                  --max-time 30 \
+                  --retry 3 \
+                  --retry-all-errors \
+                  --retry-delay 2 \
+                  --output "$temporary_directory/$crate.json" \
+                  --write-out '%{http_code}' \
+                  --user-agent "$user_agent" \
+                  "https://crates.io/api/v1/crates/$crate"
+              )" || {
+                echo "Unable to determine whether $crate is established on crates.io." >&2
+                exit 1
+              }
+              case "$status" in
+                200)
+                  echo "$crate is already established; trusted publishing is required." >&2
+                  exit 1
+                  ;;
+                404) ;;
+                *)
+                  echo "crates.io returned HTTP $status while checking $crate; refusing bootstrap authentication." >&2
+                  exit 1
+                  ;;
+              esac
+            done
+          fi
+
           metadata="$(cargo metadata --locked --no-deps --format-version 1)"
           package_count="$(jq '[.packages[] | select(.name == "conkit" or .name == "conkit-signature" or .name == "conkit-sketch")] | length' <<<"$metadata")"
           workspace_version="$(jq -r '[.packages[] | select(.name == "conkit" or .name == "conkit-signature" or .name == "conkit-sketch") | .version] | unique | if length == 1 then .[0] else empty end' <<<"$metadata")"
+          workspace_rust_version="$(jq -r '[.packages[] | select(.name == "conkit" or .name == "conkit-signature" or .name == "conkit-sketch") | .rust_version] | unique | if length == 1 then .[0] else empty end' <<<"$metadata")"
 
           if [[ "$package_count" != "3" || "$workspace_version" != "$REQUESTED_VERSION" ]]; then
             echo "All three workspace packages must have version $REQUESTED_VERSION." >&2
+            exit 1
+          fi
+          if [[ "$workspace_rust_version" != "$SUPPORTED_RUST_VERSION" ]]; then
+            echo "All three workspace packages must declare rust-version $SUPPORTED_RUST_VERSION." >&2
             exit 1
           fi
 
@@ -137,6 +189,20 @@ jobs:
       - name: Select the repository toolchain
         run: rustup show active-toolchain
 
+      - name: Install the pinned dependency-policy tool
+        run: cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
+
+      - name: Require the independent fuzz lockfile
+        run: test -f fuzz/Cargo.lock
+
+      - name: Enforce the locked production dependency policy
+        run: cargo deny --locked check advisories bans licenses sources
+
+      - name: Enforce the locked fuzz dependency policy
+        run: >-
+          cargo deny --manifest-path fuzz/Cargo.toml --locked
+          check advisories bans licenses sources
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -151,6 +217,144 @@ jobs:
 
       - name: Run workspace tests
         run: cargo test --locked --workspace --all-targets
+
+      - name: Provision the supported compiler-extractor toolchain
+        run: rustup toolchain install "$COMPILER_TOOLCHAIN" --profile minimal
+
+      - name: Verify compiler extraction at the exact release commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/release-compiler-compatibility"
+          library_contracts="$evidence/library-contracts"
+          binary_contracts="$evidence/binary-contracts"
+          fixture_contracts="$evidence/fixture-contracts"
+          invalid_contracts="$evidence/invalid-contracts"
+          mkdir -p \
+            "$library_contracts" \
+            "$binary_contracts" \
+            "$fixture_contracts" \
+            "$invalid_contracts"
+          printf '%s\n' "$GITHUB_SHA" > "$evidence/commit-sha.txt"
+
+          cargo run --locked -p conkit -- generate signatures \
+            --source conkit-signature \
+            --contracts "$library_contracts" \
+            --signature-extractor compiler \
+            --manifest-path Cargo.toml \
+            --package conkit-signature \
+            --lib
+
+          cargo run --locked -p conkit -- check signatures \
+            --source conkit-signature \
+            --contracts "$library_contracts" \
+            --output "$evidence/library-check.json" \
+            --strict \
+            --signature-extractor compiler \
+            --manifest-path Cargo.toml \
+            --package conkit-signature \
+            --lib
+
+          cargo run --locked -p conkit -- generate signatures \
+            --source conkit \
+            --contracts "$binary_contracts" \
+            --signature-extractor compiler \
+            --manifest-path Cargo.toml \
+            --package conkit \
+            --bin conkit
+
+          cargo run --locked -p conkit -- check signatures \
+            --source conkit \
+            --contracts "$binary_contracts" \
+            --output "$evidence/binary-check.json" \
+            --strict \
+            --signature-extractor compiler \
+            --manifest-path Cargo.toml \
+            --package conkit \
+            --bin conkit
+
+          if cargo run --locked -p conkit -- generate signatures \
+            --source test/fixtures/compiler-api/src \
+            --contracts "$invalid_contracts" \
+            --signature-extractor compiler \
+            --manifest-path test/fixtures/compiler-api/Cargo.toml \
+            --package conkit-compiler-api-fixture \
+            --lib \
+            --features broken
+          then
+            echo "Compiler extraction unexpectedly accepted the invalid fixture." >&2
+            exit 1
+          fi
+
+          shopt -s nullglob
+          invalid_outputs=("$invalid_contracts"/*.yml "$invalid_contracts"/*.yaml)
+          if (( ${#invalid_outputs[@]} != 0 )); then
+            echo "Failed compiler extraction published a partial contract." >&2
+            exit 1
+          fi
+
+          cargo run --locked -p conkit -- generate signatures \
+            --source test/fixtures/compiler-api/src \
+            --contracts "$fixture_contracts" \
+            --signature-extractor compiler \
+            --manifest-path test/fixtures/compiler-api/Cargo.toml \
+            --package conkit-compiler-api-fixture \
+            --lib \
+            --features selected
+
+          cargo run --locked -p conkit -- check signatures \
+            --source test/fixtures/compiler-api/src \
+            --contracts "$fixture_contracts" \
+            --output "$evidence/fixture-check.json" \
+            --strict \
+            --signature-extractor compiler \
+            --manifest-path test/fixtures/compiler-api/Cargo.toml \
+            --package conkit-compiler-api-fixture \
+            --lib \
+            --features selected
+
+          fixture_contract="$(find "$fixture_contracts" -maxdepth 1 -type f \
+            \( -name '*.yml' -o -name '*.yaml' \) -print -quit)"
+          if [[ -z "$fixture_contract" ]]; then
+            echo "Compiler extraction did not generate a fixture contract." >&2
+            exit 1
+          fi
+
+          for item in \
+            MacroGenerated \
+            public_api \
+            PublicModuleItem \
+            RenamedTarget \
+            GlobTarget \
+            NestedTarget \
+            SelectedApi \
+            GenericAlias \
+            normalized_alias
+          do
+            if ! grep -Fq "name: $item" "$fixture_contract"; then
+              echo "Compiler fixture contract omitted '$item'." >&2
+              exit 1
+            fi
+          done
+
+          if ! grep -Fq 'signature_type: module' "$fixture_contract"; then
+            echo "Compiler fixture contract omitted its public module declaration." >&2
+            exit 1
+          fi
+
+          if grep -Fq 'name: DisabledApi' "$fixture_contract"; then
+            echo "Compiler fixture contract retained cfg-disabled API." >&2
+            exit 1
+          fi
+
+      - name: Upload exact-commit compiler compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-compiler-compatibility-${{ github.sha }}
+          path: ${{ runner.temp }}/release-compiler-compatibility
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Verify and dry-run the library packages
         shell: bash

@@ -2,9 +2,14 @@
 
 Use this file when reviewing or refactoring shell CLI code.
 
-The `app`/CRUD snippets are generic and non-normative for `conkit`. Translate
-their principles to `conkit/args.rs`, native async dispatch in `conkit/command.rs`,
-CLI-owned OS paths, and catalog/byte domain requests.
+> **`conkit` mapping:** The `app`/CRUD snippets are generic and non-normative.
+> Translate their principles to `conkit/args.rs`, native async dispatch in
+> `conkit/command.rs`, and the application-owned `CommandContext`: one shared
+> Rayon pool, independent zero-pending domain admission, process cancellation,
+> `CatalogReadLimits`, and `CompilerExtractor`. Keep OS paths, one bounded
+> `CatalogReadBudget`, Cargo processes, extraction reconciliation, and
+> persistence in the CLI; pass only catalog/byte requests with typed extraction
+> to domains.
 
 ## Table of contents
 

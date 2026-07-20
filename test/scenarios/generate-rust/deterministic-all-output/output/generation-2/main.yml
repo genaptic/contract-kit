@@ -1,25 +1,48 @@
+contract_version: 2
 root: ../../input/source
 files:
 - nested/extra.rs
 - nested/lib.rs
+extraction:
+  mode: rust_syntax_v2
+  profile: rust_api_v1
+  crates:
+  - id: scenario
+    root: nested/lib.rs
+    kind: library
 signatures:
-- extra_function:
-    file: nested/extra.rs
-    signature_type: function
-    name: extra
-    visibility: public
-    return_type: bool
 - answer_function:
+    crate_id: scenario
     file: nested/lib.rs
     signature_type: function
     name: answer
     visibility: public
     return_type: u8
     sketch: answer_body
+- extra_module:
+    crate_id: scenario
+    file: nested/lib.rs
+    signature_type: module
+    name: extra
+    visibility: private
+- extra_function:
+    crate_id: scenario
+    file: nested/extra.rs
+    signature_type: function
+    name: extra
+    module_path:
+    - extra
+    visibility: public
+    return_type: bool
 sketches:
-- answer_body: null
-  signature_type: function
-  code: |-
-    pub fn answer() -> u8 {
-        42
-    }
+- answer_body:
+    file: nested/lib.rs
+    signature: answer_function
+    signature_type: function
+    matching:
+      normalization: exact_lines_v1
+      occurrence: at_least_one
+    code: |-
+      pub fn answer() -> u8 {
+          42
+      }

@@ -5,6 +5,7 @@ Use this reference when selecting crates, shaping Cargo manifests, or keeping co
 ## Contents
 
 - [Set toolchain and MSRV policy](#1-toolchain-and-msrv-policy)
+- [Preserve Contract Kit's pinned dependency policy](#preserve-contract-kits-pinned-dependency-policy)
 - [Prefer `std` and Cargo-native features](#2-prefer-std-and-cargo-native-features-first)
 - [Evaluate dependencies durably](#3-use-a-durable-dependency-evaluation-rubric)
 - [Use precise versions and features](#4-use-precise-cargo-version-and-feature-syntax)
@@ -40,6 +41,29 @@ Treat these as separate decisions:
 - hard-coding a specific stable patch version into every local skill
 - treating `rust-version` as “whatever stable is today”
 - silently changing a repository’s support floor because a new toolchain exists
+
+### Preserve Contract Kit's pinned dependency policy
+
+Contract Kit currently pins and enforces this repository-specific baseline:
+
+- `rust-toolchain.toml` pins Rust 1.97.0 with rustfmt and Clippy, while the root
+  workspace declares edition 2024 and `rust-version = "1.97"`.
+- The production workspace contains exactly `conkit`, `conkit-signature`, and
+  `conkit-sketch`. Members inherit package metadata, shared dependency
+  versions, and workspace lints instead of restating them.
+- Root `deny.toml` is part of the dependency and platform policy. Keep its
+  supported target matrix, advisory/license/source checks, workspace dependency
+  hygiene, and deliberately narrow duplicate-semantic-engine bans aligned with
+  Cargo manifests and CI.
+- `fuzz` is an excluded nightly-only workspace with its own `Cargo.toml` and
+  checked-in `Cargo.lock`. Validate or update that lock from the fuzz workspace;
+  do not make fuzzing a fourth member of the stable production workspace.
+- `rustdoc-types` is an approved data-transfer model for compiler-produced JSON
+  and is a production dependency of `conkit-signature` only. Do not spread it
+  to the CLI or sketch domain.
+- Compiler-private crates whose names contain the `rust` + `c` prefix remain
+  prohibited in every production manifest. The approved `rustdoc-types` DTO
+  does not relax that prohibition.
 
 ## 2. Prefer `std` and Cargo-native features first
 
@@ -328,6 +352,8 @@ Practical advice:
 - use target-specific dependencies
 - use `ProjectDirs`, `PathBuf`, and `Command`
 - run supply-chain checks appropriate to the repo
+- preserve Contract Kit's pinned 1.97 toolchain/MSRV, workspace inheritance,
+  `deny.toml`, and independently locked excluded fuzz workspace
 
 ### Don't
 
@@ -337,6 +363,8 @@ Practical advice:
 - manually build OS-specific app directory paths
 - shell out through `sh -c` / `cmd /C` when direct command invocation works
 - treat the newest stable version as the package’s MSRV
+- add compiler-private `rust` + `c`-prefixed crates to Contract Kit production
+  manifests or move `rustdoc-types` outside `conkit-signature`
 
 ## Further reading
 

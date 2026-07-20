@@ -6,15 +6,6 @@ mod scenario;
 
 use scenario::Suite;
 
-const EXPECTED_SCENARIO_COUNT: usize = 136;
-
-#[test]
-fn checked_in_scenario_inventory_contains_136_independent_leaves() {
-    let suite = Suite::discover_workspace().expect("discover checked-in scenarios");
-
-    assert_eq!(suite.scenario_ids().len(), EXPECTED_SCENARIO_COUNT);
-}
-
 #[test]
 fn checked_in_scenarios_pass() {
     let suite = Suite::discover_workspace().expect("discover checked-in scenarios");

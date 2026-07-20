@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::path::PortableCatalogPathKey;
+use crate::context::ApplicationCancellation;
 use crate::contracts::ContractDocumentPath;
 use crate::error::CliError;
 
@@ -49,9 +50,15 @@ pub(super) struct OwnedCatalog {
 }
 
 /// Logical path and digest for one owned combined document.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(super) struct OwnedFile {
+    path: CatalogPath,
+    sha256: ContentDigest,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedFileDocument {
     path: String,
     sha256: ContentDigest,
 }
@@ -129,14 +136,31 @@ impl OwnershipManifest {
     ///
     /// Returns an error if the bytes are not a valid version-3 manifest or its
     /// generation, document paths, digests, ordering, or transition is invalid.
-    pub(super) fn from_bytes(path: &Path, bytes: &[u8]) -> Result<Self, CliError> {
-        let manifest = serde_json::from_slice::<Self>(bytes).map_err(|source| {
-            CliError::InvalidGeneratedOwnership {
-                path: path.to_path_buf(),
-                message: source.to_string(),
+    pub(super) fn from_bytes(
+        path: &Path,
+        bytes: &[u8],
+        cancellation: &ApplicationCancellation,
+    ) -> Result<Self, CliError> {
+        cancellation.checkpoint()?;
+        let manifest = match serde_json::from_slice::<Self>(bytes) {
+            Ok(manifest) => manifest,
+            Err(source) => {
+                let message = source.to_string();
+                if let Some(message) = OwnedFile::path_error_message(&message) {
+                    cancellation.checkpoint()?;
+                    return Err(CliError::InvalidGeneratedOwnership {
+                        path: path.to_path_buf(),
+                        message,
+                    });
+                }
+                return Err(CliError::InvalidGeneratedOwnership {
+                    path: path.to_path_buf(),
+                    message,
+                });
             }
-        })?;
-        manifest.validate(path)?;
+        };
+        cancellation.checkpoint()?;
+        manifest.validate(path, cancellation)?;
         Ok(manifest)
     }
 
@@ -145,19 +169,30 @@ impl OwnershipManifest {
     /// # Errors
     ///
     /// Returns an error if the manifest is invalid or JSON serialization fails.
-    pub(super) fn to_bytes(&self, path: &Path) -> Result<Vec<u8>, CliError> {
-        self.validate(path)?;
+    pub(super) fn to_bytes(
+        &self,
+        path: &Path,
+        cancellation: &ApplicationCancellation,
+    ) -> Result<Vec<u8>, CliError> {
+        self.validate(path, cancellation)?;
+        cancellation.checkpoint()?;
         let mut bytes = serde_json::to_vec_pretty(self).map_err(|source| {
             CliError::InvalidGeneratedOwnership {
                 path: path.to_path_buf(),
                 message: source.to_string(),
             }
         })?;
+        cancellation.checkpoint()?;
         bytes.push(b'\n');
         Ok(bytes)
     }
 
-    fn validate(&self, path: &Path) -> Result<(), CliError> {
+    fn validate(
+        &self,
+        path: &Path,
+        cancellation: &ApplicationCancellation,
+    ) -> Result<(), CliError> {
+        cancellation.checkpoint()?;
         if self.version != Self::VERSION {
             return Err(CliError::InvalidGeneratedOwnership {
                 path: path.to_path_buf(),
@@ -168,7 +203,7 @@ impl OwnershipManifest {
         match &self.journal {
             OwnershipJournal::Committed { generation, files } => {
                 Self::validate_generation(*generation, path)?;
-                files.validate(path)
+                files.validate(path, cancellation)
             }
             OwnershipJournal::Updating {
                 generation,
@@ -176,9 +211,9 @@ impl OwnershipManifest {
                 after,
             } => {
                 Self::validate_generation(*generation, path)?;
-                before.validate(path)?;
-                after.validate(path)?;
-                before.validate_transition(after, path)
+                before.validate(path, cancellation)?;
+                after.validate(path, cancellation)?;
+                before.validate_transition(after, cancellation)
             }
         }
     }
@@ -208,8 +243,11 @@ impl OwnedCatalog {
     }
 
     /// Finds one owned document by its exact logical spelling.
-    pub(super) fn find(&self, path: &str) -> Option<&OwnedFile> {
-        self.entries().find(|file| file.path == path)
+    pub(super) fn find(&self, path: &CatalogPath) -> Option<&OwnedFile> {
+        self.documents
+            .binary_search_by(|file| file.path.cmp(path))
+            .ok()
+            .map(|index| &self.documents[index])
     }
 
     /// Validates paths, digests, portable identity, and deterministic sorting.
@@ -218,34 +256,31 @@ impl OwnedCatalog {
     ///
     /// Returns an error if a document path or digest is invalid, paths collide
     /// under portable identity, or entries are not uniquely sorted.
-    pub(super) fn validate(&self, manifest_path: &Path) -> Result<(), CliError> {
+    pub(super) fn validate(
+        &self,
+        manifest_path: &Path,
+        cancellation: &ApplicationCancellation,
+    ) -> Result<(), CliError> {
         let mut keys = BTreeMap::<PortableCatalogPathKey, String>::new();
+        let mut previous_path = None::<&CatalogPath>;
         for file in self.entries() {
-            let logical = CatalogPath::new(file.path.clone()).map_err(|source| {
-                CliError::InvalidGeneratedOwnership {
+            cancellation.checkpoint()?;
+            if previous_path.is_some_and(|previous| previous >= &file.path) {
+                return Err(CliError::InvalidGeneratedOwnership {
                     path: manifest_path.to_path_buf(),
-                    message: source.to_string(),
-                }
-            })?;
-            Self::validate_logical_path(&logical, manifest_path)?;
-            file.sha256.validate(manifest_path)?;
-            let key = PortableCatalogPathKey::new(&logical);
-            if let Some(previous) = keys.insert(key, file.path.clone()) {
-                return Err(CliError::PortableGeneratedPathCollision {
-                    first: previous,
-                    second: file.path.clone(),
+                    message: "owned document paths must be unique and sorted".to_owned(),
                 });
             }
-        }
-        if !self
-            .documents
-            .windows(2)
-            .all(|pair| pair[0].path < pair[1].path)
-        {
-            return Err(CliError::InvalidGeneratedOwnership {
-                path: manifest_path.to_path_buf(),
-                message: "owned document paths must be unique and sorted".to_owned(),
-            });
+            previous_path = Some(&file.path);
+            Self::validate_logical_path(&file.path, manifest_path)?;
+            file.sha256.validate(manifest_path)?;
+            let key = PortableCatalogPathKey::new(&file.path);
+            if let Some(previous) = keys.insert(key, file.path.as_str().to_owned()) {
+                return Err(CliError::PortableGeneratedPathCollision {
+                    first: previous,
+                    second: file.path.as_str().to_owned(),
+                });
+            }
         }
         Ok(())
     }
@@ -259,33 +294,26 @@ impl OwnedCatalog {
     pub(super) fn validate_transition(
         &self,
         after: &Self,
-        manifest_path: &Path,
+        cancellation: &ApplicationCancellation,
     ) -> Result<(), CliError> {
+        let mut after_by_key = BTreeMap::new();
+        for after_file in after.entries() {
+            cancellation.checkpoint()?;
+            after_by_key.insert(PortableCatalogPathKey::new(&after_file.path), after_file);
+        }
         for before_file in self.entries() {
-            let logical = CatalogPath::new(before_file.path.clone()).map_err(|source| {
-                CliError::InvalidGeneratedOwnership {
-                    path: manifest_path.to_path_buf(),
-                    message: source.to_string(),
-                }
-            })?;
-            let key = PortableCatalogPathKey::new(&logical);
-            if let Some(after_file) = after.find_by_key(&key)
+            cancellation.checkpoint()?;
+            let key = PortableCatalogPathKey::new(&before_file.path);
+            if let Some(after_file) = after_by_key.get(&key)
                 && before_file.path != after_file.path
             {
                 return Err(CliError::CaseOnlyGeneratedPathChange {
-                    previous: before_file.path.clone(),
-                    current: after_file.path.clone(),
+                    previous: before_file.path.as_str().to_owned(),
+                    current: after_file.path.as_str().to_owned(),
                 });
             }
         }
         Ok(())
-    }
-
-    fn find_by_key(&self, key: &PortableCatalogPathKey) -> Option<&OwnedFile> {
-        self.entries().find_map(|file| {
-            let logical = CatalogPath::new(file.path.clone()).ok()?;
-            (PortableCatalogPathKey::new(&logical) == *key).then_some(file)
-        })
     }
 
     fn validate_logical_path(logical: &CatalogPath, manifest_path: &Path) -> Result<(), CliError> {
@@ -315,13 +343,15 @@ impl OwnedCatalog {
 }
 
 impl OwnedFile {
+    const PATH_ERROR_PREFIX: &'static str = "invalid persisted ownership path: ";
+
     /// Builds one persisted owned-file value.
-    pub(super) fn new(path: String, sha256: ContentDigest) -> Self {
+    pub(super) fn new(path: CatalogPath, sha256: ContentDigest) -> Self {
         Self { path, sha256 }
     }
 
     /// Returns the persisted logical path.
-    pub(super) fn path(&self) -> &str {
+    pub(super) fn path(&self) -> &CatalogPath {
         &self.path
     }
 
@@ -329,12 +359,48 @@ impl OwnedFile {
     pub(super) fn digest(&self) -> &ContentDigest {
         &self.sha256
     }
+
+    fn path_error_message(message: &str) -> Option<String> {
+        let message = message.strip_prefix(Self::PATH_ERROR_PREFIX)?;
+        let message = message
+            .rsplit_once(" at line ")
+            .filter(|(_, location)| location.contains(" column "))
+            .map_or(message, |(message, _)| message);
+        Some(message.to_owned())
+    }
+}
+
+impl<'de> Deserialize<'de> for OwnedFile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let document = OwnedFileDocument::deserialize(deserializer)?;
+        let path = CatalogPath::new(document.path).map_err(|source| {
+            serde::de::Error::custom(format!("{}{source}", Self::PATH_ERROR_PREFIX))
+        })?;
+        Ok(Self::new(path, document.sha256))
+    }
 }
 
 impl ContentDigest {
     /// Computes a lowercase hexadecimal SHA-256 digest.
-    pub(super) fn of(bytes: &[u8]) -> Self {
-        Self(format!("{:x}", Sha256::digest(bytes)))
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when process cancellation is observed between digest
+    /// chunks or before finalization.
+    pub(super) fn of(
+        bytes: &[u8],
+        cancellation: &ApplicationCancellation,
+    ) -> Result<Self, CliError> {
+        let mut digest = Sha256::new();
+        for chunk in bytes.chunks(64 * 1024) {
+            cancellation.checkpoint()?;
+            digest.update(chunk);
+        }
+        cancellation.checkpoint()?;
+        Ok(Self(format!("{:x}", digest.finalize())))
     }
 
     fn validate(&self, manifest_path: &Path) -> Result<(), CliError> {
@@ -360,11 +426,20 @@ impl VersionProbe {
     /// # Errors
     ///
     /// Returns an error if the bytes do not contain a valid JSON version probe.
-    pub(super) fn from_bytes(path: &Path, bytes: &[u8]) -> Result<Self, CliError> {
-        serde_json::from_slice(bytes).map_err(|source| CliError::InvalidGeneratedOwnership {
-            path: path.to_path_buf(),
-            message: source.to_string(),
-        })
+    pub(super) fn from_bytes(
+        path: &Path,
+        bytes: &[u8],
+        cancellation: &ApplicationCancellation,
+    ) -> Result<Self, CliError> {
+        cancellation.checkpoint()?;
+        let probe = serde_json::from_slice::<Self>(bytes).map_err(|source| {
+            CliError::InvalidGeneratedOwnership {
+                path: path.to_path_buf(),
+                message: source.to_string(),
+            }
+        })?;
+        cancellation.checkpoint()?;
+        Ok(probe)
     }
 
     /// Returns the probed ownership wire-format version.
@@ -379,7 +454,7 @@ impl<'file> ReservationMarker<'file> {
         Self {
             version: OwnershipManifest::VERSION,
             generation,
-            path: file.path(),
+            path: file.path().as_str(),
             sha256: file.digest(),
         }
     }
@@ -389,12 +464,17 @@ impl<'file> ReservationMarker<'file> {
     /// # Errors
     ///
     /// Returns an error if the reservation marker cannot be serialized as JSON.
-    pub(super) fn to_bytes(&self) -> Result<Vec<u8>, CliError> {
+    pub(super) fn to_bytes(
+        &self,
+        cancellation: &ApplicationCancellation,
+    ) -> Result<Vec<u8>, CliError> {
+        cancellation.checkpoint()?;
         let mut bytes =
             serde_json::to_vec(self).map_err(|source| CliError::InvalidGeneratedOwnership {
                 path: PathBuf::from(self.path),
                 message: source.to_string(),
             })?;
+        cancellation.checkpoint()?;
         bytes.push(b'\n');
         Ok(bytes)
     }
@@ -404,9 +484,43 @@ impl<'file> ReservationMarker<'file> {
 mod tests {
     use std::path::Path;
 
+    use conkit_signature::CatalogPath;
+
     use super::{
         ContentDigest, OwnedCatalog, OwnedFile, OwnershipManifest, ReservationMarker, VersionProbe,
     };
+    use crate::context::ApplicationCancellation;
+    use crate::error::CliError;
+
+    struct OwnershipFixture;
+
+    impl OwnershipFixture {
+        fn cancellation() -> ApplicationCancellation {
+            ApplicationCancellation::new()
+        }
+
+        fn digest(bytes: &[u8]) -> ContentDigest {
+            ContentDigest::of(bytes, &Self::cancellation()).expect("content digest")
+        }
+
+        fn owned(path: &str, bytes: &[u8]) -> OwnedFile {
+            OwnedFile::new(
+                CatalogPath::new(path).expect("owned catalog path"),
+                Self::digest(bytes),
+            )
+        }
+
+        fn encode(
+            manifest: &OwnershipManifest,
+            path: &Path,
+        ) -> Result<Vec<u8>, crate::error::CliError> {
+            manifest.to_bytes(path, &Self::cancellation())
+        }
+
+        fn decode(path: &Path, bytes: &[u8]) -> Result<OwnershipManifest, crate::error::CliError> {
+            OwnershipManifest::from_bytes(path, bytes, &Self::cancellation())
+        }
+    }
 
     #[test]
     fn ownership_accepts_only_direct_root_yaml_documents() {
@@ -415,26 +529,18 @@ mod tests {
         for accepted in ["main.yml", "main.YAML", "MAIN.YmL"] {
             let manifest = OwnershipManifest::committed(
                 1,
-                OwnedCatalog::from_files(vec![OwnedFile::new(
-                    accepted.to_owned(),
-                    ContentDigest::of(b"generated\n"),
-                )]),
+                OwnedCatalog::from_files(vec![OwnershipFixture::owned(accepted, b"generated\n")]),
             );
-            manifest
-                .to_bytes(manifest_path)
+            OwnershipFixture::encode(&manifest, manifest_path)
                 .expect("direct YAML document ownership");
         }
 
         for rejected in ["manual.txt", "main.json", "nested/main.yml"] {
             let manifest = OwnershipManifest::committed(
                 1,
-                OwnedCatalog::from_files(vec![OwnedFile::new(
-                    rejected.to_owned(),
-                    ContentDigest::of(b"generated\n"),
-                )]),
+                OwnedCatalog::from_files(vec![OwnershipFixture::owned(rejected, b"generated\n")]),
             );
-            let error = manifest
-                .to_bytes(manifest_path)
+            let error = OwnershipFixture::encode(&manifest, manifest_path)
                 .expect_err("non-document ownership must fail");
             assert!(
                 error
@@ -450,20 +556,13 @@ mod tests {
         let manifest_path = Path::new("generated-files.json");
         let manifest = OwnershipManifest::updating(
             2,
-            OwnedCatalog::from_files(vec![OwnedFile::new(
-                "before.yml".to_owned(),
-                ContentDigest::of(b"before\n"),
-            )]),
-            OwnedCatalog::from_files(vec![OwnedFile::new(
-                "after.yml".to_owned(),
-                ContentDigest::of(b"after\n"),
-            )]),
+            OwnedCatalog::from_files(vec![OwnershipFixture::owned("before.yml", b"before\n")]),
+            OwnedCatalog::from_files(vec![OwnershipFixture::owned("after.yml", b"after\n")]),
         );
 
         assert_eq!(
             String::from_utf8(
-                manifest
-                    .to_bytes(manifest_path)
+                OwnershipFixture::encode(&manifest, manifest_path)
                     .expect("updating ownership bytes"),
             )
             .expect("ownership JSON is UTF-8"),
@@ -499,18 +598,21 @@ mod tests {
     fn owned_catalog_construction_sorts_and_manifest_round_trips() {
         let manifest_path = Path::new("generated-files.json");
         let catalog = OwnedCatalog::from_files(vec![
-            OwnedFile::new("z.yml".to_owned(), ContentDigest::of(b"z\n")),
-            OwnedFile::new("a.yaml".to_owned(), ContentDigest::of(b"a\n")),
+            OwnershipFixture::owned("z.yml", b"z\n"),
+            OwnershipFixture::owned("a.yaml", b"a\n"),
         ]);
         assert_eq!(
-            catalog.entries().map(OwnedFile::path).collect::<Vec<_>>(),
+            catalog
+                .entries()
+                .map(OwnedFile::path)
+                .map(CatalogPath::as_str)
+                .collect::<Vec<_>>(),
             ["a.yaml", "z.yml"]
         );
 
         let manifest = OwnershipManifest::committed(7, catalog);
-        let encoded = manifest
-            .to_bytes(manifest_path)
-            .expect("committed manifest");
+        let encoded =
+            OwnershipFixture::encode(&manifest, manifest_path).expect("committed manifest");
         assert_eq!(
             String::from_utf8(encoded.clone()).expect("ownership JSON is UTF-8"),
             concat!(
@@ -536,7 +638,7 @@ mod tests {
             )
         );
         let decoded =
-            OwnershipManifest::from_bytes(manifest_path, &encoded).expect("round-trip manifest");
+            OwnershipFixture::decode(manifest_path, &encoded).expect("round-trip manifest");
 
         assert_eq!(decoded, manifest);
     }
@@ -544,9 +646,9 @@ mod tests {
     #[test]
     fn ownership_rejects_zero_generation_invalid_digest_and_unsorted_paths() {
         let manifest_path = Path::new("generated-files.json");
-        let zero = OwnershipManifest::committed(0, OwnedCatalog::default())
-            .to_bytes(manifest_path)
-            .expect_err("zero generation");
+        let zero_manifest = OwnershipManifest::committed(0, OwnedCatalog::default());
+        let zero =
+            OwnershipFixture::encode(&zero_manifest, manifest_path).expect_err("zero generation");
         assert!(zero.to_string().contains("greater than zero"));
 
         let invalid_digest = br#"{
@@ -559,8 +661,8 @@ mod tests {
     }
   }
 }"#;
-        let digest_error = OwnershipManifest::from_bytes(manifest_path, invalid_digest)
-            .expect_err("invalid digest");
+        let digest_error =
+            OwnershipFixture::decode(manifest_path, invalid_digest).expect_err("invalid digest");
         assert!(digest_error.to_string().contains("invalid SHA-256 digest"));
 
         let unsorted = format!(
@@ -572,9 +674,35 @@ mod tests {
             ),
             digest = "0".repeat(64),
         );
-        let sorting_error = OwnershipManifest::from_bytes(manifest_path, unsorted.as_bytes())
+        let sorting_error = OwnershipFixture::decode(manifest_path, unsorted.as_bytes())
             .expect_err("unsorted catalog");
         assert!(sorting_error.to_string().contains("unique and sorted"));
+
+        let invalid_path = format!(
+            concat!(
+                "{{\"version\":3,\"journal\":{{\"state\":\"committed\",",
+                "\"generation\":1,\"files\":{{\"documents\":[",
+                "{{\"path\":\"../main.yml\",\"sha256\":\"{}\"}}]}}}}}}"
+            ),
+            "0".repeat(64),
+        );
+        let path_error = OwnershipFixture::decode(manifest_path, invalid_path.as_bytes())
+            .expect_err("typed path rejects invalid persisted spelling");
+        let expected_path_error = CatalogPath::new("../main.yml")
+            .expect_err("invalid path fixture")
+            .to_string();
+        assert!(matches!(
+            path_error,
+            CliError::InvalidGeneratedOwnership { message, .. }
+                if message == expected_path_error
+        ));
+
+        let cancellation = ApplicationCancellation::new();
+        cancellation.request();
+        let canceled =
+            OwnershipManifest::from_bytes(manifest_path, invalid_path.as_bytes(), &cancellation)
+                .expect_err("cancellation retains precedence after parsing an invalid path");
+        assert!(matches!(canceled, CliError::OperationCanceled));
     }
 
     #[test]
@@ -612,7 +740,7 @@ mod tests {
         ];
 
         for document in unknown_fields {
-            let error = OwnershipManifest::from_bytes(manifest_path, document.as_bytes())
+            let error = OwnershipFixture::decode(manifest_path, document.as_bytes())
                 .expect_err("unknown persisted field");
             assert!(error.to_string().contains("unknown field"));
         }
@@ -625,7 +753,7 @@ mod tests {
             ),
             "A".repeat(64),
         );
-        let error = OwnershipManifest::from_bytes(manifest_path, uppercase_digest.as_bytes())
+        let error = OwnershipFixture::decode(manifest_path, uppercase_digest.as_bytes())
             .expect_err("uppercase digest");
         assert!(error.to_string().contains("invalid SHA-256 digest"));
     }
@@ -633,39 +761,45 @@ mod tests {
     #[test]
     fn ownership_rejects_duplicate_and_ascii_case_equivalent_paths() {
         let manifest_path = Path::new("generated-files.json");
-        for (first, second) in [("main.yml", "main.yml"), ("Main.yml", "main.YML")] {
-            let catalog = OwnedCatalog::from_files(vec![
-                OwnedFile::new(first.to_owned(), ContentDigest::of(b"first\n")),
-                OwnedFile::new(second.to_owned(), ContentDigest::of(b"second\n")),
-            ]);
-            let error = OwnershipManifest::committed(1, catalog)
-                .to_bytes(manifest_path)
-                .expect_err("portable duplicate path");
+        let duplicate = OwnedCatalog::from_files(vec![
+            OwnershipFixture::owned("main.yml", b"first\n"),
+            OwnershipFixture::owned("main.yml", b"second\n"),
+        ]);
+        let duplicate =
+            OwnershipFixture::encode(&OwnershipManifest::committed(1, duplicate), manifest_path)
+                .expect_err("exact duplicate path");
+        assert!(matches!(
+            duplicate,
+            CliError::InvalidGeneratedOwnership { message, .. }
+                if message == "owned document paths must be unique and sorted"
+        ));
 
-            assert!(
-                error
-                    .to_string()
-                    .contains("portable generated path collision"),
-                "unexpected collision error: {error}"
-            );
-        }
+        let case_equivalent = OwnedCatalog::from_files(vec![
+            OwnershipFixture::owned("Main.yml", b"first\n"),
+            OwnershipFixture::owned("main.YML", b"second\n"),
+        ]);
+        let case_equivalent = OwnershipFixture::encode(
+            &OwnershipManifest::committed(1, case_equivalent),
+            manifest_path,
+        )
+        .expect_err("ASCII-case-equivalent path");
+        assert!(matches!(
+            case_equivalent,
+            CliError::PortableGeneratedPathCollision { first, second }
+                if first == "Main.yml" && second == "main.YML"
+        ));
     }
 
     #[test]
     fn updating_ownership_rejects_case_only_path_transitions() {
         let manifest_path = Path::new("generated-files.json");
-        let before = OwnedCatalog::from_files(vec![OwnedFile::new(
-            "Main.yml".to_owned(),
-            ContentDigest::of(b"before\n"),
-        )]);
-        let after = OwnedCatalog::from_files(vec![OwnedFile::new(
-            "main.yml".to_owned(),
-            ContentDigest::of(b"after\n"),
-        )]);
+        let before =
+            OwnedCatalog::from_files(vec![OwnershipFixture::owned("Main.yml", b"before\n")]);
+        let after = OwnedCatalog::from_files(vec![OwnershipFixture::owned("main.yml", b"after\n")]);
 
-        let error = OwnershipManifest::updating(2, before, after)
-            .to_bytes(manifest_path)
-            .expect_err("case-only transition");
+        let manifest = OwnershipManifest::updating(2, before, after);
+        let error =
+            OwnershipFixture::encode(&manifest, manifest_path).expect_err("case-only transition");
 
         assert!(error.to_string().contains("changes only ASCII case"));
     }
@@ -682,9 +816,11 @@ mod tests {
   }
 }"#;
 
-        let probe = VersionProbe::from_bytes(manifest_path, obsolete).expect("version probe");
+        let probe =
+            VersionProbe::from_bytes(manifest_path, obsolete, &OwnershipFixture::cancellation())
+                .expect("version probe");
         assert_eq!(probe.version(), 2);
-        let error = OwnershipManifest::from_bytes(manifest_path, obsolete)
+        let error = OwnershipFixture::decode(manifest_path, obsolete)
             .expect_err("obsolete ownership version");
         assert!(
             error
@@ -695,9 +831,9 @@ mod tests {
 
     #[test]
     fn reservation_marker_uses_version_generation_path_and_digest() {
-        let owned = OwnedFile::new("main.yml".to_owned(), ContentDigest::of(b"generated\n"));
+        let owned = OwnershipFixture::owned("main.yml", b"generated\n");
         let bytes = ReservationMarker::new(9, &owned)
-            .to_bytes()
+            .to_bytes(&OwnershipFixture::cancellation())
             .expect("reservation marker");
 
         assert_eq!(
@@ -707,6 +843,27 @@ mod tests {
                 "\"sha256\":\"9f5936ff15d3a2ba7d3d8f21858338a6c1e2adc9fe34c685c7de5b4a00caa29a\"}\n"
             )
         );
+    }
+
+    #[test]
+    fn ownership_hashing_and_validation_observe_cancellation() {
+        let cancellation = OwnershipFixture::cancellation();
+        cancellation.request();
+        let digest_error = ContentDigest::of(b"generated\n", &cancellation)
+            .expect_err("pre-canceled hashing must stop");
+        let manifest = OwnershipManifest::committed(1, OwnedCatalog::default());
+        let manifest_error = manifest
+            .to_bytes(Path::new("generated-files.json"), &cancellation)
+            .expect_err("pre-canceled ownership validation must stop");
+
+        assert!(matches!(
+            digest_error,
+            crate::error::CliError::OperationCanceled
+        ));
+        assert!(matches!(
+            manifest_error,
+            crate::error::CliError::OperationCanceled
+        ));
     }
 
     #[test]

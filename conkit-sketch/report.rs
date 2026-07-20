@@ -1,7 +1,8 @@
 use crate::api::CheckResponse;
 use crate::error::SketchContractKitError;
 use crate::files::{CatalogPath, FileCatalog};
-use crate::inventory::{SketchCheckCounts, SketchDiagnostic};
+use crate::limits::{GeneratedBytes, OutputLimits};
+use crate::work::CancellationProbe;
 use serde::{Deserialize, Serialize};
 
 /// Output encoding for generated sketch check reports.
@@ -65,89 +66,139 @@ pub enum ReportRequest {
     },
 }
 
-pub(crate) struct ReportFiles {
-    request: ReportRequest,
-}
-
-impl ReportFiles {
-    pub(crate) fn new(request: ReportRequest) -> Self {
-        Self { request }
-    }
-
+impl ReportRequest {
     pub(crate) fn render(
-        &self,
+        self,
         response: &CheckResponse,
+        limits: &OutputLimits,
+        cancellation: &CancellationProbe,
     ) -> Result<FileCatalog, SketchContractKitError> {
-        match &self.request {
-            ReportRequest::None => Ok(FileCatalog::new()),
-            ReportRequest::Generate {
+        cancellation.checkpoint()?;
+        match self {
+            Self::None => Ok(FileCatalog::new()),
+            Self::Generate {
                 format,
                 output_file,
             } => {
-                let report = SketchCheckReport::from_response(response);
+                let report = response.report_view();
+                let generated = GeneratedBytes::new(limits, cancellation);
+                let mut output = generated.returned_buffer(&output_file);
                 let bytes = match format {
-                    ReportFormat::Yaml => serde_yaml::to_string(&report)
-                        .map(String::into_bytes)
-                        .map_err(|source| {
-                            SketchContractKitError::write_failed(output_file, source.to_string())
-                        })?,
-                    ReportFormat::Json => serde_json::to_vec_pretty(&report).map_err(|source| {
-                        SketchContractKitError::write_failed(output_file, source.to_string())
-                    })?,
+                    ReportFormat::Yaml => {
+                        let rendering = serde_saphyr::to_fmt_writer(&mut output, &report);
+                        output.finish(rendering)?
+                    }
+                    ReportFormat::Json => {
+                        let rendering = serde_json::to_writer_pretty(&mut output, &report);
+                        output.finish(rendering)?
+                    }
                 };
+                cancellation.checkpoint()?;
                 let mut files = FileCatalog::new();
-                files.insert(output_file.clone(), bytes)?;
-
+                files.insert(output_file, bytes)?;
                 Ok(files)
             }
         }
     }
 }
-
-#[derive(Serialize)]
-struct SketchCheckReport<'a> {
-    passed: bool,
-    counts: &'a SketchCheckCounts,
-    diagnostics: &'a [SketchDiagnostic],
+pub(crate) struct CheckReportView<'response> {
+    response: &'response CheckResponse,
 }
 
-impl<'a> SketchCheckReport<'a> {
-    fn from_response(response: &'a CheckResponse) -> Self {
-        Self {
-            passed: response.passed,
-            counts: &response.counts,
-            diagnostics: &response.diagnostics,
-        }
+impl<'response> CheckReportView<'response> {
+    pub(crate) fn new(response: &'response CheckResponse) -> Self {
+        Self { response }
+    }
+}
+
+impl Serialize for CheckReportView<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+
+        let mut report = serializer.serialize_struct("CheckReport", 3)?;
+        report.serialize_field("passed", &self.response.passed)?;
+        report.serialize_field("counts", &self.response.counts)?;
+        report.serialize_field("diagnostics", &self.response.diagnostics)?;
+        report.end()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ReportFiles, ReportFormat, ReportRequest};
+    use super::{CheckReportView, ReportFormat, ReportRequest};
     use crate::api::CheckResponse;
+    use crate::contract::{SketchNormalization, SketchOccurrence};
     use crate::files::{CatalogPath, FileCatalog};
-    use crate::inventory::{SketchCheckCounts, SketchDiagnostic};
+    use crate::inventory::{
+        DiagnosticExcerpt, MatchCandidate, SketchCheckCounts, SketchDiagnostic, SketchLocation,
+        SourceLineSpan,
+    };
+    use crate::limits::{LimitResource, OutputLimits};
+    use crate::work::CancellationProbe;
+    use serde::Deserialize;
 
     struct TestResponse {
         response: CheckResponse,
     }
 
     impl TestResponse {
-        fn with_diagnostic() -> Self {
+        fn with_rich_diagnostics() -> Self {
             Self {
                 response: CheckResponse {
                     passed: false,
                     counts: SketchCheckCounts {
-                        source_file_count: 1,
-                        contract_file_count: 1,
-                        sketch_count: 1,
+                        source_catalog_entry_count: 4,
+                        referenced_source_file_count: 3,
+                        present_referenced_source_file_count: 2,
+                        contract_document_count: 3,
+                        sketch_count: 3,
                         matched_sketch_count: 0,
-                        failed_sketch_count: 1,
+                        failed_sketch_count: 3,
                     },
-                    diagnostics: vec![SketchDiagnostic::NotMatched {
-                        sketch_id: "answer".to_owned(),
-                        file: "src/lib.rs".to_owned(),
-                    }],
+                    diagnostics: vec![
+                        SketchDiagnostic::OccurrenceMismatch {
+                            sketch: SketchLocation::new(
+                                "duplicate",
+                                CatalogPath::new("contracts/a.yaml").expect("contract path"),
+                                0,
+                                CatalogPath::new("src/a.rs").expect("source path"),
+                            ),
+                            expected: SketchOccurrence::ExactlyOne,
+                            actual: 4,
+                            spans: vec![SourceLineSpan::new(2, 3), SourceLineSpan::new(6, 7)],
+                            spans_truncated: true,
+                        },
+                        SketchDiagnostic::NotMatched {
+                            sketch: SketchLocation::new(
+                                "invalid-bytes",
+                                CatalogPath::new("contracts/b.yaml").expect("contract path"),
+                                1,
+                                CatalogPath::new("src/b.bin").expect("source path"),
+                            ),
+                            normalization: SketchNormalization::ExactLinesV1,
+                            candidate: Some(MatchCandidate::new(
+                                SourceLineSpan::new(10, 11),
+                                2,
+                                11,
+                                DiagnosticExcerpt::Bytes {
+                                    escaped: "a\\xff\\n".to_owned(),
+                                    truncated: true,
+                                },
+                                DiagnosticExcerpt::missing(),
+                            )),
+                        },
+                        SketchDiagnostic::MissingFile {
+                            sketch: SketchLocation::new(
+                                "missing",
+                                CatalogPath::new("contracts/c.yaml").expect("contract path"),
+                                2,
+                                CatalogPath::new("src/missing.rs").expect("source path"),
+                            ),
+                        },
+                    ],
                     report_files: FileCatalog::new(),
                 },
             }
@@ -156,53 +207,294 @@ mod tests {
         fn response(&self) -> &CheckResponse {
             &self.response
         }
+
+        fn rendered_bytes(&self, format: ReportFormat, output: &str) -> Vec<u8> {
+            let output_file = CatalogPath::new(output).expect("output path");
+            let files = ReportRequest::Generate {
+                format,
+                output_file: output_file.clone(),
+            }
+            .render(
+                self.response(),
+                &OutputLimits::default(),
+                &CancellationProbe::new(),
+            )
+            .expect("render report");
+
+            files.get(&output_file).expect("report bytes").to_vec()
+        }
     }
 
     #[test]
     fn none_request_returns_empty_catalog() {
-        let response = TestResponse::with_diagnostic();
-        let files = ReportFiles::new(ReportRequest::None)
-            .render(response.response())
+        let response = TestResponse::with_rich_diagnostics();
+        let files = ReportRequest::None
+            .render(
+                response.response(),
+                &OutputLimits::default(),
+                &CancellationProbe::new(),
+            )
             .expect("render report");
 
         assert!(files.is_empty());
     }
 
     #[test]
-    fn yaml_report_includes_counts_and_diagnostics() {
-        let response = TestResponse::with_diagnostic();
-        let output_file = CatalogPath::new("reports/output.yml").expect("path");
-        let files = ReportFiles::new(ReportRequest::Generate {
-            format: ReportFormat::Yaml,
-            output_file: output_file.clone(),
-        })
-        .render(response.response())
-        .expect("render report");
-        let yaml = std::str::from_utf8(files.get(&output_file).expect("report bytes"))
-            .expect("yaml is utf8");
+    fn report_view_preserves_exact_standalone_and_embedded_wire_shape() {
+        let mut report_files = FileCatalog::new();
+        report_files
+            .insert(
+                CatalogPath::new("reports/nested.json").expect("report path"),
+                b"nested".to_vec(),
+            )
+            .expect("report file");
+        let response = CheckResponse {
+            passed: true,
+            counts: SketchCheckCounts {
+                source_catalog_entry_count: 1,
+                referenced_source_file_count: 1,
+                present_referenced_source_file_count: 1,
+                contract_document_count: 1,
+                sketch_count: 1,
+                matched_sketch_count: 1,
+                failed_sketch_count: 0,
+            },
+            diagnostics: Vec::new(),
+            report_files,
+        };
+        let view = CheckReportView::new(&response);
 
-        assert!(yaml.contains("passed: false"));
-        assert!(yaml.contains("sketch_count: 1"));
-        assert!(yaml.contains("answer"));
+        assert_eq!(
+            serde_json::to_string_pretty(&view).expect("report JSON"),
+            concat!(
+                "{\n",
+                "  \"passed\": true,\n",
+                "  \"counts\": {\n",
+                "    \"source_catalog_entry_count\": 1,\n",
+                "    \"referenced_source_file_count\": 1,\n",
+                "    \"present_referenced_source_file_count\": 1,\n",
+                "    \"contract_document_count\": 1,\n",
+                "    \"sketch_count\": 1,\n",
+                "    \"matched_sketch_count\": 1,\n",
+                "    \"failed_sketch_count\": 0\n",
+                "  },\n",
+                "  \"diagnostics\": []\n",
+                "}",
+            )
+        );
+        assert_eq!(
+            serde_saphyr::to_string(&view).expect("report YAML"),
+            concat!(
+                "passed: true\n",
+                "counts:\n",
+                "  source_catalog_entry_count: 1\n",
+                "  referenced_source_file_count: 1\n",
+                "  present_referenced_source_file_count: 1\n",
+                "  contract_document_count: 1\n",
+                "  sketch_count: 1\n",
+                "  matched_sketch_count: 1\n",
+                "  failed_sketch_count: 0\n",
+                "diagnostics: []\n",
+            )
+        );
     }
 
     #[test]
-    fn json_report_includes_counts_and_diagnostics() {
-        let response = TestResponse::with_diagnostic();
-        let output_file = CatalogPath::new("reports/output.json").expect("path");
-        let files = ReportFiles::new(ReportRequest::Generate {
+    fn generated_report_bytes_respect_the_output_budget() {
+        let response = TestResponse::with_rich_diagnostics();
+        let error = ReportRequest::Generate {
             format: ReportFormat::Json,
-            output_file: output_file.clone(),
-        })
-        .render(response.response())
-        .expect("render report");
-        let value = serde_json::from_slice::<serde_json::Value>(
-            files.get(&output_file).expect("report bytes"),
+            output_file: CatalogPath::new("report.json").expect("output path"),
+        }
+        .render(
+            response.response(),
+            &OutputLimits {
+                generated_bytes: 1,
+                ..OutputLimits::default()
+            },
+            &CancellationProbe::new(),
         )
-        .expect("json report");
+        .expect_err("report must exceed one byte");
 
-        assert_eq!(value["passed"], false);
-        assert_eq!(value["counts"]["sketch_count"], 1);
-        assert_eq!(value["diagnostics"][0]["NotMatched"]["sketch_id"], "answer");
+        assert_eq!(
+            error.limit_exceeded().expect("typed limit").resource,
+            LimitResource::GeneratedOutputBytes
+        );
+    }
+
+    #[test]
+    fn cancelled_report_serialization_preserves_the_typed_operation_error() {
+        let response = TestResponse::with_rich_diagnostics();
+        let cancellation = CancellationProbe::new();
+        cancellation.cancel();
+
+        for (format, output_file) in [
+            (ReportFormat::Yaml, "report.yml"),
+            (ReportFormat::Json, "report.json"),
+        ] {
+            let error = ReportRequest::Generate {
+                format,
+                output_file: CatalogPath::new(output_file).expect("output path"),
+            }
+            .render(response.response(), &OutputLimits::default(), &cancellation)
+            .expect_err("cancelled report serialization must stop");
+
+            assert!(error.is_operation_cancelled());
+            assert!(error.limit_exceeded().is_none());
+        }
+    }
+
+    #[derive(Debug, Deserialize, Eq, PartialEq)]
+    struct ParsedSketchCheckReport {
+        passed: bool,
+        counts: SketchCheckCounts,
+        diagnostics: Vec<SketchDiagnostic>,
+    }
+
+    impl ParsedSketchCheckReport {
+        fn from_response(response: &CheckResponse) -> Self {
+            Self {
+                passed: response.passed,
+                counts: response.counts.clone(),
+                diagnostics: response.diagnostics.clone(),
+            }
+        }
+
+        fn assert_rich_evidence(&self) {
+            assert_eq!(self.diagnostics.len(), 3);
+            assert_eq!(
+                self.diagnostics[0],
+                SketchDiagnostic::OccurrenceMismatch {
+                    sketch: SketchLocation::new(
+                        "duplicate",
+                        CatalogPath::new("contracts/a.yaml").expect("contract path"),
+                        0,
+                        CatalogPath::new("src/a.rs").expect("source path"),
+                    ),
+                    expected: SketchOccurrence::ExactlyOne,
+                    actual: 4,
+                    spans: vec![SourceLineSpan::new(2, 3), SourceLineSpan::new(6, 7)],
+                    spans_truncated: true,
+                }
+            );
+            assert_eq!(
+                self.diagnostics[1],
+                SketchDiagnostic::NotMatched {
+                    sketch: SketchLocation::new(
+                        "invalid-bytes",
+                        CatalogPath::new("contracts/b.yaml").expect("contract path"),
+                        1,
+                        CatalogPath::new("src/b.bin").expect("source path"),
+                    ),
+                    normalization: SketchNormalization::ExactLinesV1,
+                    candidate: Some(MatchCandidate::new(
+                        SourceLineSpan::new(10, 11),
+                        2,
+                        11,
+                        DiagnosticExcerpt::Bytes {
+                            escaped: "a\\xff\\n".to_owned(),
+                            truncated: true,
+                        },
+                        DiagnosticExcerpt::Missing,
+                    )),
+                }
+            );
+            assert_eq!(
+                self.diagnostics[2],
+                SketchDiagnostic::MissingFile {
+                    sketch: SketchLocation::new(
+                        "missing",
+                        CatalogPath::new("contracts/c.yaml").expect("contract path"),
+                        2,
+                        CatalogPath::new("src/missing.rs").expect("source path"),
+                    ),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_report_uses_the_maintained_semantic_stack_and_round_trips() {
+        let response = TestResponse::with_rich_diagnostics();
+        let bytes = response.rendered_bytes(ReportFormat::Yaml, "reports/output.yml");
+        let parsed = serde_saphyr::from_slice::<ParsedSketchCheckReport>(&bytes)
+            .expect("semantic YAML report");
+
+        assert_eq!(
+            parsed,
+            ParsedSketchCheckReport::from_response(response.response())
+        );
+        parsed.assert_rich_evidence();
+        assert!(
+            !std::str::from_utf8(&bytes)
+                .expect("yaml is utf8")
+                .contains("report_files")
+        );
+    }
+
+    #[test]
+    fn json_report_round_trips_complete_location_policy_and_evidence() {
+        let response = TestResponse::with_rich_diagnostics();
+        let bytes = response.rendered_bytes(ReportFormat::Json, "reports/output.json");
+        let parsed =
+            serde_json::from_slice::<ParsedSketchCheckReport>(&bytes).expect("JSON report");
+
+        assert_eq!(
+            parsed,
+            ParsedSketchCheckReport::from_response(response.response())
+        );
+        parsed.assert_rich_evidence();
+        assert!(
+            !std::str::from_utf8(&bytes)
+                .expect("json is utf8")
+                .contains("report_files")
+        );
+    }
+
+    #[test]
+    fn json_report_has_stable_explicit_evidence_shape() {
+        let response = TestResponse::with_rich_diagnostics();
+        let bytes = response.rendered_bytes(ReportFormat::Json, "reports/output.json");
+        let value = serde_json::from_slice::<serde_json::Value>(&bytes).expect("JSON report");
+
+        assert_eq!(
+            value["diagnostics"][0]["OccurrenceMismatch"]["sketch"]["document_index"],
+            0
+        );
+        assert_eq!(
+            value["diagnostics"][0]["OccurrenceMismatch"]["spans"][1]["end"],
+            7
+        );
+        assert_eq!(
+            value["diagnostics"][1]["NotMatched"]["normalization"],
+            "exact_lines_v1"
+        );
+        assert_eq!(
+            value["diagnostics"][1]["NotMatched"]["candidate"]["expected"]["Bytes"]["escaped"],
+            "a\\xff\\n"
+        );
+        assert_eq!(
+            value["diagnostics"][1]["NotMatched"]["candidate"]["expected"]["Bytes"]["truncated"],
+            true
+        );
+        assert_eq!(
+            value["diagnostics"][1]["NotMatched"]["candidate"]["actual"],
+            "Missing"
+        );
+    }
+
+    #[test]
+    fn report_serialization_is_deterministic_in_both_formats() {
+        let response = TestResponse::with_rich_diagnostics();
+
+        for (format, output) in [
+            (ReportFormat::Yaml, "reports/output.yml"),
+            (ReportFormat::Json, "reports/output.json"),
+        ] {
+            let first = response.rendered_bytes(format, output);
+            let second = response.rendered_bytes(format, output);
+
+            assert_eq!(first, second);
+        }
     }
 }

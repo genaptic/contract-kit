@@ -13,12 +13,14 @@ steps:
   - /input/source
   - --contracts
   - /output/contracts
+  - --crate-root
+  - scenario=library:nested/lib.rs
   expect:
     exit_code: 0
     stdout:
       kind: exact
       value: |
-        generated 2 signature contracts and 0 sketch contracts
+        contract generation completed: documents 1, signatures 3, preserved sketches 0, semantically changed documents 1, byte-changed documents 1; linked sketches 0, refreshed 0, changed 0, changed documents 0
     stderr:
       kind: empty
 - type: assert_tree

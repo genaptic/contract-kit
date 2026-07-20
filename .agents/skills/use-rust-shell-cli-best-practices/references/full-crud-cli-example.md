@@ -4,11 +4,15 @@ This reference is the canonical code shape for a modern Rust shell CLI. It is
 intentionally exhaustive so future command work can copy the architecture
 without inventing missing pieces.
 
-It is **not** the architecture specification for `conkit`. Treat its `app`,
-`crates/app-*`, CRUD grammar, synchronous `AppCommand`, and domain `PathBuf`
-types as generic teaching material. In `conkit`, follow `conkit/args.rs`, the native
-async dispatcher in `conkit/command.rs`, CLI-owned filesystem/catalog adapters,
-and catalog/byte requests into `conkit-signature` and `conkit-sketch`.
+> **`conkit` mapping:** This is **not** the architecture specification for
+> `conkit`. Treat its `app`, `crates/app-*`, CRUD grammar, synchronous
+> `AppCommand`, and domain `PathBuf` types as generic teaching material. Follow
+> `conkit/args.rs`, the native async dispatcher in `conkit/command.rs`, and the
+> application-owned `CommandContext`: one shared Rayon pool, independent
+> zero-pending domain admission, process cancellation, `CatalogReadLimits`, and
+> `CompilerExtractor`. Keep OS paths, one bounded `CatalogReadBudget`, Cargo
+> processes, extraction reconciliation, and persistence in the CLI; pass only
+> catalog/byte requests with typed extraction into the domains.
 
 ## Table of contents
 

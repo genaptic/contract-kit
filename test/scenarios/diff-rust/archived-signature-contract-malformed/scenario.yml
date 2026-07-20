@@ -23,10 +23,18 @@ steps:
     stderr:
       kind: exact
       value: |
-        failed to diff contracts
+        archived contracts must be recreated in contract format v2
 
         Caused by:
-            failed to parse main.yml: signatures: invalid type: string "not-a-list", expected a sequence at line 4 column 13
+            invalid contract layout main.yml: YAML document index 0 is invalid: error: line 12 column 13: unexpected event: expected sequence start
+              --> <input>:12:13
+               |
+            10 |       root: lib.rs
+            11 |       kind: library
+            12 | signatures: not-a-list
+               |             ^ unexpected event: expected sequence start
+            13 | sketches: []
+               |
 - type: assert_tree
   actual: /input/archives
   expected: assets

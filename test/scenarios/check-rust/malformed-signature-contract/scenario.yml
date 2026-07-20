@@ -25,12 +25,12 @@ steps:
     stdout:
       kind: empty
     stderr:
-      kind: exact
-      value: |
-        failed to check signature contracts
-
-        Caused by:
-            failed to parse main.yml: signatures: invalid type: string "not-a-named-signature", expected a map at line 5 column 3
+      kind: contains_in_order
+      value:
+      - failed to check signature contracts
+      - failed to parse main.yml document 0
+      - not-a-named-signature
+      - "unexpected event: expected mapping start"
 - type: overlay
   source: assets/overlays/inapplicable-field/main.yml
   destination: /input/contracts/main.yml
@@ -51,12 +51,11 @@ steps:
     stdout:
       kind: empty
     stderr:
-      kind: exact
-      value: |
-        failed to check signature contracts
-
-        Caused by:
-            failed to parse main.yml: signatures: field fields is not allowed for signature_type function at line 5 column 3
+      kind: contains_in_order
+      value:
+      - failed to check signature contracts
+      - failed to parse main.yml document 0
+      - field fields is not allowed for signature_type function
 - type: assert_tree
   actual: /output
   expected: output

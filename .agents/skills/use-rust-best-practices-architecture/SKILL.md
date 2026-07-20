@@ -32,26 +32,28 @@ structure, binary/library boundaries, or test placement.
 4. Put tests at the narrowest level that still exercises the behavior you need.
 5. Prefer clone-minimizing ownership transitions at parsing, persistence,
    network, and task-spawn edges.
-6. For enum-dispatch contract modules, keep shared modules provider-agnostic
-   and put concrete trait impls in the owning implementation subtree.
-   Dispatcher modules keep explicit exhaustive `match` arms and no wildcard or
-   catch-all arms for implementation-family variants. Match arms call
-   receiver methods on payloads implementing the same trait; do not use
-   dispatch-contract UFCS as a structural shortcut. Public root handle methods
-   may use `<Self as Trait>::method(self, ...)` only to bridge into the
-   handle's own private trait impl. Only exported dispatchers need an opaque
-   public struct wrapper; private internal dispatch enums can remain plain
-   private enums, but they must not become reusable implementation-family
-   identity, provenance, capability, diagnostic-label, or error-label helpers.
-7. Keep implementation-family matches over provider backends, agent backends,
-   database backends, or toolset runtime/source families in root `{crate}/src`
-   dispatcher files only. Shared core modules, contract modules, and helper
-   subtrees may match ordinary domain enums and state-machine enums, but must
-   not match across different backend families.
+6. Use an enum plus private trait only for a closed family with multiple real
+   concrete implementations. Keep its contract module implementation-agnostic,
+   concrete impls in their owning subtrees, and dispatch explicit and
+   exhaustive. Match arms call receiver methods rather than dispatch-contract
+   UFCS. Exported dispatchers may use opaque public wrappers; crate-private
+   dispatch enums may remain plain private enums. Do not turn routing enums
+   into shared identity, provenance, capability, diagnostic, or error helpers.
+7. Preserve Contract Kit's three production crates. Keep mixed-catalog archive
+   transport, bounded filesystem reads, compiler-process extraction, process
+   cancellation, and the application-owned shared Rayon pool in `conkit`.
+   Keep signature and sketch semantics, nominal limits and work options,
+   independent admission, and direct domain revalidation in their owning
+   crates. Do not add `conkit-core` or a shared cross-domain error trait.
+8. Treat `RustExtractionBackend` as the current closed syntax/compiler family.
+   Keep `SketchContractKit` concrete and direct unless a second real
+   implementation establishes a polymorphic boundary.
 
 ## Output Rules
 
 - Prefer one coherent domain crate over many tiny pseudo-layer crates.
+- Preserve the `conkit`, `conkit-signature`, and `conkit-sketch` ownership
+  boundaries; do not introduce `conkit-core` or cross-domain error traits.
 - Use `src/bin/` before introducing a separate package for small extra binaries
   that share the same domain and dependencies.
 - Do not centralize backend-, provider-, model-, database-, runtime-, or
@@ -66,6 +68,8 @@ structure, binary/library boundaries, or test placement.
   and keep implementation facts in the owning subtree.
 - Do not hide missing implementation-family variants behind wildcard or
   catch-all dispatcher arms.
+- Do not add an enum-dispatch layer to a single concrete behavior owner such as
+  `SketchContractKit`.
 
 ## References
 

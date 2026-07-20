@@ -18,22 +18,26 @@ operational rules and exact validation commands here.
 - Treat direct `.await` as the normal executor-neutral integration. A spawned
   task must own its request and the kit or an `Arc` clone; its owning future and
   output must remain `Send + 'static`.
-- Keep `WorkParallelism::Fixed(n)` as both the `n`-thread Rayon budget and the
-  `n`-operation root admission budget. The runtime-default policy derives both
-  budgets from the worker count selected when the pool is built.
-- Keep admission waits asynchronous. A future dropped before admission must
-  submit no work; a canceled queued job is skipped best effort; finite work
-  that has started must run to completion, with an unobserved result discarded.
-- Document host timeouts as bounds on waiting rather than preemption of CPU
-  work. Library admission does not bound pending tasks or their owned catalogs,
-  so service hosts must also limit request creation. Promise no FIFO order.
-- Keep worker completion on the runtime-neutral one-shot bridge and forward
-  worker panics to the polling thread. Because operations only transform owned
+- Keep `WorkerPool`, active-root admission, and pending-root admission as three
+  independent budgets. `RuntimeDefault` and `Dedicated` own a local Rayon pool;
+  `Shared` reuses a caller-owned `Arc<rayon::ThreadPool>` without selecting an
+  async runtime.
+- Reject work immediately when active plus pending admission is full. Dropping
+  a queued future releases admission without submitting work. Dropping a
+  running future sets its cooperative cancellation probe; synchronous domain
+  owners check that probe between files, modules, diagnostic batches, and
+  rendered documents.
+- Document cancellation as cooperative, not thread preemption. Keep pending
+  ownership bounded by `max_pending_operations`, promise no FIFO order, and
+  return a typed queue-full error when saturated.
+- Keep worker completion on the runtime-neutral one-shot bridge, release
+  admission and active permits before waking completion, and forward worker
+  panics to the polling thread. Because operations only transform owned
   in-memory catalogs, discarded results must not leave partial external side
   effects.
 - Use exactly one `AsyncWorkPool::execute` call around each complete public
-  operation. Keep parser backends synchronous and `Send + Sync`; they must not
-  accept the work pool or submit work themselves.
+  operation. Keep the parser synchronous and `Send + Sync`; it must not
+  accept the work pool or submit work itself.
 - Treat `FileCatalog` as every byte input and byte output boundary.
 - Treat `CatalogPath` as a validated logical UTF-8 catalog path. It is not an
   operating-system path.
@@ -43,13 +47,13 @@ operational rules and exact validation commands here.
 - Use `$use-rust-best-practices-core` for any Rust planning, editing, review,
   debugging, or validation task in this crate.
 - Add `$use-rust-best-practices-architecture` when changing crate, module,
-  public API, parser-dispatch, or test placement.
+  public API, parser ownership, or test placement.
 - Add `$use-rust-best-practices-testing` when changing unit tests,
   integration tests, boundary scanners, doctests, or validation strategy.
 - Add `$use-rust-best-practices-async` before changing public async methods,
   work-pool behavior, cancellation, or CPU scheduling.
-- Add `$use-rust-best-practices-abstractions` before changing dispatcher
-  traits, private backend traits, error shapes, or receiver-method ownership.
+- Add `$use-rust-best-practices-abstractions` before changing concrete parser
+  ownership, error shapes, or receiver-method boundaries.
 - Add `$rust-code-structuring-best-practices` before changing structs, enums,
   builders, repeated parameter groups, Rust item type handling, or standalone
   helper placement.
@@ -83,18 +87,27 @@ operational rules and exact validation commands here.
 Treat [the Rust YAML format architecture](ARCHITECTURE.md#rust-yaml-contract-format)
 as the semantic source of truth. Operationally:
 
-- Preserve the single combined dialect; add no compatibility path, split
-  dialect, or standalone implementation representation.
-- Keep one parsed document-set owner and immediate raw-YAML-to-domain
-  conversion private under `languages/rust/parser/yaml/`. Do not add a second
-  catalog parse or a post-validation YAML semantic mirror.
-- Preserve module traversal, global local-owner normalization, strict
-  kind-specific fields, ABI-presence semantics, declaration order, linked-item
-  extraction, and lossless generated round trips exactly as documented.
-- Treat item macros that share a file, module path, and semantic name as
-  distinct by one-based declaration occurrence. Preserve numeric occurrence
-  ordering beyond `#9`, label retention by occurrence during regeneration,
-  and occurrence-aware linked-source resolution.
+- Preserve the single mandatory-v2 combined dialect and nested sketch body;
+  add no versionless/v1 compatibility path, split dialect, flattened-sketch
+  branch, or standalone implementation representation.
+- Keep one typed parsed document-set owner and immediate maintained-YAML-to-
+  domain conversion private under `languages/rust/parser/yaml/`. Physical
+  document path/index locators disambiguate processing and diagnostics but are
+  not semantic identity. Do not add a second catalog parse or a
+  post-validation YAML semantic mirror.
+- Load the lossless YAML tree only after full document-render inequality is
+  known. Preserve original bytes on exact no-ops, edit only affected nodes,
+  and semantically reparse every changed result before returning it.
+- Preserve explicit crate roots, allowlist-bounded module traversal, lexical
+  local-owner resolution, strict kind-specific fields, ABI-presence semantics,
+  declaration order, linked-item extraction, and lossless generated round
+  trips exactly as documented. Never restore a global bare-name fallback.
+- Treat structurally repeatable items that share a crate, logical module,
+  item kind, and semantic name as distinct by one-based declaration
+  occurrence. A physical source path is locator evidence, not semantic
+  identity. Preserve numeric occurrence ordering beyond `#9`, label retention
+  by occurrence during regeneration, and occurrence-aware linked-source
+  resolution.
 - Keep scenario contracts on the current combined format, and add focused
   parser, generation, round-trip, or linked-source tests under
   `languages/rust/parser/yaml/tests/` before changing the format behavior.
@@ -119,8 +132,10 @@ as the semantic source of truth. Operationally:
 ## Internal Ownership Rules
 
 - Keep `api.rs` responsible for public DTOs, the builder, public behavior
-  wiring, private backend dispatch, top-level async work submission, the
-  complete check and diff workflow owners, and report byte rendering.
+  wiring, direct top-level async work submission, the
+  complete check and diff workflow owners, report byte rendering, and borrowed
+  standalone/embedded report views. Do not expose or copy a second report DTO
+  for CLI composition.
 - Keep `error.rs` responsible for `SignatureContractKitError`, contextual
   operation errors, catalog conversion, and language-neutral inventory-error
   conversion.
@@ -131,11 +146,25 @@ as the semantic source of truth. Operationally:
 - Keep `inventory.rs` language-neutral. It stores opaque IDs and digests only.
 - Keep `languages/mod.rs` as a thin parser surface.
 - Keep Rust parsing, Rust identity, Rust type conversion, Rust canonical bytes,
-  synchronous parser dispatch, and Rust YAML read/render behavior under
+  synchronous parser execution, and Rust YAML read/render behavior under
   `languages/rust/parser`.
+- Keep the one private syntax/compiler backend contract and exhaustive enum
+  dispatcher under `languages/rust/parser/backend`; retain concrete adapters,
+  receiver-style forwarding, and no trait objects or macro dispatch.
+- Keep operation-scoped declaration/implementation collection and capability
+  diagnostics in `inventory_collector.rs`; projections and source graphs must
+  not snapshot or reinsert those diagnostics.
 - Keep combined-document parse/render and linked-sketch resolution under
-  `languages/rust/parser/yaml/`. Shared modules should only see the neutral
-  parser boundary and generated `FileCatalog` bytes.
+  `languages/rust/parser/yaml/`. The `input` facade delegates document,
+  declaration, member, and metadata wire concerns to its children; the
+  `render` facade delegates proposal, lossless-edit, and typed-output concerns
+  to its children. Shared modules should only see the neutral parser boundary
+  and generated `FileCatalog` bytes.
+- Keep compiler-artifact validation, immutable indexing, module traversal,
+  declaration/type lowering, and provenance resolution in the focused
+  `languages/rust/rustdoc` children. Full rustdoc semantics are decoded once
+  here and lowering borrows artifact items while mutable output state remains
+  separate.
 - Keep Rust parser domain structs under `languages/rust/types`.
 - Keep production modules free of test-only API shape changes. Do not add
   `#[cfg(test)]` impls, methods, imports, fields, trait impls, or constructors
@@ -149,8 +178,8 @@ as the semantic source of truth. Operationally:
   YAML behavior.
 - Parse and render multi-file Rust inputs in parallel only when results are
   sorted before merging or returning.
-- Use explicit dispatcher match arms with receiver-method calls. Do not use
-  wildcard arms or macro-generated dispatch for implementation families.
+- Keep closed domain-enum match arms explicit and receiver-owned. Do not use
+  wildcard arms or macro-generated forwarding for implementation families.
 
 ## Validation Defaults
 
@@ -173,11 +202,11 @@ docs describe current behavior or validation boundaries.
 
 - Keep crate-level integration tests in `conkit-signature/tests`.
 - Keep unit tests next to the implementation they exercise.
-- Keep structural boundary scanners in `conkit-signature/tests/public_api.rs` when
-  they guard public API or production-source invariants.
+- Keep `conkit-signature/tests/public_api.rs` as the one integration-crate root
+  over focused support, async-contract, boundary, and workflow children.
 - Keep compile-time coverage for `Send` directly borrowed operation futures and
   `Send + 'static` owning task futures and outputs in
-  `conkit-signature/tests/public_api.rs`.
+  `conkit-signature/tests/public_api/async_contract.rs`.
 - Keep deterministic admission, pre-start and post-start cancellation,
   maximum active-root, panic-forwarding, and worker-loss tests in the local
   `work.rs` test module. Coordinate them with channels, manual polling, and

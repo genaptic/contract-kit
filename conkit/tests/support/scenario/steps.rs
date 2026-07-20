@@ -141,8 +141,10 @@ impl RunStep {
         if executable.as_str() != "conkit" {
             return Err("run argv[0] must be exactly \"conkit\"".to_owned());
         }
+        let mut previous = None;
         for argument in &self.argv[1..] {
-            argument.validate()?;
+            argument.validate_for_option(previous)?;
+            previous = Some(argument.as_str());
         }
         if let Some(cwd) = &self.cwd {
             cwd.validate()?;

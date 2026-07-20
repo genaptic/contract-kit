@@ -5,9 +5,14 @@ extending the root `AppCommand` architecture.
 
 > **`conkit` mapping:** These are generic, non-normative diff shapes. For `conkit`,
 > use `conkit/args.rs`, native async `AppCommand` receiver methods in
-> `conkit/command.rs`, CLI-owned filesystem adapters, catalog/byte domain
-> requests, and manifest-aware scenarios. Do not copy the example's CRUD
-> grammar, package names, domain `PathBuf` requests, or synchronous methods.
+> `conkit/command.rs`, and the application-owned `CommandContext` services:
+> one shared Rayon pool, independent zero-pending domain admission, process
+> cancellation, `CatalogReadLimits`, and `CompilerExtractor`. Keep one bounded
+> `CatalogReadBudget`, requested/persisted extraction reconciliation, OS paths,
+> Cargo processes, and persistence in the CLI; pass only catalog/byte requests
+> with typed extraction to domains. Do not copy the example's CRUD grammar,
+> package names, domain `PathBuf` requests, command-local pools, unbounded reads,
+> or synchronous methods.
 
 ## Table of contents
 

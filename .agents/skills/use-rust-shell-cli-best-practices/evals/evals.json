@@ -14,7 +14,12 @@
     {
       "id": "path-cross-platform",
       "prompt": "I need to fix a command that uses string concatenation for file paths and fails on Windows. What should Codex change?",
-      "expected_output": "Uses this skill and recommends Path/PathBuf, path.join, fs-err, tests with spaces and non-ASCII paths, and avoiding hard-coded Unix assumptions."
+      "expected_output": "Uses this skill and recommends Path/PathBuf, path.join, fs-err where appropriate, the repository's capability-safe filesystem adapters for conkit catalog paths, tests with spaces and non-ASCII paths, and avoiding hard-coded Unix assumptions; for conkit catalog inputs it also preserves CatalogReadLimits and the operation-wide cancellation-aware CatalogReadBudget."
+    },
+    {
+      "id": "review-conkit-runtime-ownership-regression",
+      "prompt": "Review a proposed conkit generate refactor that creates a Rayon pool in each command, allows 64 pending operations, uses read_to_end without a byte ceiling, and moves Cargo/rustdoc extraction into conkit-signature.",
+      "expected_output": "Uses this skill to reject the refactor, reuses the one CommandContext-owned Rayon pool, preserves independent signature/sketch admission with the CLI's zero-pending policy, keeps one cancellation-aware CatalogReadBudget across filesystem phases, retains SignatureExtractionCoordinator and CompilerExtractor in conkit, and passes only catalogs, bytes, and typed RustExtractionInput into the domain crate."
     }
   ]
 }

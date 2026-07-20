@@ -48,7 +48,7 @@ steps:
     stderr:
       kind: exact
       value: |
-        failed to parse catalog input main.yml: orphan sketch answer_body is not referenced by a signature
+        failed to parse catalog input main.yml document 0: orphan sketch answer_body is not referenced by a signature
 - type: assert_tree
   actual: /output
   expected: output

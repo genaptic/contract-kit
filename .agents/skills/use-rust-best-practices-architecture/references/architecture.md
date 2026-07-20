@@ -7,7 +7,7 @@ Use this reference when designing or restructuring package layout, workspace str
 - [Prefer Cargo's standard target layout](#1-prefer-the-standard-cargo-target-layout)
 - [Keep `main.rs` thin](#2-keep-mainrs-thin)
 - [Follow repository module policy](#3-follow-the-repositorys-module-policy-first)
-- [Keep enum-dispatch contracts provider-agnostic](#4-keep-enum-dispatch-contracts-provider-agnostic)
+- [Keep enum-dispatch contracts implementation-agnostic](#4-keep-enum-dispatch-contracts-implementation-agnostic)
 - [Organize by domain and behavior](#5-organize-by-domain-and-behavior)
 - [Use `src/bin/` before adding a package](#6-use-srcbin-before-adding-a-new-package)
 - [Use workspaces for package boundaries](#7-use-workspaces-for-real-package-boundaries)
@@ -156,10 +156,12 @@ entrypoints when the repository has not standardized on `mod.rs`.
 
 Do not mass-convert a large codebase just for style unless the task already includes that cleanup.
 
-## 4. Keep enum-dispatch contracts provider-agnostic
+## 4. Keep enum-dispatch contracts implementation-agnostic
 
-When a module owns a shared enum-dispatch trait contract, keep that module to
-provider-agnostic traits, shared handles, and default helpers. Concrete
+First require multiple real concrete implementations before introducing an
+enum-dispatch trait contract. A single behavior owner should remain concrete.
+When a module does own a justified closed-family contract, keep that module to
+implementation-agnostic traits, shared handles, and default helpers. Concrete
 backend, provider, model, database, runtime, or source impl blocks belong under
 the owning implementation subtree.
 
@@ -191,6 +193,13 @@ not turn them into shared backend/provider/source identity, provenance,
 capability, diagnostic-label, or error-label helpers; those facts belong in the
 owning implementation subtree or in a documented public data/config type with a
 narrow role.
+
+Contract Kit's current domain example is the private
+`RustExtractionBackend` contract: syntax and compiler extraction are the two
+concrete implementations, and `RustBackend` owns their exhaustive routing.
+`SketchContractKit` remains a direct concrete owner. Do not add a sketch
+backend trait, inner dispatch enum, or forwarding facade without a second real
+implementation that establishes the boundary.
 
 ## 5. Organize by domain and behavior
 
@@ -325,6 +334,25 @@ Use `default-members` when the workspace contains expensive or optional crates, 
 - benchmarking-only crates
 
 This keeps common root commands fast and predictable.
+
+### Preserve the Contract Kit workspace boundary
+
+Contract Kit has exactly three production workspace members:
+
+- `conkit` owns the CLI, mixed signature/sketch archive transport, bounded
+  filesystem catalog reads, compiler-process extraction, process cancellation,
+  and the one application-owned Rayon pool shared with both domains.
+- `conkit-signature` owns signature semantics, compiler-artifact interpretation,
+  nominal signature limits and work options, independent active/pending
+  admission, and direct revalidation of its inputs and outputs.
+- `conkit-sketch` owns sketch semantics, nominal sketch limits and work options,
+  independent active/pending admission, and direct revalidation of its inputs
+  and outputs.
+
+Keep those resource and semantic boundaries explicit. Do not extract
+`conkit-core`, a shared limits package, or a cross-domain error trait. The
+nightly-only `fuzz` workspace is excluded from this three-member production
+workspace and is not a fourth production crate.
 
 ## 8. Decide between extending a crate and creating a new one
 
@@ -475,7 +503,9 @@ pub enum OrderError {
 
 - keep binaries thin
 - keep modules domain-oriented
-- keep shared enum-dispatch contract modules provider-agnostic
+- keep justified enum-dispatch contract modules implementation-agnostic
+- preserve Contract Kit's three production crate boundaries and application-
+  owned shared CPU pool
 - use `src/bin/` for small operational helpers
 - use workspaces for real package boundaries
 - place tests at the narrowest useful level
@@ -485,6 +515,8 @@ pub enum OrderError {
 
 - create “utils” dumping grounds
 - centralize concrete enum-dispatch impls in shared contract modules
+- add enum dispatch to a single concrete owner such as `SketchContractKit`
+- add `conkit-core`, shared limit carriers, or cross-domain error traits
 - split crates for speculative abstraction
 - keep all behavior in `main.rs`
 - change a repository-wide module policy casually

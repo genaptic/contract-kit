@@ -1,0 +1,5 @@
+root: ../src
+files: [lib.rs]
+extraction: { mode: rust_syntax_v2, profile: rust_api_v1, crates: [{ id: fuzz, root: lib.rs, kind: library }] }
+signatures: []
+sketches: []

@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fmt;
@@ -13,7 +14,8 @@ use std::fmt;
 ///
 /// Serde encodings represent catalog paths as scalar string map keys.
 /// Deserialization validates every key through [`CatalogPath::new`], so encoded
-/// input cannot bypass the logical-path rules.
+/// input cannot bypass the logical-path rules, and duplicate encoded keys are
+/// rejected instead of overwriting an earlier entry.
 ///
 /// # Examples
 ///
@@ -27,7 +29,8 @@ use std::fmt;
 /// catalog.insert(lib.clone(), b"pub fn answer() -> u8 { 42 }\n".to_vec())?;
 /// catalog.insert(
 ///     contract.clone(),
-///     b"root: ../src\nfiles: []\nsignatures: []\nsketches: []\n".to_vec(),
+///     b"contract_version: 2\nroot: ../src\nfiles: []\nsignatures: []\nsketches: []\n"
+///         .to_vec(),
 /// )?;
 ///
 /// assert_eq!(catalog.get(&lib), Some(&b"pub fn answer() -> u8 { 42 }\n"[..]));
@@ -37,9 +40,106 @@ use std::fmt;
 /// );
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct FileCatalog {
     files: BTreeMap<CatalogPath, Vec<u8>>,
+}
+
+impl<'de> Deserialize<'de> for FileCatalog {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_struct("FileCatalog", &["files"], FileCatalogVisitor)
+    }
+}
+
+struct FileCatalogVisitor;
+
+impl<'de> Visitor<'de> for FileCatalogVisitor {
+    type Value = FileCatalog;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a file catalog with one files map")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let files = sequence
+            .next_element::<CatalogEntries>()?
+            .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+
+        if sequence.next_element::<IgnoredAny>()?.is_some() {
+            return Err(de::Error::invalid_length(2, &self));
+        }
+
+        Ok(files.into_catalog())
+    }
+
+    fn visit_map<A>(self, mut mapping: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut files = None;
+
+        while let Some(field) = mapping.next_key::<String>()? {
+            if field == "files" {
+                if files.is_some() {
+                    return Err(de::Error::duplicate_field("files"));
+                }
+                files = Some(mapping.next_value::<CatalogEntries>()?.into_catalog());
+            } else {
+                mapping.next_value::<IgnoredAny>()?;
+            }
+        }
+
+        files.ok_or_else(|| de::Error::missing_field("files"))
+    }
+}
+
+struct CatalogEntries {
+    catalog: FileCatalog,
+}
+
+impl CatalogEntries {
+    fn into_catalog(self) -> FileCatalog {
+        self.catalog
+    }
+}
+
+impl<'de> Deserialize<'de> for CatalogEntries {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(CatalogEntriesVisitor)
+    }
+}
+
+struct CatalogEntriesVisitor;
+
+impl<'de> Visitor<'de> for CatalogEntriesVisitor {
+    type Value = CatalogEntries;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a map of unique logical catalog paths to bytes")
+    }
+
+    fn visit_map<A>(self, mut mapping: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut catalog = FileCatalog::new();
+
+        while let Some(path) = mapping.next_key::<CatalogPath>()? {
+            let contents = mapping.next_value::<Vec<u8>>()?;
+            catalog.insert(path, contents).map_err(de::Error::custom)?;
+        }
+
+        Ok(CatalogEntries { catalog })
+    }
 }
 
 impl FileCatalog {
@@ -403,6 +503,7 @@ impl FileCatalogError {
 #[cfg(test)]
 mod tests {
     use super::{CatalogPath, FileCatalog, FileCatalogError};
+    use proptest::prelude::*;
 
     #[test]
     fn catalog_path_accepts_valid_logical_paths() {
@@ -572,5 +673,94 @@ mod tests {
 
         assert_eq!(json, r#"{"files":{"src/a.rs":[97],"src/z.rs":[122]}}"#);
         assert_eq!(round_tripped, catalog);
+    }
+
+    #[test]
+    fn catalog_json_deserialization_rejects_duplicate_encoded_paths() {
+        let error =
+            serde_json::from_str::<FileCatalog>(r#"{"files":{"src/lib.rs":[1],"src/lib.rs":[2]}}"#)
+                .expect_err("encoded duplicate path must not overwrite the first entry");
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate catalog path: src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn catalog_yaml_deserialization_rejects_duplicate_encoded_paths() {
+        let options = serde_saphyr::options! {
+            duplicate_keys: serde_saphyr::DuplicateKeyPolicy::LastWins,
+        };
+        let error = serde_saphyr::from_str_with_options::<FileCatalog>(
+            "files:\n  src/lib.rs: [1]\n  src/lib.rs: [2]\n",
+            options,
+        )
+        .expect_err("encoded duplicate path must not overwrite the first entry");
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate catalog path: src/lib.rs")
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn generated_portable_catalog_paths_round_trip_as_validated_scalars(
+            components in prop::collection::vec(
+                prop::collection::vec(b'a'..=b'z', 1..16),
+                1..8,
+            ),
+        ) {
+            let value = components
+                .into_iter()
+                .map(|component| String::from_utf8(component).expect("ASCII component"))
+                .collect::<Vec<_>>()
+                .join("/");
+            let path = CatalogPath::new(value.clone()).expect("generated valid path");
+            let json = serde_json::to_string(&path).expect("serialize generated path");
+            let decoded = serde_json::from_str::<CatalogPath>(&json)
+                .expect("deserialize generated path");
+
+            prop_assert_eq!(decoded.as_str(), value);
+            prop_assert_eq!(decoded, path);
+        }
+
+        #[test]
+        fn catalog_serialization_is_independent_of_insertion_order(
+            names in prop::collection::btree_set(
+                prop::collection::vec(b'a'..=b'z', 1..24),
+                0..32,
+            ),
+        ) {
+            let entries = names
+                .into_iter()
+                .map(|name| {
+                    let name = String::from_utf8(name).expect("ASCII name");
+                    let path = CatalogPath::new(format!("src/{name}.rs"))
+                        .expect("generated source path");
+                    (path, name.into_bytes())
+                })
+                .collect::<Vec<_>>();
+            let mut forward = FileCatalog::new();
+            let mut reverse = FileCatalog::new();
+            for (path, bytes) in &entries {
+                forward
+                    .insert(path.clone(), bytes.clone())
+                    .expect("unique generated forward path");
+            }
+            for (path, bytes) in entries.iter().rev() {
+                reverse
+                    .insert(path.clone(), bytes.clone())
+                    .expect("unique generated reverse path");
+            }
+
+            prop_assert_eq!(
+                serde_json::to_vec(&forward).expect("serialize forward catalog"),
+                serde_json::to_vec(&reverse).expect("serialize reverse catalog"),
+            );
+        }
     }
 }

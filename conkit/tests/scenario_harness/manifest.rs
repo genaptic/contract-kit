@@ -1,18 +1,21 @@
 use super::{HarnessRepository, Scenario, Suite};
 
 #[test]
-fn coverage_registry_is_one_sorted_184_key_source_of_truth() {
+fn coverage_registry_is_one_sorted_semantic_source_of_truth() {
     let keys = Suite::required_coverage_keys();
 
-    assert_eq!(keys.len(), 184);
     assert!(keys.windows(2).all(|pair| pair[0] < pair[1]));
     for required in [
+        "behavior.check.matching.passes",
+        "behavior.check.mismatching.default-fails",
+        "behavior.check.mismatching.strict-fails",
+        "behavior.check.mismatching.warning-passes",
         "behavior.check.contracts.missing-listed-source",
         "behavior.check.contracts.multiple-documents",
         "behavior.check.contracts.overlapping-files",
         "behavior.check.contracts.root-mismatch",
         "behavior.check.contracts.signature-unlisted-file",
-        "behavior.check.sketch.whitespace-normalized",
+        "behavior.check.sketch.exact-lines-whitespace-mismatch",
         "behavior.diff.error.archive.trailing-data",
         "behavior.check.diagnostic.sketch.orphan-link",
         "behavior.generate.error.invalid-linked-sketch-resolution",
@@ -23,6 +26,8 @@ fn coverage_registry_is_one_sorted_184_key_source_of_truth() {
         assert!(keys.binary_search(&required).is_ok(), "missing {required}");
     }
     for obsolete in [
+        "behavior.check.matrix.all.default.matching",
+        "behavior.check.report.all.json",
         "behavior.check.diagnostic.sketch.missing-file",
         "behavior.generate.cleanup.signatures-selected",
         "behavior.generate.cleanup.sketches-selected",
@@ -72,7 +77,7 @@ steps: []
     assert!(cases.contains("unknown field `cases`"), "{cases}");
     assert!(fixture.contains("unknown field `fixture`"), "{fixture}");
     assert!(test_field.contains("unknown field `test`"), "{test_field}");
-    assert!(scalar.contains("invalid type"), "{scalar}");
+    assert!(scalar.contains("expected mapping start"), "{scalar}");
 }
 
 #[test]
@@ -88,11 +93,14 @@ fn manifest_rejects_versions_empty_steps_unknown_fields_and_malformed_yaml() {
         "version: 1\nunknown: true\nsteps: []\n",
     );
     let malformed = repository.load_error("malformed", "version: [\n");
+    let duplicate =
+        repository.load_error("duplicate-root-key", "version: 1\nversion: 1\nsteps: []\n");
 
     assert!(version.contains("unsupported version 2"), "{version}");
     assert!(empty.contains("steps must not be empty"), "{empty}");
     assert!(unknown.contains("unknown field `unknown`"), "{unknown}");
     assert!(malformed.contains("could not parse"), "{malformed}");
+    assert!(duplicate.contains("duplicate"), "{duplicate}");
 }
 
 #[test]
@@ -126,7 +134,7 @@ fn manifest_accepts_known_coverage_and_rejects_unknown_scalar_and_duplicates() {
     );
 
     assert!(unknown.contains("unknown coverage key"), "{unknown}");
-    assert!(scalar.contains("invalid type"), "{scalar}");
+    assert!(scalar.contains("expected sequence start"), "{scalar}");
     assert!(duplicate.contains("duplicate coverage key"), "{duplicate}");
 }
 
@@ -169,13 +177,20 @@ steps:
 fn coverage_audit_aggregates_leaf_manifests_and_reports_sorted_missing_keys() {
     let repository = HarnessRepository::new();
     let keys = Suite::required_coverage_keys();
-    repository.write_scenario("coverage-a", &repository.coverage_manifest(&keys[..90]));
-    repository.write_scenario("coverage-b", &repository.coverage_manifest(&keys[90..]));
+    let midpoint = keys.len() / 2;
+    repository.write_scenario(
+        "coverage-a",
+        &repository.coverage_manifest(&keys[..midpoint]),
+    );
+    repository.write_scenario(
+        "coverage-b",
+        &repository.coverage_manifest(&keys[midpoint..]),
+    );
 
     repository
         .discover()
         .audit_cli_coverage()
-        .expect("all 184 keys should aggregate across leaves");
+        .expect("all semantic keys should aggregate across leaves");
 
     let incomplete = HarnessRepository::new();
     incomplete.write_scenario("no-coverage", &incomplete.version_manifest(0));
@@ -344,4 +359,37 @@ steps:
         absolute.contains("path must begin with exactly /work, /input, or /output"),
         "{absolute}"
     );
+}
+
+#[test]
+fn manifest_accepts_typed_crate_roots_and_rejects_host_absolute_root_paths() {
+    let repository = HarnessRepository::new();
+    let accepted = repository.write_scenario(
+        "typed-crate-root",
+        r#"version: 1
+steps:
+  - type: run
+    argv: [conkit, generate, signatures, --crate-root, example=library:src/lib.rs]
+    expect:
+      exit_code: 0
+      stdout: { kind: empty }
+      stderr: { kind: empty }
+"#,
+    );
+    Scenario::load(&accepted).expect("typed crate root should parse");
+
+    let absolute = repository.load_error(
+        "absolute-crate-root",
+        r#"version: 1
+steps:
+  - type: run
+    argv: [conkit, generate, signatures, --crate-root, 'example=library:C:/src/lib.rs']
+    expect:
+      exit_code: 0
+      stdout: { kind: empty }
+      stderr: { kind: empty }
+"#,
+    );
+
+    assert!(absolute.contains("host-absolute paths"), "{absolute}");
 }

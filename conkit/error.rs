@@ -1,18 +1,55 @@
 //! Error type for CLI-owned failures.
 //!
-//! Domain crates expose their own typed errors. This module wraps those errors
-//! with filesystem, platform, reporting, archive, and target-selection failures
-//! that only the executable can produce.
+//! Domain crates expose their own typed errors. This module adds the failures
+//! owned by the executable: process cancellation and signal registration,
+//! compiler extraction, bounded catalog reads, portable path handling,
+//! mandatory-v2 YAML layout validation, reports and archives, and generated-
+//! file ownership and reconciliation.
 
 use std::path::PathBuf;
 use std::time::SystemTimeError;
 
-use crate::catalog::PathRole;
+use crate::catalog::{CatalogReadLimitExceeded, PathRole};
+use crate::compiler::CompilerError;
 use crate::contracts::ContractTarget;
 
-/// Errors produced by CLI parsing adapters and filesystem boundaries.
+/// Structured duplicate-key failure from a physical combined-contract document.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error(
+    "duplicate YAML mapping key {:?} in {path} at YAML document index {document_index}, line {}, column {}",
+    .key.as_deref().unwrap_or("<non-scalar>"),
+    .location.line(),
+    .location.column()
+)]
+pub(crate) struct DuplicateContractKey {
+    /// Logical contract path containing the invalid document.
+    pub(crate) path: PathBuf,
+    /// Zero-based physical YAML document index.
+    pub(crate) document_index: usize,
+    /// Scalar key text when the YAML parser can represent it losslessly.
+    pub(crate) key: Option<String>,
+    /// Complete source location reported by the maintained YAML parser.
+    pub(crate) location: serde_saphyr::Location,
+}
+
+/// Errors produced by CLI-owned process, parsing, filesystem, and persistence boundaries.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CliError {
+    /// Process-level cancellation was requested by the host operating system.
+    #[error("operation canceled")]
+    OperationCanceled,
+    /// The process-level termination handler could not be installed.
+    #[error("failed to install the process termination handler")]
+    SignalHandler {
+        #[source]
+        source: ctrlc::Error,
+    },
+    /// Compiler-backed signature extraction failed at the CLI process boundary.
+    #[error(transparent)]
+    Compiler(#[from] CompilerError),
+    /// A CLI filesystem-to-catalog read exceeded its configured budget.
+    #[error(transparent)]
+    CatalogReadLimit(#[from] CatalogReadLimitExceeded),
     /// A command path could not be resolved for overlap validation.
     #[error("failed to resolve {role} path {path}")]
     PathResolution {
@@ -29,9 +66,6 @@ pub(crate) enum CliError {
         second_role: PathRole,
         second_path: PathBuf,
     },
-    /// A path resolved outside its selected filesystem root.
-    #[error("path {path} resolves outside selected root {root}")]
-    PathEscapesRoot { root: PathBuf, path: PathBuf },
     /// A path contains a symbolic link that cannot participate in stable ownership.
     #[error("{role} path contains an unsupported symbolic link: {path}")]
     UnsupportedPathSymlink { role: PathRole, path: PathBuf },
@@ -99,12 +133,24 @@ pub(crate) enum CliError {
     /// A source path named by a contract document is not a regular file.
     #[error("listed source path is not a regular file: {path}")]
     ListedSourceNotFile { path: PathBuf },
-    /// A selected source path changed while its file handle was being opened.
-    #[error("listed source path changed while it was being opened: {path}")]
-    ListedSourceChanged { path: PathBuf },
     /// A combined contract document has an invalid filesystem binding.
     #[error("invalid contract layout {path}: {message}")]
     ContractLayout { path: PathBuf, message: String },
+    /// A physical YAML contract document contains a duplicate mapping key.
+    #[error(transparent)]
+    DuplicateContractKey(#[from] DuplicateContractKey),
+    /// A combined YAML document is not the current contract format.
+    #[error(
+        "unsupported contract version in {path} at YAML document index {document_index}: {message}"
+    )]
+    UnsupportedContractVersion {
+        /// Logical or local path containing the unsupported document.
+        path: PathBuf,
+        /// Zero-based nonempty document index within the YAML stream.
+        document_index: usize,
+        /// Upgrade or unsupported-version detail.
+        message: String,
+    },
     /// A host path component could not be converted to UTF-8.
     #[error("path contains a non-UTF-8 component")]
     NonUtf8PathComponent,
@@ -124,6 +170,18 @@ pub(crate) enum CliError {
         path: PathBuf,
         /// Serialization failure message.
         message: String,
+    },
+    /// A rendered or domain-provided report exceeded the CLI output budget.
+    #[error(
+        "report output byte limit exceeded for {path}: limit {limit}, observed at least {observed_at_least}"
+    )]
+    ReportOutputLimit {
+        /// Local report path that would have received the oversized output.
+        path: PathBuf,
+        /// Configured maximum report bytes.
+        limit: u64,
+        /// Amount known when rendering or validation stopped.
+        observed_at_least: u64,
     },
     /// The selected contract target reported a failed check.
     #[error("contract check failed for {target:?}")]

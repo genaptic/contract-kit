@@ -1,0 +1,75 @@
+[graph]
+# Match the production CI's supported operating-system families while keeping
+# the dependency graph independent from the nightly-only fuzz workspace.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+# Vulnerability advisories are denied by cargo-deny. Make the additional
+# hardening categories explicit so a tool-default change cannot weaken them.
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+maximum-db-staleness = "P30D"
+ignore = []
+
+[licenses]
+confidence-threshold = 0.93
+include-dev = true
+include-build = true
+unused-allowed-license = "allow"
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "NCSA",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+# Warn about ecosystem-wide duplication, but fail only for crates whose
+# duplicate runtime formats or semantic engines would compromise determinism.
+multiple-versions = "warn"
+multiple-versions-include-dev = true
+wildcards = "deny"
+highlight = "simplest-path"
+deny = [
+    { crate = "async-lock", deny-multiple-versions = true, reason = "work admission must use one synchronization implementation" },
+    { crate = "rayon", deny-multiple-versions = true, reason = "both domains must share one compatible scheduler implementation" },
+    { crate = "serde", deny-multiple-versions = true, reason = "wire and contract models must use one serialization ABI" },
+    { crate = "serde-saphyr", deny-multiple-versions = true, reason = "all production YAML semantics must use one maintained parser version" },
+    { crate = "serde_json", deny-multiple-versions = true, reason = "reports and compiler artifacts must use one JSON semantic implementation" },
+    { crate = "sha2", deny-multiple-versions = true, reason = "versioned contract digests must use one hashing implementation" },
+    { crate = "syn", deny-multiple-versions = true, reason = "syntax extraction must not mix incompatible Rust syntax models" },
+    { crate = "yaml-edit", deny-multiple-versions = true, reason = "lossless YAML edits must use one concrete-syntax-tree implementation" },
+    { crate = "serde_yaml", reason = "the archived parser is replaced by serde-saphyr plus yaml-edit" },
+]
+
+[bans.workspace-dependencies]
+duplicates = "deny"
+include-path-dependencies = false
+unused = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+required-git-spec = "rev"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+unused-allowed-source = "allow"

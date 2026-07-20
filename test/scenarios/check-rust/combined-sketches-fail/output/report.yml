@@ -4,17 +4,38 @@ signatures:
   counts:
     source_signature_count: 1
     contract_signature_count: 1
-  inventory_digest: 938e22ab00ca16b405a6c3f2b407bb210bab6c34a3f0a50ad94fbad3926d399e
+  source_shape_digest: 9c4a93d7bca1a78e3514645d0e6906d5e7fb1d68e16e8002155f8f800bc51525
+  digest_version: 2
   diagnostics: []
 sketches:
   passed: false
   counts:
-    source_file_count: 1
-    contract_file_count: 1
+    source_catalog_entry_count: 1
+    referenced_source_file_count: 1
+    present_referenced_source_file_count: 1
+    contract_document_count: 1
     sketch_count: 1
     matched_sketch_count: 0
     failed_sketch_count: 1
   diagnostics:
-  - !NotMatched
-    sketch_id: answer_body
-    file: lib.rs
+  - NotMatched:
+      sketch:
+        sketch_id: answer_body
+        contract_file: main.yml
+        document_index: 0
+        source_file: lib.rs
+      normalization: exact_lines_v1
+      candidate:
+        source:
+          start: 1
+          end: 1
+        expected_line: 1
+        source_line: 1
+        expected:
+          Bytes:
+            escaped: pub fn answer() -> u8 { 43 }
+            truncated: false
+        actual:
+          Bytes:
+            escaped: pub fn answer() -> u8 { 42 }
+            truncated: false

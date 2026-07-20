@@ -26,7 +26,7 @@ steps:
         failed to diff sketch contracts
 
         Caused by:
-            failed to parse catalog input main.yml: sketch answer_body code must not be empty
+            failed to parse catalog input main.yml document 0: sketch answer_body code must not be empty
 - type: overlay
   source: input/contracts/main.yml
   destination: /input/contracts/main.yml

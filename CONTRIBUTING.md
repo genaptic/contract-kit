@@ -33,8 +33,9 @@ Install:
 
 The repository's `rust-toolchain.toml` pins Rust 1.97.0 with `rustfmt` and
 Clippy for development. Rustup selects that toolchain automatically when you
-work in the checkout. This pin is not a declared minimum supported Rust
-version (MSRV).
+work in the checkout. Workspace manifests declare Rust 1.97 as the minimum
+supported Rust version (MSRV), and release preflight verifies that all three
+packages retain that declaration.
 
 Clone and build the workspace:
 

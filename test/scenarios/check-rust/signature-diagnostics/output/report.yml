@@ -1,14 +1,16 @@
 passed: false
+source_shape_digest: 06ebc922c87deb5fbda4f7f7ac509e49de45b6c6d4fe3bd618bda11d4f9e7a56
+digest_version: 2
 counts:
   source_signature_count: 2
   contract_signature_count: 2
-inventory_digest: 58d9f80e24c99ea0364c3c14b8e1204382b826c529de51ff62b47e8bf78aed1d
 diagnostics:
-- !Mismatched
-  signature_id: answer
-  expected_digest: 2346e94bb75bfad6216cde584a70260cae93d9a0cba9e644da47c5331259edc3
-  actual_digest: b9ec9b1b50dcc7a0b33c63aa620fcfbb83536f83f35036e4e97c8a5c0fd2890c
-- !Missing
-  signature_id: expected_only
-- !Extra
-  signature_id: rust:lib.rs:function:actual_only
+- Mismatched:
+    signature_id: main.yml::document:0::answer
+    expected_digest: 09c30fb0d814208de56b221fea9b0327022c607edb43f94ffe191933ab050294
+    actual_digest: ee547bfe03a5625ef1fc5fe94769de79b6e1cdfd54027ffca0e40050c9925d5d
+- Missing:
+    signature_id: main.yml::document:0::expected_only
+- Extra:
+    signature_id: >-
+      main.yml::document:0::rust:v2:crate:6:sample:modules:0:kind:8:function:name:11:actual_only:occurrence:1:1

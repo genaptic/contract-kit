@@ -12,12 +12,14 @@ steps:
   - /input/source
   - --contracts
   - /output/contracts
+  - --crate-root
+  - scenario=library:nested/lib.rs
   expect:
     exit_code: 0
     stdout:
       kind: exact
       value: |
-        generated 2 signature contracts
+        signature generation completed: documents 1, signatures 3, preserved sketches 0, semantically changed documents 1, byte-changed documents 1
     stderr:
       kind: empty
 - type: overlay
@@ -42,7 +44,7 @@ steps:
     stderr:
       kind: exact
       value: |
-        failed to parse catalog input main.yml: sketch answer_body code must not be empty
+        failed to parse catalog input main.yml document 0: sketch answer_body code must not be empty
 - type: assert_tree
   actual: /output/contracts
   expected: output

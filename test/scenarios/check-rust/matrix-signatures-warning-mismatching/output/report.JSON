@@ -1,0 +1,18 @@
+{
+  "passed": true,
+  "source_shape_digest": "604e569a4332faf7841a544176a54027c18fac8d3764c81e007699e2a2864f54",
+  "digest_version": 2,
+  "counts": {
+    "source_signature_count": 1,
+    "contract_signature_count": 1
+  },
+  "diagnostics": [
+    {
+      "Mismatched": {
+        "signature_id": "main.yml::document:0::answer",
+        "expected_digest": "09c30fb0d814208de56b221fea9b0327022c607edb43f94ffe191933ab050294",
+        "actual_digest": "ee547bfe03a5625ef1fc5fe94769de79b6e1cdfd54027ffca0e40050c9925d5d"
+      }
+    }
+  ]
+}

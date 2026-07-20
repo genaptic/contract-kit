@@ -24,7 +24,7 @@ steps:
     stdout:
       kind: exact
       value: |
-        sketch check passed: 1 matched sketches, 0 failed sketches
+        sketch check passed: matched 1, failed 0, total 1; referenced sources present 1/1; catalog entries 5; contract documents 1
     stderr:
       kind: empty
 - type: assert_tree

@@ -1,7 +1,127 @@
 use crate::api::{CheckMode, CheckResponse};
-use crate::files::FileCatalog;
+use crate::contract::{SketchNormalization, SketchOccurrence};
+use crate::files::{CatalogPath, FileCatalog};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+
+/// Complete logical location of one parsed sketch and its referenced source.
+///
+/// The contract file and document index locate the authoring site, while the
+/// source file locates the bytes that participated in matching. All paths are
+/// validated logical catalog paths rather than operating-system paths.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct SketchLocation {
+    /// User-defined sketch identifier.
+    pub sketch_id: String,
+    /// Logical path of the combined contract document containing the sketch.
+    pub contract_file: CatalogPath,
+    /// Zero-based YAML document index within `contract_file`.
+    pub document_index: usize,
+    /// Logical source path referenced by the sketch.
+    pub source_file: CatalogPath,
+}
+
+impl SketchLocation {
+    pub(crate) fn new(
+        sketch_id: impl Into<String>,
+        contract_file: CatalogPath,
+        document_index: usize,
+        source_file: CatalogPath,
+    ) -> Self {
+        Self {
+            sketch_id: sketch_id.into(),
+            contract_file,
+            document_index,
+            source_file,
+        }
+    }
+}
+
+/// One-based inclusive source-line range for a matching occurrence or candidate.
+///
+/// Exactly-one occurrence evidence is recorded in source-start order. Ranges
+/// may overlap because every contiguous start position is counted.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct SourceLineSpan {
+    /// One-based first source line in the range.
+    pub start: usize,
+    /// One-based final source line in the range, included in the range.
+    pub end: usize,
+}
+
+impl SourceLineSpan {
+    pub(crate) const fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+}
+
+/// Safely rendered line evidence for a failed sketch match.
+///
+/// Retained raw bytes are rendered with [`std::ascii::escape_default`], so
+/// quotes, backslashes, controls, and invalid UTF-8 are safe in text and
+/// serialized reports. Truncation is decided on the retained raw-byte prefix
+/// before escaping; escape expansion is still charged to the aggregate
+/// diagnostic-byte budget.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum DiagnosticExcerpt {
+    /// Escaped source or expected bytes that are safe for text reports.
+    Bytes {
+        /// ASCII-escaped representation of the retained raw-byte prefix.
+        escaped: String,
+        /// Whether the complete raw line exceeded the excerpt-retention budget.
+        truncated: bool,
+    },
+    /// No aligned line exists. The current matcher emits this for the actual
+    /// source side when an expected snippet extends past the source.
+    Missing,
+}
+
+impl DiagnosticExcerpt {
+    pub(crate) const fn missing() -> Self {
+        Self::Missing
+    }
+}
+
+/// Bounded evidence for the closest aligned source window after a mismatch.
+///
+/// Candidate scanning happens only after exact matching finds no occurrence.
+/// Every possible source start is scored by the number of expected lines equal
+/// to their aligned source lines. The highest score wins; an equal score keeps
+/// the earliest source start. Evidence identifies the first differing expected
+/// line. When the expected snippet extends past the selected source window,
+/// [`Self::actual`] is [`DiagnosticExcerpt::Missing`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MatchCandidate {
+    /// One-based inclusive source range covered by the aligned candidate.
+    pub source: SourceLineSpan,
+    /// One-based expected snippet line containing the first difference.
+    pub expected_line: usize,
+    /// One-based source line aligned with `expected_line`.
+    pub source_line: usize,
+    /// Expected snippet-line evidence.
+    pub expected: DiagnosticExcerpt,
+    /// Actual source evidence, or [`DiagnosticExcerpt::Missing`] when the
+    /// expected line extends past the available source.
+    pub actual: DiagnosticExcerpt,
+}
+
+impl MatchCandidate {
+    pub(crate) const fn new(
+        source: SourceLineSpan,
+        expected_line: usize,
+        source_line: usize,
+        expected: DiagnosticExcerpt,
+        actual: DiagnosticExcerpt,
+    ) -> Self {
+        Self {
+            source,
+            expected_line,
+            source_line,
+            expected,
+            actual,
+        }
+    }
+}
 
 /// A per-sketch diagnostic from a completed check.
 ///
@@ -10,139 +130,184 @@ use std::cmp::Ordering;
 /// [`SketchContractKitError`](crate::SketchContractKitError) from
 /// [`SketchContractKit::check`](crate::SketchContractKit::check), without a
 /// [`CheckResponse`]. When a check does complete, it retains diagnostics in
-/// every mode: [`CheckMode::Default`] and [`CheckMode::Strict`] fail a response
-/// that has diagnostics, while [`CheckMode::Warning`] allows it to pass.
+/// every mode: [`CheckMode::Enforce`] fails a response that has diagnostics,
+/// while [`CheckMode::Warning`] allows it to pass.
 ///
 /// A response has at most one diagnostic per parsed sketch. Diagnostics are
-/// ordered deterministically by sketch identifier, optional logical file path,
-/// and diagnostic kind. File values are logical catalog paths represented as
-/// strings, not operating-system paths or language-specific parser data.
+/// ordered deterministically by their complete [`SketchLocation`] and then by
+/// diagnostic kind. Evidence does not affect ordering. File values are logical
+/// catalog paths, not operating-system paths or language-specific parser data.
+///
+/// # Examples
+///
+/// Inspect exact occurrence totals separately from bounded span evidence.
+///
+/// ```
+/// use conkit_sketch::{
+///     CatalogPath, SketchDiagnostic, SketchLocation, SketchOccurrence,
+///     SourceLineSpan,
+/// };
+///
+/// let diagnostic = SketchDiagnostic::OccurrenceMismatch {
+///     sketch: SketchLocation {
+///         sketch_id: "pair".to_owned(),
+///         contract_file: CatalogPath::new("main.yml")?,
+///         document_index: 0,
+///         source_file: CatalogPath::new("lib.rs")?,
+///     },
+///     expected: SketchOccurrence::ExactlyOne,
+///     actual: 3,
+///     spans: vec![SourceLineSpan { start: 1, end: 2 }],
+///     spans_truncated: true,
+/// };
+///
+/// match diagnostic {
+///     SketchDiagnostic::OccurrenceMismatch {
+///         actual,
+///         spans,
+///         spans_truncated,
+///         ..
+///     } => {
+///         assert_eq!(actual, 3);
+///         assert_eq!(spans[0], SourceLineSpan { start: 1, end: 2 });
+///         assert!(spans_truncated);
+///     }
+///     _ => unreachable!("constructed an occurrence diagnostic"),
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SketchDiagnostic {
     /// The sketch references a logical file absent from the source catalog.
     MissingFile {
-        /// The user-defined sketch identifier.
-        sketch_id: String,
-        /// The logical source file path named by the sketch.
-        file: String,
+        /// Contract and source location of the sketch.
+        sketch: SketchLocation,
     },
-    /// The sketch snippet was empty after normalization.
-    ///
-    /// The public checker rejects an empty normalized snippet as a
-    /// [`SketchContractKitError`](crate::SketchContractKitError) while parsing
-    /// contracts, before constructing a response. This variant is therefore
-    /// not emitted by [`SketchContractKit::check`](crate::SketchContractKit::check).
-    EmptySnippet {
-        /// The user-defined sketch identifier.
-        sketch_id: String,
-    },
-    /// The source file existed, but the normalized snippet was not found as a
-    /// contiguous normalized line sequence.
+    /// The source file existed, but no occurrence satisfied the sketch.
     NotMatched {
-        /// The user-defined sketch identifier.
-        sketch_id: String,
-        /// The logical source file path named by the sketch.
-        file: String,
+        /// Contract and source location of the sketch.
+        sketch: SketchLocation,
+        /// Versioned normalization used for this comparison.
+        normalization: SketchNormalization,
+        /// Closest bounded source evidence, when a candidate window exists.
+        candidate: Option<MatchCandidate>,
     },
-    /// The contract catalog contained a duplicate sketch identifier.
-    ///
-    /// The public checker rejects duplicate identifiers as a
-    /// [`SketchContractKitError`](crate::SketchContractKitError) while parsing
-    /// contracts, before constructing a response. This variant is therefore
-    /// not emitted by [`SketchContractKit::check`](crate::SketchContractKit::check).
-    DuplicateSketch {
-        /// The duplicated user-defined sketch identifier.
-        sketch_id: String,
+    /// Matching occurrences violated the sketch's explicit occurrence policy.
+    OccurrenceMismatch {
+        /// Contract and source location of the sketch.
+        sketch: SketchLocation,
+        /// Occurrence policy required by the contract.
+        expected: SketchOccurrence,
+        /// Exact number of matching occurrences found in the source, including
+        /// overlapping occurrences.
+        actual: usize,
+        /// Bounded one-based inclusive occurrence ranges in source-start order.
+        spans: Vec<SourceLineSpan>,
+        /// Whether additional occurrence ranges were omitted from `spans`.
+        ///
+        /// Omission affects evidence only; the `actual` member remains exact.
+        spans_truncated: bool,
     },
 }
 
 impl SketchDiagnostic {
-    pub(crate) fn missing_file(sketch_id: impl ToString, file: impl ToString) -> Self {
-        Self::MissingFile {
-            sketch_id: sketch_id.to_string(),
-            file: file.to_string(),
-        }
+    pub(crate) fn missing_file(sketch: SketchLocation) -> Self {
+        Self::MissingFile { sketch }
     }
 
-    pub(crate) fn empty_snippet(sketch_id: impl ToString) -> Self {
-        Self::EmptySnippet {
-            sketch_id: sketch_id.to_string(),
-        }
-    }
-
-    pub(crate) fn not_matched(sketch_id: impl ToString, file: impl ToString) -> Self {
+    pub(crate) fn not_matched(
+        sketch: SketchLocation,
+        normalization: SketchNormalization,
+        candidate: Option<MatchCandidate>,
+    ) -> Self {
         Self::NotMatched {
-            sketch_id: sketch_id.to_string(),
-            file: file.to_string(),
+            sketch,
+            normalization,
+            candidate,
+        }
+    }
+
+    pub(crate) fn occurrence_mismatch(
+        sketch: SketchLocation,
+        expected: SketchOccurrence,
+        actual: usize,
+        spans: Vec<SourceLineSpan>,
+        spans_truncated: bool,
+    ) -> Self {
+        Self::OccurrenceMismatch {
+            sketch,
+            expected,
+            actual,
+            spans,
+            spans_truncated,
         }
     }
 
     fn compare(left: &Self, right: &Self) -> Ordering {
-        left.sketch_id()
-            .cmp(right.sketch_id())
-            .then_with(|| left.file().cmp(&right.file()))
+        left.location()
+            .cmp(right.location())
             .then_with(|| left.kind_rank().cmp(&right.kind_rank()))
     }
 
-    fn sketch_id(&self) -> &str {
+    fn location(&self) -> &SketchLocation {
         match self {
-            Self::MissingFile { sketch_id, .. }
-            | Self::EmptySnippet { sketch_id }
-            | Self::NotMatched { sketch_id, .. }
-            | Self::DuplicateSketch { sketch_id } => sketch_id,
+            Self::MissingFile { sketch }
+            | Self::NotMatched { sketch, .. }
+            | Self::OccurrenceMismatch { sketch, .. } => sketch,
         }
     }
 
-    fn file(&self) -> Option<&str> {
-        match self {
-            Self::MissingFile { file, .. } | Self::NotMatched { file, .. } => Some(file.as_str()),
-            Self::EmptySnippet { .. } | Self::DuplicateSketch { .. } => None,
-        }
+    pub(crate) fn contract_file(&self) -> &CatalogPath {
+        &self.location().contract_file
     }
 
     fn kind_rank(&self) -> u8 {
         match self {
             Self::MissingFile { .. } => 0,
-            Self::EmptySnippet { .. } => 1,
-            Self::NotMatched { .. } => 2,
-            Self::DuplicateSketch { .. } => 3,
+            Self::NotMatched { .. } => 1,
+            Self::OccurrenceMismatch { .. } => 2,
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SketchInventoryComparison {
-    source_file_count: usize,
-    contract_file_count: usize,
-    sketch_count: usize,
+    counts: SketchCheckCounts,
     diagnostics: Vec<SketchDiagnostic>,
 }
 
 impl SketchInventoryComparison {
     pub(crate) fn new(
-        source_file_count: usize,
-        contract_file_count: usize,
+        source_catalog_entry_count: usize,
+        referenced_source_file_count: usize,
+        present_referenced_source_file_count: usize,
+        contract_document_count: usize,
         sketch_count: usize,
+        matched_sketch_count: usize,
         mut diagnostics: Vec<SketchDiagnostic>,
-    ) -> Result<Self, InventoryError> {
-        if diagnostics.len() > sketch_count {
-            return Err(InventoryError::ComparisonFailed {
-                message: format!(
-                    "diagnostic count {} exceeds sketch count {}",
-                    diagnostics.len(),
-                    sketch_count
-                ),
-            });
-        }
+    ) -> Self {
+        let failed_sketch_count = diagnostics.len();
+        debug_assert!(present_referenced_source_file_count <= source_catalog_entry_count);
+        debug_assert!(present_referenced_source_file_count <= referenced_source_file_count);
+        debug_assert_eq!(
+            matched_sketch_count.checked_add(failed_sketch_count),
+            Some(sketch_count)
+        );
 
         diagnostics.sort_by(SketchDiagnostic::compare);
 
-        Ok(Self {
-            source_file_count,
-            contract_file_count,
-            sketch_count,
+        Self {
+            counts: SketchCheckCounts {
+                source_catalog_entry_count,
+                referenced_source_file_count,
+                present_referenced_source_file_count,
+                contract_document_count,
+                sketch_count,
+                matched_sketch_count,
+                failed_sketch_count,
+            },
             diagnostics,
-        })
+        }
     }
 
     pub(crate) fn diagnostics(&self) -> &[SketchDiagnostic] {
@@ -150,25 +315,12 @@ impl SketchInventoryComparison {
     }
 
     pub(crate) fn passed(&self, mode: CheckMode) -> bool {
-        self.diagnostics().is_empty() || mode == CheckMode::Warning
-    }
-
-    pub(crate) fn counts(&self) -> SketchCheckCounts {
-        let failed_sketch_count = self.diagnostics().len();
-        let matched_sketch_count = self.sketch_count.saturating_sub(failed_sketch_count);
-
-        SketchCheckCounts {
-            source_file_count: self.source_file_count,
-            contract_file_count: self.contract_file_count,
-            sketch_count: self.sketch_count,
-            matched_sketch_count,
-            failed_sketch_count,
-        }
+        mode.passed(self.diagnostics())
     }
 
     pub(crate) fn into_response(self, mode: CheckMode) -> CheckResponse {
         let passed = self.passed(mode);
-        let counts = self.counts();
+        let counts = self.counts;
 
         CheckResponse {
             passed,
@@ -193,13 +345,13 @@ pub struct SketchCheckCounts {
     ///
     /// This includes unreferenced entries; only files named by parsed sketches
     /// participate in matching.
-    pub source_file_count: usize,
-    /// Number of direct root-level `.yaml` and `.yml` entries parsed.
-    ///
-    /// Nested YAML entries are not counted. Every counted entry must be a valid
-    /// combined contract document. Extension matching is ASCII
-    /// case-insensitive.
-    pub contract_file_count: usize,
+    pub source_catalog_entry_count: usize,
+    /// Number of unique logical source paths referenced by parsed sketches.
+    pub referenced_source_file_count: usize,
+    /// Number of unique referenced paths present in the supplied catalog.
+    pub present_referenced_source_file_count: usize,
+    /// Number of semantic YAML documents parsed across root contract files.
+    pub contract_document_count: usize,
     /// Number of successfully parsed sketch entries across contract files.
     ///
     /// Invalid entries and duplicate identifiers fail the operation before a
@@ -215,31 +367,44 @@ pub struct SketchCheckCounts {
     pub failed_sketch_count: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub(crate) enum InventoryError {
-    #[error("failed sketch inventory comparison: {message}")]
-    ComparisonFailed { message: String },
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{SketchDiagnostic, SketchInventoryComparison};
+    use super::{
+        DiagnosticExcerpt, MatchCandidate, SketchDiagnostic, SketchInventoryComparison,
+        SketchLocation, SourceLineSpan,
+    };
     use crate::api::CheckMode;
+    use crate::contract::{SketchNormalization, SketchOccurrence};
+    use crate::files::CatalogPath;
 
     #[test]
     fn comparison_counts_match_scope_and_diagnostics() {
         let comparison = SketchInventoryComparison::new(
             3,
             2,
+            1,
+            2,
             4,
-            vec![SketchDiagnostic::not_matched("b", "src/b.rs")],
-        )
-        .expect("comparison");
+            3,
+            vec![SketchDiagnostic::not_matched(
+                SketchLocation::new(
+                    "b",
+                    CatalogPath::new("contracts/b.yaml").expect("contract path"),
+                    1,
+                    CatalogPath::new("src/b.rs").expect("source path"),
+                ),
+                SketchNormalization::ExactLinesV1,
+                None,
+            )],
+        );
 
-        let counts = comparison.counts();
+        let response = comparison.into_response(CheckMode::Enforce);
+        let counts = &response.counts;
 
-        assert_eq!(counts.source_file_count, 3);
-        assert_eq!(counts.contract_file_count, 2);
+        assert_eq!(counts.source_catalog_entry_count, 3);
+        assert_eq!(counts.referenced_source_file_count, 2);
+        assert_eq!(counts.present_referenced_source_file_count, 1);
+        assert_eq!(counts.contract_document_count, 2);
         assert_eq!(counts.sketch_count, 4);
         assert_eq!(counts.matched_sketch_count, 3);
         assert_eq!(counts.failed_sketch_count, 1);
@@ -251,13 +416,23 @@ mod tests {
             1,
             1,
             1,
-            vec![SketchDiagnostic::not_matched("a", "src/a.rs")],
-        )
-        .expect("comparison");
+            1,
+            1,
+            0,
+            vec![SketchDiagnostic::not_matched(
+                SketchLocation::new(
+                    "a",
+                    CatalogPath::new("contracts/a.yaml").expect("contract path"),
+                    0,
+                    CatalogPath::new("src/a.rs").expect("source path"),
+                ),
+                SketchNormalization::ExactLinesV1,
+                None,
+            )],
+        );
 
         assert!(comparison.passed(CheckMode::Warning));
-        assert!(!comparison.passed(CheckMode::Default));
-        assert!(!comparison.passed(CheckMode::Strict));
+        assert!(!comparison.passed(CheckMode::Enforce));
     }
 
     #[test]
@@ -265,10 +440,17 @@ mod tests {
         let response = SketchInventoryComparison::new(
             1,
             1,
+            0,
             1,
-            vec![SketchDiagnostic::missing_file("a", "src/a.rs")],
+            1,
+            0,
+            vec![SketchDiagnostic::missing_file(SketchLocation::new(
+                "a",
+                CatalogPath::new("contracts/a.yaml").expect("contract path"),
+                0,
+                CatalogPath::new("src/a.rs").expect("source path"),
+            ))],
         )
-        .expect("comparison")
         .into_response(CheckMode::Warning);
 
         assert!(response.passed);
@@ -277,41 +459,168 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_sort_deterministically() {
+    fn diagnostics_sort_by_complete_location_then_variant_rank() {
+        let same_location = SketchLocation::new(
+            "a",
+            CatalogPath::new("contracts/a.yaml").expect("contract path"),
+            1,
+            CatalogPath::new("src/a.rs").expect("source path"),
+        );
+        let later_document = SketchLocation::new(
+            "a",
+            CatalogPath::new("contracts/a.yaml").expect("contract path"),
+            2,
+            CatalogPath::new("src/a.rs").expect("source path"),
+        );
+        let later_identifier = SketchLocation::new(
+            "z",
+            CatalogPath::new("contracts/a.yaml").expect("contract path"),
+            0,
+            CatalogPath::new("src/z.rs").expect("source path"),
+        );
+
         let comparison = SketchInventoryComparison::new(
             1,
+            3,
             1,
-            2,
+            3,
+            5,
+            0,
             vec![
-                SketchDiagnostic::missing_file("z", "src/z.rs"),
-                SketchDiagnostic::not_matched("a", "src/a.rs"),
+                SketchDiagnostic::missing_file(later_identifier.clone()),
+                SketchDiagnostic::occurrence_mismatch(
+                    same_location.clone(),
+                    SketchOccurrence::ExactlyOne,
+                    2,
+                    vec![SourceLineSpan::new(3, 4), SourceLineSpan::new(8, 9)],
+                    false,
+                ),
+                SketchDiagnostic::not_matched(
+                    later_document.clone(),
+                    SketchNormalization::ExactLinesV1,
+                    None,
+                ),
+                SketchDiagnostic::not_matched(
+                    same_location.clone(),
+                    SketchNormalization::ExactLinesV1,
+                    None,
+                ),
+                SketchDiagnostic::missing_file(same_location.clone()),
             ],
-        )
-        .expect("comparison");
+        );
 
         assert_eq!(
             comparison.diagnostics(),
             &[
+                SketchDiagnostic::MissingFile {
+                    sketch: same_location.clone(),
+                },
                 SketchDiagnostic::NotMatched {
-                    sketch_id: "a".to_owned(),
-                    file: "src/a.rs".to_owned(),
+                    sketch: same_location.clone(),
+                    normalization: SketchNormalization::ExactLinesV1,
+                    candidate: None,
+                },
+                SketchDiagnostic::OccurrenceMismatch {
+                    sketch: same_location,
+                    expected: SketchOccurrence::ExactlyOne,
+                    actual: 2,
+                    spans: vec![SourceLineSpan::new(3, 4), SourceLineSpan::new(8, 9)],
+                    spans_truncated: false,
+                },
+                SketchDiagnostic::NotMatched {
+                    sketch: later_document,
+                    normalization: SketchNormalization::ExactLinesV1,
+                    candidate: None,
                 },
                 SketchDiagnostic::MissingFile {
-                    sketch_id: "z".to_owned(),
-                    file: "src/z.rs".to_owned(),
+                    sketch: later_identifier,
                 },
             ]
         );
     }
 
     #[test]
-    fn diagnostics_serialize_as_data_carrying_enum() {
-        let value = serde_json::to_value(SketchDiagnostic::NotMatched {
-            sketch_id: "a".to_owned(),
-            file: "src/a.rs".to_owned(),
-        })
-        .expect("serialize diagnostic");
+    fn rich_diagnostics_round_trip_with_locations_and_bounded_evidence() {
+        let location = SketchLocation::new(
+            "checkout",
+            CatalogPath::new("contracts/api.yaml").expect("contract path"),
+            3,
+            CatalogPath::new("src/api.rs").expect("source path"),
+        );
+        let candidate = MatchCandidate::new(
+            SourceLineSpan::new(41, 43),
+            2,
+            42,
+            DiagnosticExcerpt::Bytes {
+                escaped: "expected\\xff".to_owned(),
+                truncated: true,
+            },
+            DiagnosticExcerpt::missing(),
+        );
+        let diagnostics = vec![
+            SketchDiagnostic::missing_file(location.clone()),
+            SketchDiagnostic::not_matched(
+                location.clone(),
+                SketchNormalization::ExactLinesV1,
+                Some(candidate),
+            ),
+            SketchDiagnostic::occurrence_mismatch(
+                location,
+                SketchOccurrence::ExactlyOne,
+                4,
+                vec![SourceLineSpan::new(1, 2), SourceLineSpan::new(10, 11)],
+                true,
+            ),
+        ];
 
-        assert!(value.get("NotMatched").is_some());
+        let bytes = serde_json::to_vec(&diagnostics).expect("serialize diagnostics");
+        let round_trip = serde_json::from_slice::<Vec<SketchDiagnostic>>(&bytes)
+            .expect("deserialize diagnostics");
+
+        assert_eq!(round_trip, diagnostics);
+        assert!(matches!(
+            &round_trip[1],
+            SketchDiagnostic::NotMatched {
+                sketch,
+                normalization: SketchNormalization::ExactLinesV1,
+                candidate: Some(MatchCandidate {
+                    source: SourceLineSpan { start: 41, end: 43 },
+                    expected_line: 2,
+                    source_line: 42,
+                    expected: DiagnosticExcerpt::Bytes {
+                        escaped,
+                        truncated: true,
+                    },
+                    actual: DiagnosticExcerpt::Missing,
+                }),
+            } if sketch.document_index == 3
+                && sketch.contract_file.as_str() == "contracts/api.yaml"
+                && sketch.source_file.as_str() == "src/api.rs"
+                && escaped == "expected\\xff"
+        ));
+    }
+
+    #[test]
+    fn diagnostic_excerpts_escape_arbitrary_bytes_before_serialization() {
+        let excerpt = DiagnosticExcerpt::Bytes {
+            escaped: "a\\n\\xff".to_owned(),
+            truncated: true,
+        };
+
+        assert_eq!(
+            excerpt,
+            DiagnosticExcerpt::Bytes {
+                escaped: "a\\n\\xff".to_owned(),
+                truncated: true,
+            }
+        );
+    }
+
+    #[test]
+    fn source_line_spans_are_one_based_and_inclusive() {
+        let span = SourceLineSpan::new(1, 3);
+
+        assert_eq!(span.start, 1);
+        assert_eq!(span.end, 3);
     }
 }
