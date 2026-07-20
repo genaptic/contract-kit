@@ -400,7 +400,14 @@ impl ContentDigest {
             digest.update(chunk);
         }
         cancellation.checkpoint()?;
-        Ok(Self(format!("{:x}", digest.finalize())))
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let digest = digest.finalize();
+        let mut value = String::with_capacity(64);
+        for byte in digest {
+            value.push(HEX[usize::from(byte >> 4)] as char);
+            value.push(HEX[usize::from(byte & 0x0f)] as char);
+        }
+        Ok(Self(value))
     }
 
     fn validate(&self, manifest_path: &Path) -> Result<(), CliError> {

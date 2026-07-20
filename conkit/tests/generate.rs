@@ -263,6 +263,17 @@ impl GenerateFixture {
         std::fs::read(self.contract_path()).expect("combined contract bytes")
     }
 
+    fn sha256(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let digest = Sha256::digest(bytes);
+        let mut value = String::with_capacity(64);
+        for byte in digest {
+            value.push(HEX[usize::from(byte >> 4)] as char);
+            value.push(HEX[usize::from(byte & 0x0f)] as char);
+        }
+        value
+    }
+
     fn semantic_documents(&self) -> Vec<OwnedAnswerContract> {
         let options = serde_saphyr::options! {
             duplicate_keys: serde_saphyr::DuplicateKeyPolicy::Error,
@@ -311,7 +322,7 @@ impl GenerateFixture {
         std::fs::write(self.contract_path(), bytes).expect("write linked document");
 
         let mut ownership = self.ownership_json();
-        let digest = format!("{:x}", Sha256::digest(bytes));
+        let digest = Self::sha256(bytes);
         ownership["journal"]["files"]["documents"][0]["sha256"] = serde_json::Value::String(digest);
         let bytes = serde_json::to_vec_pretty(&ownership).expect("render ownership");
         std::fs::write(self.ownership_path(), bytes).expect("update owned digest");
@@ -1046,7 +1057,7 @@ fn all_generation_refreshes_linked_sketch_after_signature_change() {
         "pub fn answer() -> u16 { 43 }"
     );
 
-    let contract_digest = format!("{:x}", Sha256::digest(fixture.contract_bytes()));
+    let contract_digest = GenerateFixture::sha256(&fixture.contract_bytes());
     let ownership = fixture.ownership_json();
     assert_eq!(ownership["journal"]["generation"], 2);
     assert_eq!(
@@ -1135,7 +1146,7 @@ fn ownership_cannot_claim_a_non_document_user_file() {
         .expect("owned documents")
         .push(serde_json::json!({
             "path": "manual.txt",
-            "sha256": format!("{:x}", Sha256::digest(b"user file\n")),
+            "sha256": GenerateFixture::sha256(b"user file\n"),
         }));
     let mut ownership_before =
         serde_json::to_vec_pretty(&ownership).expect("render forged ownership");
