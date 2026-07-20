@@ -155,7 +155,13 @@ impl RustdocProbe {
         seed.close().map_err(CompilerError::RustdocProbeWorkspace)?;
         let mut hasher = Sha256::new();
         hasher.update(seed_path.as_os_str().as_encoded_bytes());
-        let token = format!("{:x}", hasher.finalize());
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let digest = hasher.finalize();
+        let mut token = String::with_capacity(64);
+        for byte in digest {
+            token.push(HEX[usize::from(byte >> 4)] as char);
+            token.push(HEX[usize::from(byte & 0x0f)] as char);
+        }
         let capture_path = workspace
             .target_directory()
             .join(format!(".conkit-rustdoc-probe-{token}.json"));
