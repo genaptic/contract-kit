@@ -25,9 +25,10 @@ steps:
     stdout:
       kind: empty
     stderr:
-      kind: exact
-      value: |
-        failed to parse catalog input main.yml: sketch entries must be flattened mappings
+      kind: contains_in_order
+      value:
+      - failed to parse catalog input main.yml document 0
+      - not-a-flattened-sketch
 - type: assert_tree
   actual: /output
   expected: output

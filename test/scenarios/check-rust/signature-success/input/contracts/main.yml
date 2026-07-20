@@ -1,3 +1,4 @@
+contract_version: 2
 root: ../src
 files:
   - main.rs
@@ -5,411 +6,301 @@ files:
   - bar.rs
   - foobar.rs
   - utils.rs
+extraction: { mode: rust_syntax_v2, profile: rust_api_v1, crates: [{ id: app, root: main.rs, kind: binary }] }
 
 signatures:
+  - bar_module:
+      file: main.rs
+      signature_type: module
+      name: bar
+      visibility: private
+  - foo_module:
+      file: main.rs
+      signature_type: module
+      name: foo
+      visibility: private
+  - foobar_module:
+      file: main.rs
+      signature_type: module
+      name: foobar
+      visibility: private
+  - utils_module:
+      file: main.rs
+      signature_type: module
+      name: utils
+      visibility: private
   - main:
       file: main.rs
-      signature_type: main_method
+      signature_type: function
+      name: main
+      visibility: private
+      parameters: []
       sketch: main
   - foo_struct:
       file: foo.rs
+      module_path: [foo]
       signature_type: struct
       name: FooStruct
-      visibility: public(crate)
-      derives: [Clone, Debug, PartialEq, Eq]
+      visibility: crate
       fields:
         foo: Foo
         int_field: i32
-      methods:
-        - signature_type: method
-          name: new
-          visibility: public(crate)
-          parameters:
-            - foo: Foo
-            - int_field: i32
-          return_type: Self
-        - signature_type: method
-          name: foo
-          receiver: ref
-          visibility: public(crate)
-          parameters: []
-          return_type: "&Foo"
-        - signature_type: method
-          name: int_field
-          receiver: ref
-          visibility: public(crate)
-          parameters: []
-          return_type: i32
-        - signature_type: method
-          name: total
-          receiver: ref
-          visibility: public(crate)
-          parameters: []
-          return_type: i32
-        - signature_type: method
-          name: increment_foo
-          receiver: mut
-          visibility: public(crate)
-          parameters: []
-        - signature_type: method
-          name: describe
-          receiver: ref
-          visibility: public(crate)
-          parameters: []
-          return_type: String
-  - foo_struct_exposes_fields_through_accessors_function:
-      file: foo.rs
-      signature_type: function
-      name: foo_struct_exposes_fields_through_accessors
-      module_path: [tests]
-      visibility: private
-      parameters: []
-  - foo_struct_can_increment_inner_foo_function:
-      file: foo.rs
-      signature_type: function
-      name: foo_struct_can_increment_inner_foo
-      module_path: [tests]
-      visibility: private
-      parameters: []
-  - foo_struct_describes_its_fields_function:
-      file: foo.rs
-      signature_type: function
-      name: foo_struct_describes_its_fields
-      module_path: [tests]
-      visibility: private
-      parameters: []
+      implementations:
+        - items:
+            - signature_type: method
+              name: new
+              visibility: crate
+              parameters:
+                - { pattern: foo, type: Foo }
+                - { pattern: int_field, type: i32 }
+              return_type: Self
+            - signature_type: method
+              name: foo
+              receiver: ref
+              visibility: crate
+              parameters: []
+              return_type: "&Foo"
+            - signature_type: method
+              name: int_field
+              receiver: ref
+              visibility: crate
+              parameters: []
+              return_type: i32
+            - signature_type: method
+              name: total
+              receiver: ref
+              visibility: crate
+              parameters: []
+              return_type: i32
+            - signature_type: method
+              name: increment_foo
+              receiver: mut
+              visibility: crate
+              parameters: []
+            - signature_type: method
+              name: describe
+              receiver: ref
+              visibility: crate
+              parameters: []
+              return_type: String
   - foo_enum:
       file: bar.rs
+      module_path: [bar]
       signature_type: enum
       name: Foo
-      visibility: public(crate)
-      derives: [Default, Clone, Copy, Debug, PartialEq, Eq]
+      visibility: crate
       variants:
         - Foo
         - Bar: [i32]
-      methods:
-        - signature_type: method
-          name: new_foo
-          visibility: public(crate)
-          parameters: []
-          return_type: Self
-        - signature_type: method
-          name: new_bar
-          visibility: public(crate)
-          parameters:
-            - value: i32
-          return_type: Self
-        - signature_type: method
-          name: is_foo
-          receiver: ref
-          visibility: public(crate)
-          parameters: []
-          return_type: bool
-        - signature_type: method
-          name: is_bar
-          receiver: ref
-          visibility: public(crate)
-          parameters: []
-          return_type: bool
-        - signature_type: method
-          name: value
-          receiver: ref
-          visibility: public(crate)
-          parameters: []
-          return_type: Option<i32>
-        - signature_type: method
-          name: increment
-          receiver: ref
-          visibility: public(crate)
-          parameters: []
-          return_type: Self
-        - signature_type: method
-          name: reset
-          receiver: ref
-          visibility: public(crate)
-          parameters: []
-          return_type: Self
-        - signature_type: method
-          name: describe
-          receiver: ref
-          visibility: public(crate)
-          parameters: []
-          return_type: String
+      implementations:
+        - items:
+            - signature_type: method
+              name: new_foo
+              visibility: crate
+              parameters: []
+              return_type: Self
+            - signature_type: method
+              name: new_bar
+              visibility: crate
+              parameters:
+                - { pattern: value, type: i32 }
+              return_type: Self
+            - signature_type: method
+              name: is_foo
+              receiver: ref
+              visibility: crate
+              parameters: []
+              return_type: bool
+            - signature_type: method
+              name: is_bar
+              receiver: ref
+              visibility: crate
+              parameters: []
+              return_type: bool
+            - signature_type: method
+              name: value
+              receiver: ref
+              visibility: crate
+              parameters: []
+              return_type: Option<i32>
+            - signature_type: method
+              name: increment
+              receiver: ref
+              visibility: crate
+              parameters: []
+              return_type: Self
+            - signature_type: method
+              name: reset
+              receiver: ref
+              visibility: crate
+              parameters: []
+              return_type: Self
+            - signature_type: method
+              name: describe
+              receiver: ref
+              visibility: crate
+              parameters: []
+              return_type: String
   - bar_enum:
       file: bar.rs
+      module_path: [bar]
       signature_type: enum
       name: Bar
       visibility: public
-      derives: [Clone, Copy, Debug, PartialEq, Eq]
       variants:
         - Foo
         - Bar: [i32]
-      methods:
-        - signature_type: method
-          name: new_foo
-          visibility: public(crate)
-          parameters: []
-          return_type: Self
-        - signature_type: method
-          name: new_bar
-          visibility: public(crate)
-          parameters:
-            - value: i32
-          return_type: Self
-        - signature_type: method
-          name: value
-          receiver: ref
-          visibility: public(crate)
-          parameters: []
-          return_type: Option<i32>
-        - signature_type: method
-          name: default
-          visibility: public
-          trait: Default
-          parameters: []
-          return_type: Self
-        - signature_type: method
-          name: is_foo
-          receiver: ref
-          visibility: public
-          trait: FooBar
-          parameters: []
-          return_type: bool
-        - signature_type: method
-          name: is_bar
-          receiver: ref
-          visibility: public
-          trait: FooBar
-          parameters: []
-          return_type: bool
-        - signature_type: method
-          name: describe
-          receiver: ref
-          visibility: public
-          trait: FooBar
-          parameters: []
-          return_type: String
-  - foo_tracks_unit_and_tuple_variants_function:
-      file: bar.rs
-      signature_type: function
-      name: foo_tracks_unit_and_tuple_variants
-      module_path: [tests]
-      visibility: private
-      parameters: []
-  - bar_defaults_to_zero_tuple_variant_function:
-      file: bar.rs
-      signature_type: function
-      name: bar_defaults_to_zero_tuple_variant
-      module_path: [tests]
-      visibility: private
-      parameters: []
-  - bar_implements_foobar_trait_function:
-      file: bar.rs
-      signature_type: function
-      name: bar_implements_foobar_trait
-      module_path: [tests]
-      visibility: private
-      parameters: []
+      implementations:
+        - items:
+            - signature_type: method
+              name: new_foo
+              visibility: crate
+              parameters: []
+              return_type: Self
+            - signature_type: method
+              name: new_bar
+              visibility: crate
+              parameters:
+                - { pattern: value, type: i32 }
+              return_type: Self
+            - signature_type: method
+              name: value
+              receiver: ref
+              visibility: crate
+              parameters: []
+              return_type: Option<i32>
+        - trait: Default
+          items:
+            - signature_type: method
+              name: default
+              parameters: []
+              return_type: Self
+        - trait: FooBar
+          items:
+            - signature_type: method
+              name: is_foo
+              receiver: ref
+              parameters: []
+              return_type: bool
+            - signature_type: method
+              name: is_bar
+              receiver: ref
+              parameters: []
+              return_type: bool
+            - signature_type: method
+              name: describe
+              receiver: ref
+              parameters: []
+              return_type: String
   - foobar_trait:
       file: foobar.rs
+      module_path: [foobar]
       signature_type: trait
       name: FooBar
       visibility: public
-      methods:
+      items:
         - signature_type: method
           name: is_foo
           receiver: ref
-          visibility: public
           parameters: []
           return_type: bool
         - signature_type: method
           name: is_bar
           receiver: ref
-          visibility: public
           parameters: []
           return_type: bool
         - signature_type: method
           name: describe
           receiver: ref
-          visibility: public
           parameters: []
           return_type: String
         - signature_type: method
           name: kind_label
           receiver: ref
-          visibility: public
+          default_body: true
           parameters: []
           return_type: "&'static str"
-  - test_foo_bar_struct:
-      file: foobar.rs
-      signature_type: struct
-      name: TestFooBar
-      module_path: [tests]
-      visibility: private
-      fields:
-        foo: bool
-        bar: bool
-      methods:
-        - signature_type: method
-          name: new
-          visibility: private
-          parameters:
-            - foo: bool
-            - bar: bool
-          return_type: Self
-        - signature_type: method
-          name: is_foo
-          receiver: ref
-          visibility: private
-          trait: FooBar
-          parameters: []
-          return_type: bool
-        - signature_type: method
-          name: is_bar
-          receiver: ref
-          visibility: private
-          trait: FooBar
-          parameters: []
-          return_type: bool
-        - signature_type: method
-          name: describe
-          receiver: ref
-          visibility: private
-          trait: FooBar
-          parameters: []
-          return_type: String
-  - kind_label_prefers_foo_when_present_function:
-      file: foobar.rs
-      signature_type: function
-      name: kind_label_prefers_foo_when_present
-      module_path: [tests]
-      visibility: private
-      parameters: []
-  - kind_label_returns_bar_for_bar_values_function:
-      file: foobar.rs
-      signature_type: function
-      name: kind_label_returns_bar_for_bar_values
-      module_path: [tests]
-      visibility: private
-      parameters: []
-  - kind_label_returns_unknown_without_known_state_function:
-      file: foobar.rs
-      signature_type: function
-      name: kind_label_returns_unknown_without_known_state
-      module_path: [tests]
-      visibility: private
-      parameters: []
   - parse_error_enum:
       file: utils.rs
+      module_path: [utils]
       signature_type: enum
       name: ParseError
-      visibility: public(crate)
-      derives: [Clone, Debug, PartialEq, Eq]
+      visibility: crate
       variants: [Empty, Invalid, NotPositive]
   - sum_values_function:
       file: utils.rs
+      module_path: [utils]
       signature_type: function
       name: sum_values
-      visibility: public(crate)
+      visibility: crate
       parameters:
-        - values: "&[Foo]"
+        - { pattern: values, type: "&[Foo]" }
       return_type: i32
   - first_bar_value_function:
       file: utils.rs
+      module_path: [utils]
       signature_type: function
       name: first_bar_value
-      visibility: public(crate)
+      visibility: crate
       parameters:
-        - values: "&[Foo]"
+        - { pattern: values, type: "&[Foo]" }
       return_type: Option<i32>
   - parse_positive_function:
       file: utils.rs
+      module_path: [utils]
       signature_type: function
       name: parse_positive
-      visibility: public(crate)
+      visibility: crate
       parameters:
-        - input: "&str"
+        - { pattern: input, type: "&str" }
       return_type: Result<i32, ParseError>
   - describe_foobar_function:
       file: utils.rs
+      module_path: [utils]
       signature_type: function
       name: describe_foobar
-      visibility: public(crate)
+      visibility: crate
       generics:
         - "T: FooBar"
       parameters:
-        - value: "&T"
+        - { pattern: value, type: "&T" }
       return_type: String
-  - sum_values_adds_only_tuple_values_function:
-      file: utils.rs
-      signature_type: function
-      name: sum_values_adds_only_tuple_values
-      module_path: [tests]
-      visibility: private
-      parameters: []
-  - first_bar_value_returns_first_tuple_value_function:
-      file: utils.rs
-      signature_type: function
-      name: first_bar_value_returns_first_tuple_value
-      module_path: [tests]
-      visibility: private
-      parameters: []
-  - parse_positive_accepts_positive_integer_text_function:
-      file: utils.rs
-      signature_type: function
-      name: parse_positive_accepts_positive_integer_text
-      module_path: [tests]
-      visibility: private
-      parameters: []
-  - parse_positive_rejects_empty_invalid_and_non_positive_input_function:
-      file: utils.rs
-      signature_type: function
-      name: parse_positive_rejects_empty_invalid_and_non_positive_input
-      module_path: [tests]
-      visibility: private
-      parameters: []
-  - describe_foobar_formats_trait_values_function:
-      file: utils.rs
-      signature_type: function
-      name: describe_foobar_formats_trait_values
-      module_path: [tests]
-      visibility: private
-      parameters: []
-
-
 sketches:
   - main:
-    signature_type: main_method
-    code: |
-      fn main() {
-          let foo = Foo::new_foo();
-          let bar_value = Foo::new_bar(41).increment();
-          let wrapped = FooStruct::new(bar_value, 1);
+      file: main.rs
+      signature: main
+      signature_type: function
+      matching: { normalization: exact_lines_v1, occurrence: at_least_one }
+      code: |
+        fn main() {
+            let foo = Foo::new_foo();
+            let bar_value = Foo::new_bar(41).increment();
+            let wrapped = FooStruct::new(bar_value, 1);
 
-          assert!(foo.is_foo());
-          assert!(!foo.is_bar());
-          assert_eq!(foo.reset(), Foo::new_foo());
-          assert_eq!(wrapped.total(), 43);
-          assert_eq!(wrapped.foo(), &Foo::new_bar(42));
-          assert_eq!(wrapped.int_field(), 1);
-          assert_eq!(wrapped.describe(), "FooStruct(foo=Bar(42), int_field=1)");
+            assert!(foo.is_foo());
+            assert!(!foo.is_bar());
+            assert!(foo.reset().is_foo());
+            assert_eq!(wrapped.total(), 43);
+            assert_eq!(wrapped.foo().value(), Some(42));
+            assert_eq!(wrapped.int_field(), 1);
+            assert_eq!(wrapped.describe(), "FooStruct(foo=Bar(42), int_field=1)");
 
-          let mut mutable_wrapped = FooStruct::new(Foo::new_bar(1), 2);
-          mutable_wrapped.increment_foo();
-          assert_eq!(mutable_wrapped.total(), 4);
+            let mut mutable_wrapped = FooStruct::new(Foo::new_bar(1), 2);
+            mutable_wrapped.increment_foo();
+            assert_eq!(mutable_wrapped.total(), 4);
 
-          let trait_foo = Bar::new_foo();
-          let trait_bar = Bar::new_bar(7);
-          assert!(trait_foo.is_foo());
-          assert_eq!(trait_foo.kind_label(), "foo");
-          assert!(trait_bar.is_bar());
-          assert_eq!(trait_bar.value(), Some(7));
-          assert_eq!(trait_bar.describe(), "Bar(7)");
-          assert_eq!(trait_bar.kind_label(), "bar");
+            let trait_foo = Bar::new_foo();
+            let trait_bar = Bar::new_bar(7);
+            assert!(trait_foo.is_foo());
+            assert_eq!(trait_foo.kind_label(), "foo");
+            assert!(trait_bar.is_bar());
+            assert_eq!(trait_bar.value(), Some(7));
+            assert_eq!(trait_bar.describe(), "Bar(7)");
+            assert_eq!(trait_bar.kind_label(), "bar");
 
-          let values = [Foo::new_foo(), Foo::new_bar(3), Foo::new_bar(4)];
-          assert_eq!(utils::sum_values(&values), 7);
-          assert_eq!(utils::first_bar_value(&values), Some(3));
-          assert_eq!(utils::parse_positive("9"), Ok(9));
-          assert_eq!(utils::describe_foobar(&trait_bar), "bar: Bar(7)");
-      }
+            let values = [Foo::new_foo(), Foo::new_bar(3), Foo::new_bar(4)];
+            assert_eq!(utils::sum_values(&values), 7);
+            assert_eq!(utils::first_bar_value(&values), Some(3));
+            assert!(matches!(utils::parse_positive("9"), Ok(9)));
+            assert_eq!(utils::describe_foobar(&trait_bar), "bar: Bar(7)");
+        }

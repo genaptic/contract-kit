@@ -32,9 +32,13 @@ documentation refresh sequence.
    rg --hidden --files -g '*.md' -g '!.git/**' | sort
    ```
 
-2. Reconcile the root docs, each crate's `AGENTS.md` and `ARCHITECTURE.md`, and
+2. Reconcile the root docs (`README.md`, `ARCHITECTURE.md`, `AGENTS.md`,
+   `SKILLS.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, and `RELEASING.md`), each
+   crate's `AGENTS.md` and `ARCHITECTURE.md`, and
    `test/scenarios/AGENTS.md` plus `test/scenarios/README.md` against current
-   implementation evidence.
+   implementation evidence. Include root audit, findings, plan, and other
+   historical markdown in the inventory even when the correct action is to
+   delete a stale unreferenced artifact.
 3. Inventory every repo-local `SKILL.md`, `agents/openai.yaml`, and eval JSON
    file. This repository owns exactly twelve skills and twelve matching
    `agents/openai.yaml` files.
@@ -43,14 +47,18 @@ documentation refresh sequence.
 
 ## Execution
 
-1. Refresh root `README.md`, `ARCHITECTURE.md`, `AGENTS.md`, and `SKILLS.md`
-   when the branch changes workspace-wide behavior or skill inventory.
+1. Refresh root `README.md`, `ARCHITECTURE.md`, `AGENTS.md`, `SKILLS.md`,
+   `CHANGELOG.md`, `CONTRIBUTING.md`, and `RELEASING.md` when the branch changes
+   their product, structure, operating, inventory, history, contributor, or
+   release-owned facts.
 2. Refresh nested crate and scenario docs when their module ownership,
    authoring rules, test flows, or command behavior changes.
 3. Refresh skill docs when their owning workflow, references, templates,
    validation steps, or invocation policy changes.
 4. Keep `README.md` product-facing, `ARCHITECTURE.md` structural,
-   `AGENTS.md` operational, and `SKILLS.md` as the skill inventory.
+   `AGENTS.md` operational, `SKILLS.md` as the skill inventory,
+   `CONTRIBUTING.md` human-facing, `CHANGELOG.md` release-history-facing, and
+   `RELEASING.md` focused on release operations.
 5. Keep scenario schema and authoring detail in `test/scenarios/README.md`
    instead of duplicating it in root or CLI docs.
 6. Keep archived or historical markdown clearly marked as non-normative.

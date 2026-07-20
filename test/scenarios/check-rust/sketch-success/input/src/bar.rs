@@ -1,8 +1,6 @@
 use crate::foobar::FooBar;
 
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Foo {
-    #[default]
     Foo,
     Bar(i32),
 }
@@ -39,7 +37,7 @@ impl Foo {
     }
 
     pub(crate) fn reset(&self) -> Self {
-        Self::default()
+        Self::Foo
     }
 
     pub(crate) fn describe(&self) -> String {
@@ -50,7 +48,6 @@ impl Foo {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bar {
     Foo,
     Bar(i32),
@@ -93,54 +90,5 @@ impl FooBar for Bar {
             Self::Foo => "Foo".to_string(),
             Self::Bar(value) => format!("Bar({value})"),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Bar, Foo};
-    use crate::foobar::FooBar;
-
-    #[test]
-    fn foo_tracks_unit_and_tuple_variants() {
-        let foo = Foo::new_foo();
-        let bar = Foo::new_bar(5);
-
-        assert!(foo.is_foo());
-        assert!(!foo.is_bar());
-        assert!(bar.is_bar());
-        assert!(!bar.is_foo());
-        assert_eq!(foo.value(), None);
-        assert_eq!(bar.value(), Some(5));
-        assert_eq!(foo.increment(), Foo::new_bar(1));
-        assert_eq!(bar.increment(), Foo::new_bar(6));
-        assert_eq!(bar.reset(), Foo::new_foo());
-        assert_eq!(foo.describe(), "Foo");
-        assert_eq!(bar.describe(), "Bar(5)");
-    }
-
-    #[test]
-    fn bar_defaults_to_zero_tuple_variant() {
-        let value = Bar::default();
-
-        assert_eq!(value, Bar::new_bar(0));
-        assert_eq!(value.value(), Some(0));
-    }
-
-    #[test]
-    fn bar_implements_foobar_trait() {
-        let foo = Bar::new_foo();
-        let bar = Bar::new_bar(8);
-
-        assert!(foo.is_foo());
-        assert!(!foo.is_bar());
-        assert_eq!(foo.describe(), "Foo");
-        assert_eq!(foo.kind_label(), "foo");
-
-        assert!(bar.is_bar());
-        assert!(!bar.is_foo());
-        assert_eq!(bar.value(), Some(8));
-        assert_eq!(bar.describe(), "Bar(8)");
-        assert_eq!(bar.kind_label(), "bar");
     }
 }

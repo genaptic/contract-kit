@@ -1,6 +1,7 @@
 version: 1
 coverage:
-- behavior.check.matrix.sketches.strict.mismatching
+- behavior.check.mismatching.strict-fails
+- behavior.check.report.extension.yml
 steps:
 - type: run
   argv:

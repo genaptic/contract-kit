@@ -1,6 +1,7 @@
 version: 1
 coverage:
-- behavior.check.matrix.signatures.warning.mismatching
+- behavior.check.mismatching.warning-passes
+- behavior.check.report.extension.mixed-case
 steps:
 - type: run
   argv:
@@ -12,7 +13,7 @@ steps:
   - --contracts
   - /input/contracts
   - --output
-  - /output/report.json
+  - /output/report.JSON
   - --warning
   expect:
     exit_code: 0

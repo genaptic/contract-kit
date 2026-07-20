@@ -1,6 +1,14 @@
+contract_version: 2
 root: ../src
 files:
   - lib.rs
+extraction:
+  mode: rust_syntax_v2
+  profile: rust_api_v1
+  crates:
+    - id: fixture
+      root: lib.rs
+      kind: library
 signatures:
   - changed:
       file: lib.rs
@@ -18,14 +26,24 @@ signatures:
       sketch: removed_sketch
 sketches:
   - changed_sketch:
-    signature_type: function
-    code: |
-      pub fn changed() -> u8 {
-          1
-      }
+      file: lib.rs
+      signature: changed
+      signature_type: function
+      matching:
+        normalization: exact_lines_v1
+        occurrence: at_least_one
+      code: |
+        pub fn changed() -> u8 {
+            1
+        }
   - removed_sketch:
-    signature_type: function
-    code: |
-      pub fn removed() -> u8 {
-          1
-      }
+      file: lib.rs
+      signature: removed
+      signature_type: function
+      matching:
+        normalization: exact_lines_v1
+        occurrence: at_least_one
+      code: |
+        pub fn removed() -> u8 {
+            1
+        }

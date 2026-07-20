@@ -36,7 +36,7 @@ pub(crate) enum HarnessError {
     Parse {
         path: PathBuf,
         #[source]
-        source: serde_yaml::Error,
+        source: Box<serde_saphyr::Error>,
     },
 
     #[error("invalid scenario manifest {path}: {message}", path = .path.display())]

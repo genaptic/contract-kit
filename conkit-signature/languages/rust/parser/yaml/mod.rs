@@ -2,11 +2,11 @@ mod document;
 mod input;
 mod render;
 mod sketch;
-mod type_text;
+pub(in crate::languages::rust) mod type_text;
 
-pub(super) use document::RustContractDocuments;
+pub(super) use document::{RustContractDocuments, RustGenerationPlan};
 pub(super) use render::RustYamlRenderer;
-pub(super) use sketch::RustSketchResolver;
+pub(super) use sketch::{RustSketchDocumentPlan, RustSketchSeeds};
 
 #[cfg(test)]
 mod tests;

@@ -1,5 +1,13 @@
+contract_version: 2
 root: ../src
 files:
   - lib.rs
-signatures: []
+extraction: { mode: rust_syntax_v2, profile: rust_api_v1, crates: [{ id: sample, root: lib.rs, kind: library }] }
+signatures:
+  - answer_function:
+      file: lib.rs
+      signature_type: function
+      name: answer
+      visibility: public
+      parameters: []
 sketches: []

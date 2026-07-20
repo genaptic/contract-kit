@@ -15,7 +15,11 @@ writing the plan or editing files.
 
 ## In-Scope Markdown
 
-- Root docs: `AGENTS.md`, `ARCHITECTURE.md`, `README.md`, and `SKILLS.md`.
+- Root docs: `AGENTS.md`, `ARCHITECTURE.md`, `README.md`, `SKILLS.md`,
+  `CHANGELOG.md`, `CONTRIBUTING.md`, and `RELEASING.md`.
+- Historical or audit-oriented root markdown, including completed findings and
+  plan artifacts. Delete stale unreferenced artifacts or mark retained history
+  clearly non-normative; never let it masquerade as current guidance.
 - Crate docs: `conkit/AGENTS.md`, `conkit/ARCHITECTURE.md`,
   `conkit-signature/AGENTS.md`, `conkit-signature/ARCHITECTURE.md`,
   `conkit-sketch/AGENTS.md`, and `conkit-sketch/ARCHITECTURE.md`.

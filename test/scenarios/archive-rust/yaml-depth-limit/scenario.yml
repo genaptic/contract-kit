@@ -1,0 +1,33 @@
+version: 1
+cargo_workspace: true
+coverage:
+  - behavior.archive.error.yaml-limit
+steps:
+  - type: overlay
+    source: output/sentinel.txt
+    destination: /output/sentinel.txt
+  - type: run
+    argv:
+      - conkit
+      - archive
+      - --contracts
+      - /input/contracts
+      - --archive
+      - /output/archives
+    expect:
+      exit_code: 1
+      stdout:
+        kind: empty
+      stderr:
+        kind: contains_in_order
+        value:
+          - main.yml
+          - depth
+  - type: assert_tree
+    actual: /input
+    expected: input
+    contents: bytes
+  - type: assert_tree
+    actual: /output
+    expected: output
+    contents: bytes

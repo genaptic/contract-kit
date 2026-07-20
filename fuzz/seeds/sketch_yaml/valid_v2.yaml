@@ -1,0 +1,16 @@
+contract_version: 2
+root: ../src
+files: [lib.rs]
+extraction: { mode: rust_syntax_v2, profile: rust_api_v1, crates: [{ id: fuzz, root: lib.rs, kind: library }] }
+signatures:
+  - fuzz_signature:
+      file: lib.rs
+      signature_type: function
+      sketch: fuzz_body
+sketches:
+  - fuzz_body:
+      file: lib.rs
+      signature: fuzz_signature
+      signature_type: function
+      matching: { normalization: exact_lines_v1, occurrence: exactly_one }
+      code: "pub fn fuzz() {}"

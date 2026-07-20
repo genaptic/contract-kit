@@ -8,14 +8,55 @@
 //! logical [`CatalogPath`] names and bytes through [`FileCatalog`], then decide
 //! where returned catalog entries should be stored.
 //!
-//! Rust signatures live in combined YAML documents with `root`, an exact
-//! `files` allowlist, user-named nested `signatures`, signature-to-sketch links,
-//! and flattened `sketches`. Versioned `language: rust` shorthand is rejected.
-//! Repeated item macros with the same file, module path, and semantic name use
-//! one-based declaration occurrence as their structural identity: the first
-//! occurrence is unsuffixed, followed by `#2`, `#3`, and so on. Regeneration
+//! Rust signatures live in mandatory `contract_version: 2` combined YAML
+//! documents with a versioned `rust_syntax_v2` or `rust_compiler_v1`
+//! extraction context, `profile: rust_api_v1`, explicit typed crate roots,
+//! `root`, an exact `files` allowlist, user-named `signatures`,
+//! signature-to-sketch links, and nested `sketches`. Compiler documents also
+//! retain compiler/rustdoc schema, target triple, sorted features and cfg,
+//! package/target identity, and resolution capabilities. Missing, legacy,
+//! future, mismatched, or unknown extraction versions fail closed. Every
+//! decoded or mapped Rust source belongs to the owning document's allowlist.
+//!
+//! The syntax extractor receives crate roots and target kinds from v2 metadata,
+//! then builds canonical module identity from inline modules, out-of-line `mod`
+//! declarations, and `#[path]`. It does not guess logical modules from arbitrary
+//! source paths or fall back to global bare-name implementation-owner lookup.
+//! Structurally repeatable items with the same crate, module path, item kind,
+//! and semantic name use one-based declaration occurrence as their identity:
+//! the first is unsuffixed, followed by `#2`, `#3`, and so on. Regeneration
 //! retains user labels by occurrence, and linked-sketch resolution uses that
-//! same occurrence to return the exact Rust item text.
+//! occurrence to return the exact Rust item text.
+//!
+//! `rust_syntax_v2` does not run Cargo, compile crates, expand macros, evaluate
+//! conditional compilation, or perform compiler name resolution. It retains
+//! modeled syntax and reports deterministic capability warnings for facts that
+//! need compiler context. [`CheckMode::Default`] permits warning-only results,
+//! [`CheckMode::Strict`] requires no diagnostics, and [`CheckMode::Warning`]
+//! preserves all diagnostics while passing a completed check. Unsupported
+//! reachable syntax and invalid attributes, module graphs, visibility, or
+//! implementation ownership return typed errors instead of being omitted.
+//! `rust_compiler_v1` instead consumes a bounded, host-produced rustdoc JSON
+//! artifact. The host owns Cargo/toolchain/process work; this crate validates
+//! its schema and tagged exact/compiler-generated source provenance and
+//! converts it into the same declaration and inventory graph used by syntax
+//! extraction. Compiler extraction retains cfg-selected and macro-generated
+//! public items, expands rustdoc-exposed direct and glob reexports, and
+//! normalizes generic type-alias applications. A summary-only external glob
+//! target or another rustdoc fact lacking a lossless representation fails
+//! explicitly. Compiler-generated items participate in signatures but cannot
+//! supply exact source text for linked sketches.
+//!
+//! Existing-document generation is lossless. An exact semantic no-op returns
+//! the original document bytes. A real change edits only affected signature
+//! nodes, preserves retained spans, comments, presentation, and nested sketch
+//! records, then reparses the changed bytes and verifies that they equal the
+//! proposed semantic document before returning them.
+//!
+//! Functions named `main` are ordinary functions. Equivalent visibility
+//! spellings canonicalize to the same semantic visibility. Parameter patterns
+//! remain rendering metadata, while `rust_api_v1` digest bytes include callable
+//! types and receiver form but exclude ordinary binding and destructuring names.
 //!
 //! # Operations
 //!
@@ -27,6 +68,22 @@
 //!   metadata for explicitly linked sketches.
 //! - [`SignatureContractKit::diff`] compares grouped signature identities in
 //!   current and previous contract catalogs.
+//!
+//! [`CheckResponse`] also provides borrowed serializable report views. The
+//! standalone and embedded views omit returned report files while preserving
+//! their established wire layouts, so storage adapters can compose reports
+//! without mirroring signature-domain fields.
+//!
+//! # Resource limits
+//!
+//! Every operation applies [`SignatureLimits`] across its complete workflow,
+//! including all participating catalogs, both sides of a diff, compiler
+//! artifact nodes, diagnostics or diff entries, changed-document verification
+//! reparses, and returned output. [`SignatureContractKitError::limit_exceeded`]
+//! recovers typed [`LimitExceeded`] evidence with the configured limit, a
+//! proven observed lower bound, and a logical file when the breach is
+//! file-specific. Returned bytes and simultaneously retained generation/edit
+//! scratch have independent 512 MiB defaults.
 //!
 //! # Boundaries
 //!
@@ -45,9 +102,14 @@
 //! an `async move` block. That owning task future and its output satisfy
 //! `Send + 'static`; an operation future called directly still borrows the kit.
 //!
-//! [`WorkOptions`] documents the complete worker-admission, cancellation, and
-//! timeout contract. Examples here use `futures_executor::block_on` only to
+//! [`WorkOptions`] documents the complete worker-admission and cooperative
+//! cancellation contract. Examples here use `futures_executor::block_on` only to
 //! remain self-contained; the crate does not select that executor for callers.
+//! Hosts selecting compiler extraction construct a [`RustCompilerArtifact`]
+//! using [`RUST_COMPILER_ARTIFACT_SCHEMA_VERSION`] and
+//! [`RUSTDOC_FORMAT_VERSION`]. Artifact trust or conversion failures remain
+//! available as typed [`RustCompilerArtifactFailure`] evidence through
+//! [`SignatureContractKitError::compiler_artifact_failure`].
 //!
 //! # Examples
 //!
@@ -58,7 +120,7 @@
 //! use conkit_signature::{
 //!     CatalogPath, CheckMode, CheckRequest, ContractScope, FileCatalog,
 //!     GenerateDocument, GenerateRequest, GenerateTarget, ReportRequest,
-//!     SignatureContractKit,
+//!     RustCrateKind, RustCrateRoot, SignatureContractKit,
 //! };
 //!
 //! fn catalog_with(path: &str, bytes: &[u8]) -> Result<FileCatalog, Box<dyn std::error::Error>> {
@@ -71,11 +133,17 @@
 //! let source_files = catalog_with("lib.rs", b"pub fn answer() -> u8 { 42 }\n")?;
 //!
 //! let generated = futures_executor::block_on(kit.generate(GenerateRequest {
+//!     extraction: conkit_signature::RustExtractionInput::Syntax,
 //!     source_files: source_files.clone(),
 //!     target: GenerateTarget::New(GenerateDocument {
 //!         contract_file: CatalogPath::new("main.yml")?,
 //!         root: "../src".to_owned(),
 //!         files: vec![CatalogPath::new("lib.rs")?],
+//!         crates: vec![RustCrateRoot {
+//!             id: "sample".to_owned(),
+//!             root: CatalogPath::new("lib.rs")?,
+//!             kind: RustCrateKind::Library,
+//!         }],
 //!     }),
 //!     scope: ContractScope::Signatures,
 //! }))?;
@@ -89,10 +157,10 @@
 //! assert!(contract_yaml.contains("signature_type: function"));
 //!
 //! let response = futures_executor::block_on(kit.check(CheckRequest {
+//!     extraction: conkit_signature::RustExtractionInput::Syntax,
 //!     source_files,
 //!     contract_files: generated.contract_files,
 //!     report: ReportRequest::None,
-//!     scope: ContractScope::Signatures,
 //!     mode: CheckMode::Default,
 //! }))?;
 //!
@@ -109,14 +177,25 @@ mod error;
 mod files;
 mod inventory;
 mod languages;
+mod limits;
 mod work;
 
 pub use crate::api::{
-    CheckDiagnostic, CheckMode, CheckRequest, CheckResponse, ContractScope, DiffEntry, DiffRequest,
-    DiffResponse, GenerateDocument, GenerateRequest, GenerateResponse, GenerateTarget,
-    ReportFormat, ReportRequest, ResolveSketchesRequest, ResolveSketchesResponse,
-    ResolvedSketchSeed, SignatureCheckCounts, SignatureContractKit, SignatureContractKitBuilder,
+    CheckDiagnostic, CheckDiagnosticCategory, CheckMode, CheckRequest, CheckResponse,
+    ContractScope, DiagnosticSeverity, DiffCategory, DiffEntry, DiffRequest, DiffResponse,
+    GenerateDocument, GenerateRequest, GenerateResponse, GenerateTarget, ReportFormat,
+    ReportRequest, ResolveSketchesRequest, ResolveSketchesResponse, ResolvedSketchSeed,
+    RustCrateKind, RustCrateRoot, RustExtractionInput, SignatureCheckCounts, SignatureContractKit,
+    SignatureContractKitBuilder, SignatureGenerationCounts,
 };
 pub use crate::error::SignatureContractKitError;
 pub use crate::files::{CatalogPath, FileCatalog, FileCatalogError};
-pub use crate::work::{WorkOptions, WorkParallelism};
+pub use crate::languages::rust::rustdoc::{
+    CompilerSourcePath, CompilerSourceProvenance, RUST_COMPILER_ARTIFACT_SCHEMA_VERSION,
+    RUSTDOC_FORMAT_VERSION, RustCompilerArtifact, RustCompilerArtifactFailure, RustCompilerCrate,
+};
+pub use crate::limits::{
+    CatalogLimits, DiagnosticLimits, LimitExceeded, LimitResource, OutputLimits,
+    RustExtractionLimits, SignatureLimits, YamlLimits,
+};
+pub use crate::work::{WorkOptions, WorkerPool};

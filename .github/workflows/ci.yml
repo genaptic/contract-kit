@@ -1,3 +1,10 @@
+# BUG_RESOLUTION_PLAN [PHASES 8, 9][ADDITION + TEST]
+# Citations: BUG_RESOLUTION_PLAN.md:1330-1461, 1864-1897;
+# BUG_AUDIT_FINDINGS.md:799-817.
+# Keep this five-command cross-platform gate unchanged. Dependency policy,
+# bounded Linux fuzzing, opt-in compiler/rustdoc compatibility, and non-gating
+# cross-platform benchmark artifacts are isolated in `hardening.yml`; long
+# hardening work must not make routine pull-request CI flaky.
 name: CI
 
 on:

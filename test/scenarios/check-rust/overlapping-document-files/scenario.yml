@@ -9,7 +9,7 @@ steps:
     argv:
       - conkit
       - check
-      - sketches
+      - signatures
       - --source
       - /input/src
       - --contracts
@@ -18,12 +18,12 @@ steps:
       - /output/report.yml
       - --strict
     expect:
-      exit_code: 1
-      stdout: { kind: empty }
-      stderr:
+      exit_code: 0
+      stdout:
         kind: exact
         value: |
-          invalid contract layout /input/contracts/second.YAML: listed source path lib.rs overlaps lib.rs claimed by first.yml
+          signature check passed: 2 source signatures, 2 contract signatures
+      stderr: { kind: empty }
   - type: assert_tree
     actual: /output
     expected: output

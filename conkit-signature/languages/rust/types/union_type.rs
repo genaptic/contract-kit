@@ -1,9 +1,9 @@
-use crate::languages::rust::types::base_type::{BaseCanonical, BaseType};
+use crate::languages::rust::types::base_type::BaseType;
 use crate::languages::rust::types::primitive_types::RustGenericMetadata;
 use crate::languages::rust::types::struct_type::StructField;
 use serde::Serialize;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct UnionType {
     base: BaseType,
     generics: RustGenericMetadata,
@@ -41,18 +41,12 @@ impl UnionType {
         &self.fields
     }
 
-    pub(in crate::languages::rust) fn canonical_form(&self) -> UnionCanonical {
-        UnionCanonical {
-            base: self.base.canonical_form(),
-            generics: self.generics.clone(),
-            fields: self.fields.clone(),
-        }
+    pub(crate) fn requires_capability_warning(&self) -> bool {
+        self.base.attributes().requires_capability_warning()
+            || self.generics.requires_capability_warning()
+            || self.fields.iter().any(|field| {
+                field.attributes().requires_capability_warning()
+                    || field.field_type().requires_capability_warning()
+            })
     }
-}
-
-#[derive(Serialize)]
-pub(in crate::languages::rust) struct UnionCanonical {
-    base: BaseCanonical,
-    generics: RustGenericMetadata,
-    fields: Vec<StructField>,
 }

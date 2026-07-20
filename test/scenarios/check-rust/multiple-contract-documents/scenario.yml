@@ -20,7 +20,7 @@ steps:
       stdout:
         kind: exact
         value: |
-          sketch check passed: 2 matched sketches, 0 failed sketches
+          sketch check passed: matched 2, failed 0, total 2; referenced sources present 2/2; catalog entries 2; contract documents 2
       stderr: { kind: empty }
   - type: assert_tree
     actual: /output

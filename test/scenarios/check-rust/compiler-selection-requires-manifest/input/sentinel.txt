@@ -1,0 +1,1 @@
+compiler selection must fail before filesystem discovery

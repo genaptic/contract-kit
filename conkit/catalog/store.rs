@@ -1,16 +1,24 @@
 //! Contracts-root catalog access and generated-document persistence.
+//!
+//! The store reads the complete non-metadata catalog through verified handles,
+//! exposes reserved ownership capabilities, and hands baseline-bound generated
+//! documents to runtime reconciliation. Each generated document is replaced
+//! individually and atomically; multi-file generation is coordinated by the
+//! digest-backed ownership journal rather than described as one atomic write.
 
 use std::ffi::OsStr;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use atomic_write_file::AtomicWriteFile;
+use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
+use cap_std::fs::{Dir, File, OpenOptions};
 use conkit_signature::{CatalogPath, FileCatalog};
-use walkdir::WalkDir;
 
 use super::ownership::OwnershipManifest;
-use super::path::{CatalogDirectory, ResolvedPath};
+use super::path::{CatalogDirectory, CatalogLeaf, PathRole};
 use super::reconciliation::{CatalogReconciliation, GenerationLock};
+use super::{CatalogReadBudget, CatalogReadLimits};
 use crate::error::CliError;
 use crate::platform::PortablePathRules;
 
@@ -18,6 +26,14 @@ use crate::platform::PortablePathRules;
 #[derive(Debug)]
 pub(crate) struct ContractsStore {
     directory: CatalogDirectory,
+    limits: CatalogReadLimits,
+}
+
+/// Bytes and stable identity obtained from one capability-opened file handle.
+#[derive(Debug)]
+pub(super) struct FileSnapshot {
+    bytes: Vec<u8>,
+    identity: same_file::Handle,
 }
 
 /// Policy for an existing destination that is not already owned.
@@ -42,12 +58,188 @@ pub(crate) struct GenerationReceipt {
     adopted_count: usize,
 }
 
+struct ContractPublication<'destination> {
+    temporary: std::ffi::OsString,
+    destination: &'destination CatalogLeaf,
+    state: ContractPublicationState,
+}
+
+enum ContractPublicationState {
+    Writing(File),
+    Prepared,
+    Published,
+    Aborted,
+}
+
+impl<'destination> ContractPublication<'destination> {
+    fn create(
+        destination: &'destination CatalogLeaf,
+        cancellation: &crate::context::ApplicationCancellation,
+    ) -> Result<Self, CliError> {
+        cancellation.checkpoint()?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+
+        for attempt in 0_u16..=u16::MAX {
+            cancellation.checkpoint()?;
+            let temporary = Self::temporary_name(destination.name(), timestamp, attempt);
+            match Self::open(destination, temporary) {
+                Ok(publication) => return Ok(publication),
+                Err(CliError::Io(source)) if source.kind() == ErrorKind::AlreadyExists => {}
+                Err(source) => return Err(source),
+            }
+        }
+
+        Err(CliError::Io(std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            format!(
+                "no collision-free atomic temporary name is available for {}",
+                destination.display_path().display()
+            ),
+        )))
+    }
+
+    fn open(
+        destination: &'destination CatalogLeaf,
+        temporary: std::ffi::OsString,
+    ) -> Result<Self, CliError> {
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        let output = destination.open_sibling(&temporary, &options)?;
+        Ok(Self {
+            temporary,
+            destination,
+            state: ContractPublicationState::Writing(output),
+        })
+    }
+
+    fn publish(
+        mut self,
+        bytes: &[u8],
+        cancellation: &crate::context::ApplicationCancellation,
+    ) -> Result<(), CliError> {
+        if let Err(operation) = self.write_and_prepare(bytes, cancellation) {
+            return Err(self.abort(operation));
+        }
+        if let Err(canceled) = cancellation.checkpoint() {
+            return Err(self.abort(canceled));
+        }
+        if let Err(operation) = self.destination.rename_sibling(&self.temporary) {
+            return Err(self.abort(operation));
+        }
+        self.state = ContractPublicationState::Published;
+        self.destination.sync_parent()
+    }
+
+    fn write_and_prepare(
+        &mut self,
+        bytes: &[u8],
+        cancellation: &crate::context::ApplicationCancellation,
+    ) -> Result<(), CliError> {
+        for chunk in bytes.chunks(64 * 1024) {
+            cancellation.checkpoint()?;
+            self.output()?.write_all(chunk)?;
+        }
+        cancellation.checkpoint()?;
+        self.output()?.flush()?;
+        self.output()?.sync_all()?;
+        self.close();
+        Ok(())
+    }
+
+    fn output(&mut self) -> Result<&mut File, std::io::Error> {
+        match &mut self.state {
+            ContractPublicationState::Writing(output) => Ok(output),
+            ContractPublicationState::Prepared
+            | ContractPublicationState::Published
+            | ContractPublicationState::Aborted => Err(std::io::Error::other(
+                "atomic contract publication is no longer writable",
+            )),
+        }
+    }
+
+    fn close(&mut self) {
+        if matches!(&self.state, ContractPublicationState::Writing(_)) {
+            self.state = ContractPublicationState::Prepared;
+        }
+    }
+
+    fn abort(mut self, operation: CliError) -> CliError {
+        self.close();
+        let cleanup = self.destination.remove_sibling(&self.temporary);
+        self.state = ContractPublicationState::Aborted;
+        match cleanup {
+            Ok(()) => operation,
+            Err(cleanup) if cleanup.kind() == ErrorKind::NotFound => operation,
+            Err(cleanup) => Self::cleanup_failure(operation, cleanup),
+        }
+    }
+
+    fn cleanup_failure(operation: CliError, cleanup: std::io::Error) -> CliError {
+        match operation {
+            CliError::OperationCanceled => CliError::Io(std::io::Error::new(
+                cleanup.kind(),
+                format!("operation canceled; atomic temporary cleanup also failed: {cleanup}"),
+            )),
+            CliError::Io(operation) => CliError::Io(std::io::Error::new(
+                operation.kind(),
+                format!("{operation}; atomic temporary cleanup also failed: {cleanup}"),
+            )),
+            operation => CliError::Io(std::io::Error::new(
+                cleanup.kind(),
+                format!("{operation}; atomic temporary cleanup also failed: {cleanup}"),
+            )),
+        }
+    }
+
+    fn temporary_name(destination: &OsStr, timestamp: u128, attempt: u16) -> std::ffi::OsString {
+        if destination == OwnershipManifest::FILE_NAME {
+            let suffix = (timestamp as u64)
+                .wrapping_add(u64::from(std::process::id()) << 16)
+                .wrapping_add(u64::from(attempt))
+                & 0xff_ffff;
+            return format!("{}{:06x}", OwnershipManifest::TEMPORARY_PREFIX, suffix).into();
+        }
+
+        format!(
+            ".contract-kit-{}-{timestamp}-{attempt}.tmp",
+            std::process::id()
+        )
+        .into()
+    }
+}
+
+impl Drop for ContractPublication<'_> {
+    fn drop(&mut self) {
+        if matches!(
+            &self.state,
+            ContractPublicationState::Writing(_) | ContractPublicationState::Prepared
+        ) {
+            self.close();
+            let _ = self.destination.remove_sibling(&self.temporary);
+            self.state = ContractPublicationState::Aborted;
+        }
+    }
+}
+
 impl ContractsStore {
     /// Creates access to a contracts root without creating or validating it.
     pub(crate) fn new(path: PathBuf) -> Self {
         Self {
             directory: CatalogDirectory::contracts(path),
+            limits: CatalogReadLimits::default(),
         }
+    }
+
+    /// Replaces the filesystem catalog budgets for this contracts root.
+    pub(crate) fn with_limits(mut self, limits: CatalogReadLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Returns the selected contracts-root path.
@@ -55,118 +247,143 @@ impl ContractsStore {
         self.directory.path()
     }
 
-    /// Reads every non-metadata regular file from an existing contracts root.
-    ///
-    /// Entries are sorted by file name for deterministic catalog construction.
-    /// The selected root may itself be a symlink to a directory; descendant
-    /// symlinks are neither traversed nor inserted into the catalog.
+    /// Reads the required contracts catalog against a caller-owned operation budget.
     ///
     /// # Errors
     ///
-    /// Returns an error if the root is not a directory, its reserved metadata
-    /// namespace is invalid, walking or reading fails, a path is not portable,
-    /// or duplicate logical paths are encountered.
-    pub(crate) fn read(&self) -> Result<FileCatalog, CliError> {
-        self.directory.validate_directory()?;
-        self.validate_reserved_namespace()?;
+    /// Returns an error if the root, reserved namespace, or a participating file
+    /// cannot be traversed and read securely, cancellation is requested, a
+    /// catalog limit is exceeded, or a logical path cannot be represented.
+    pub(crate) fn read_with_budget(
+        &self,
+        budget: &mut CatalogReadBudget,
+    ) -> Result<FileCatalog, CliError> {
+        let root = self.directory.capability()?;
+        self.validate_reserved_namespace_with_budget(budget)?;
 
         let mut catalog = FileCatalog::new();
-        for entry in WalkDir::new(self.path())
-            .follow_links(false)
-            .sort_by_file_name()
-        {
-            let entry = entry?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-
-            let relative =
-                entry
-                    .path()
-                    .strip_prefix(self.path())
-                    .map_err(|_| CliError::PathOutsideRoot {
-                        path: entry.path().to_path_buf(),
-                    })?;
-            if relative
-                .components()
-                .next()
-                .is_some_and(|component| component.as_os_str() == OwnershipManifest::DIRECTORY)
-            {
-                continue;
-            }
-
-            let logical = self.directory.logical_path(entry.path())?;
-            catalog.insert(logical, fs_err::read(entry.path())?)?;
-        }
+        self.read_contract_directory(&root, Path::new(""), budget, &mut catalog)?;
 
         Ok(catalog)
     }
 
-    /// Reads an existing contracts root or returns an empty generation catalog
-    /// when the selected path is lexically absent.
+    fn read_contract_directory(
+        &self,
+        directory: &Dir,
+        relative: &Path,
+        budget: &mut CatalogReadBudget,
+        catalog: &mut FileCatalog,
+    ) -> Result<(), CliError> {
+        for entry in self.directory.sorted_entries(directory, relative, budget)? {
+            budget.checkpoint()?;
+            let name = entry.file_name();
+            if relative.as_os_str().is_empty() && name == OwnershipManifest::DIRECTORY {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                let child = self
+                    .directory
+                    .open_directory_child(directory, &name, relative)?;
+                let child_relative = relative.join(&name);
+                self.read_contract_directory(&child, &child_relative, budget, catalog)?;
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let entry_relative = relative.join(&name);
+            let physical = self.path().join(&entry_relative);
+            budget.begin_entry(&physical)?;
+            let logical = self.directory.logical_path(&physical)?;
+            let leaf = self.directory.discovered_leaf(directory, &name, relative)?;
+            let mut file = leaf
+                .open_regular()?
+                .ok_or_else(|| CliError::Io(std::io::ErrorKind::NotFound.into()))?;
+            budget.preflight_file(&physical, file.metadata()?.len())?;
+            let bytes = budget.read_file(&physical, &mut file)?;
+            catalog.insert(logical, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Reads the optional contracts catalog against a caller-owned operation budget.
     ///
     /// # Errors
     ///
-    /// Returns an error if an existing root cannot be inspected or read,
-    /// including when it is a file, dangling symlink, or contains an invalid
-    /// reserved metadata namespace.
-    pub(crate) fn read_optional(&self) -> Result<FileCatalog, CliError> {
-        match fs_err::symlink_metadata(self.path()) {
-            Ok(_) => self.read(),
-            Err(source) if source.kind() == ErrorKind::NotFound => Ok(FileCatalog::new()),
-            Err(source) => Err(CliError::Io(source)),
+    /// Returns an error if root absence cannot be determined or a present
+    /// contracts catalog cannot be securely validated and read within budget.
+    pub(crate) fn read_optional_with_budget(
+        &self,
+        budget: &mut CatalogReadBudget,
+    ) -> Result<FileCatalog, CliError> {
+        if self.directory.is_lexically_absent()? {
+            Ok(FileCatalog::new())
+        } else {
+            self.read_with_budget(budget)
         }
     }
 
-    /// Reconciles generated documents and their ownership metadata.
+    /// Reconciles generated documents against the caller's complete operation ledger.
     ///
     /// # Errors
     ///
-    /// Returns an error when locking, recovery, baseline validation, preflight,
-    /// reservation, mutation, rollback, verification, or ownership persistence
-    /// fails.
-    pub(crate) fn write_generated(
+    /// Returns an error if ownership recovery, locking, baseline validation,
+    /// reservation, mutation, rollback, or final verification fails, or if the
+    /// operation is canceled or exceeds its catalog budget.
+    pub(crate) fn write_generated_with_budget(
         &self,
         generated: GeneratedContracts,
         policy: ExistingOutputPolicy,
+        budget: CatalogReadBudget,
     ) -> Result<GenerationReceipt, CliError> {
-        CatalogReconciliation::new(self, generated, policy)?.apply()
+        CatalogReconciliation::new(self, generated, policy, budget)?.apply()
     }
 
-    /// Validates the reserved metadata directory and every recognized entry.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the contracts root cannot be inspected or the
-    /// reserved namespace has noncanonical spelling, shape, or entries.
-    pub(super) fn validate_reserved_namespace(&self) -> Result<(), CliError> {
-        let entries = match fs_err::read_dir(self.path()) {
-            Ok(entries) => entries,
-            Err(source) if source.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(source) => return Err(CliError::Io(source)),
-        };
-        let mut metadata_directory = None;
+    pub(super) fn validate_reserved_namespace_with_budget(
+        &self,
+        budget: &mut CatalogReadBudget,
+    ) -> Result<(), CliError> {
+        budget.checkpoint()?;
+        if self.directory.is_lexically_absent()? {
+            return Ok(());
+        }
+        let root = self.directory.capability()?;
+        let mut metadata_directory = None::<std::ffi::OsString>;
 
-        for entry in entries {
+        for entry in root.entries()? {
+            budget.checkpoint()?;
+            budget.visit_traversal_entry(self.path())?;
             let entry = entry?;
             let name = entry.file_name();
             if name.eq_ignore_ascii_case(OwnershipManifest::DIRECTORY) {
                 if name != OwnershipManifest::DIRECTORY || metadata_directory.is_some() {
-                    return Err(CliError::ReservedMetadataEntry { path: entry.path() });
+                    return Err(CliError::ReservedMetadataEntry {
+                        path: self.path().join(name),
+                    });
                 }
-                metadata_directory = Some(entry.path());
+                metadata_directory = Some(name);
             }
         }
 
-        let Some(directory) = metadata_directory else {
+        let Some(directory_name) = metadata_directory else {
             return Ok(());
         };
-        let metadata = fs_err::symlink_metadata(&directory)?;
-        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-            return Err(CliError::ReservedMetadataEntry { path: directory });
+        let metadata = root.symlink_metadata(&directory_name)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(CliError::ReservedMetadataEntry {
+                path: self.path().join(&directory_name),
+            });
         }
+        let directory = root.open_dir_nofollow(&directory_name)?;
 
-        for entry in fs_err::read_dir(&directory)? {
+        for entry in directory.entries()? {
+            budget.checkpoint()?;
+            budget.visit_traversal_entry(&self.path().join(OwnershipManifest::DIRECTORY))?;
             let entry = entry?;
             let name = entry.file_name();
             if (name != OwnershipManifest::FILE_NAME
@@ -174,43 +391,119 @@ impl ContractsStore {
                 && !Self::is_manifest_atomic_temporary_name(&name))
                 || !entry.file_type()?.is_file()
             {
-                return Err(CliError::ReservedMetadataEntry { path: entry.path() });
+                return Err(CliError::ReservedMetadataEntry {
+                    path: self.path().join(OwnershipManifest::DIRECTORY).join(name),
+                });
             }
         }
 
         Ok(())
     }
 
-    /// Removes only recognized abandoned atomic ownership-manifest writes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the metadata directory cannot be inspected, a
-    /// recognized temporary is not a file, or removal fails.
-    pub(super) fn remove_abandoned_manifest_temporaries(&self) -> Result<(), CliError> {
-        let directory = self.path().join(OwnershipManifest::DIRECTORY);
-        let entries = match fs_err::read_dir(&directory) {
-            Ok(entries) => entries,
+    pub(super) fn remove_abandoned_manifest_temporaries_with_budget(
+        &self,
+        budget: &mut CatalogReadBudget,
+    ) -> Result<(), CliError> {
+        budget.checkpoint()?;
+        if self.directory.is_lexically_absent()? {
+            return Ok(());
+        }
+        let root = self.directory.capability()?;
+        let metadata_name = OsStr::new(OwnershipManifest::DIRECTORY);
+        let metadata = match root.symlink_metadata(metadata_name) {
+            Ok(metadata) => metadata,
             Err(source) if source.kind() == ErrorKind::NotFound => return Ok(()),
             Err(source) => return Err(CliError::Io(source)),
         };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(CliError::ReservedMetadataEntry {
+                path: self.path().join(metadata_name),
+            });
+        }
+        let directory = root.open_dir_nofollow(metadata_name)?;
 
-        for entry in entries {
+        for entry in directory.entries()? {
+            budget.checkpoint()?;
+            budget.visit_traversal_entry(&self.path().join(OwnershipManifest::DIRECTORY))?;
             let entry = entry?;
-            if Self::is_manifest_atomic_temporary_name(&entry.file_name()) {
+            let name = entry.file_name();
+            if Self::is_manifest_atomic_temporary_name(&name) {
                 if !entry.file_type()?.is_file() {
-                    return Err(CliError::ReservedMetadataEntry { path: entry.path() });
+                    return Err(CliError::ReservedMetadataEntry {
+                        path: self.path().join(metadata_name).join(&name),
+                    });
                 }
-                fs_err::remove_file(entry.path())?;
+                directory.remove_file(&name)?;
             }
         }
 
         Ok(())
     }
 
-    /// Maps one logical catalog path below the selected contracts root.
-    fn output_path_for(&self, logical: &CatalogPath) -> Result<PathBuf, CliError> {
-        let mut path = self.path().to_path_buf();
+    /// Starts one cumulative budget for reconciliation-owned metadata and
+    /// generated-output reads.
+    pub(super) fn begin_reconciliation_read(
+        &self,
+        cancellation: &crate::context::ApplicationCancellation,
+    ) -> CatalogReadBudget {
+        self.limits.begin(cancellation)
+    }
+
+    /// Resolves the existing ownership-manifest name without creating the
+    /// selected root or reserved metadata directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if root absence cannot be determined or the existing
+    /// metadata path cannot be securely resolved.
+    pub(super) fn existing_ownership_leaf(&self) -> Result<Option<CatalogLeaf>, CliError> {
+        if self.directory.is_lexically_absent()? {
+            return Ok(None);
+        }
+        let relative = Path::new(OwnershipManifest::DIRECTORY).join(OwnershipManifest::FILE_NAME);
+        match self
+            .directory
+            .existing_leaf(&relative, PathRole::GeneratedOutput)
+        {
+            Ok(leaf) => Ok(Some(leaf)),
+            Err(CliError::Io(source)) if source.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Resolves the ownership-manifest name and creates its anchored metadata
+    /// parent when persistence is required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata path is invalid or its root and parent
+    /// directories cannot be securely opened or created.
+    pub(super) fn ownership_leaf_for_write(&self) -> Result<CatalogLeaf, CliError> {
+        let relative = Path::new(OwnershipManifest::DIRECTORY).join(OwnershipManifest::FILE_NAME);
+        self.directory
+            .create_leaf(&relative, PathRole::GeneratedOutput)
+    }
+
+    /// Resolves the capability-relative generation-lock name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock path is invalid or its root and parent
+    /// directories cannot be securely opened or created.
+    pub(super) fn generation_lock_leaf(&self) -> Result<CatalogLeaf, CliError> {
+        let relative = Path::new(OwnershipManifest::DIRECTORY).join(GenerationLock::FILE_NAME);
+        self.directory
+            .create_leaf(&relative, PathRole::GeneratedOutput)
+    }
+
+    /// Maps one logical catalog path to a portable relative filesystem path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any logical component is not a portable host-file
+    /// name.
+    fn output_relative_for(&self, logical: &CatalogPath) -> Result<PathBuf, CliError> {
+        let mut path = PathBuf::new();
         for component in logical.as_str().split('/') {
             PortablePathRules::validate_component(OsStr::new(component))?;
             path.push(component);
@@ -218,18 +511,14 @@ impl ContractsStore {
         Ok(path)
     }
 
-    /// Maps and containment-checks one generated logical path.
+    /// Binds one generated logical path to the retained contracts capability.
     ///
     /// # Errors
     ///
     /// Returns an error if the logical path enters the reserved namespace, has
     /// a nonportable component, encounters a symlink, or escapes the contracts
     /// root.
-    pub(super) fn validated_output_path(
-        &self,
-        root: &ResolvedPath,
-        logical: &CatalogPath,
-    ) -> Result<PathBuf, CliError> {
+    pub(super) fn generated_leaf(&self, logical: &CatalogPath) -> Result<CatalogLeaf, CliError> {
         if logical
             .as_str()
             .split('/')
@@ -237,13 +526,40 @@ impl ContractsStore {
             .is_some_and(|component| component.eq_ignore_ascii_case(OwnershipManifest::DIRECTORY))
         {
             return Err(CliError::ReservedMetadataEntry {
-                path: self.output_path_for(logical)?,
+                path: self.path().join(self.output_relative_for(logical)?),
             });
         }
 
-        let output = self.output_path_for(logical)?;
-        root.ensure_generated_path(&output)?;
-        Ok(output)
+        let relative = self.output_relative_for(logical)?;
+        self.directory
+            .create_leaf(&relative, PathRole::GeneratedOutput)
+    }
+
+    /// Reads one anchored regular file under the cumulative reconciliation
+    /// budget and derives alias identity from a clone of that same opened
+    /// handle. Metadata length is only an early check; the actual read is
+    /// capped at the remaining limit plus one evidence byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on cancellation or a catalog-limit breach, or when the
+    /// anchored name cannot be securely opened, identity-bound, or read.
+    pub(super) fn read_leaf(
+        &self,
+        leaf: &CatalogLeaf,
+        budget: &mut CatalogReadBudget,
+    ) -> Result<Option<FileSnapshot>, CliError> {
+        budget.begin_entry(leaf.display_path())?;
+        let mut file = match leaf.open_regular() {
+            Ok(Some(file)) => file,
+            Ok(None) => return Ok(None),
+            Err(CliError::Io(source)) if source.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        budget.preflight_file(leaf.display_path(), file.metadata()?.len())?;
+        let identity = same_file::Handle::from_file(file.try_clone()?.into_std())?;
+        let bytes = budget.read_file(leaf.display_path(), &mut file)?;
+        Ok(Some(FileSnapshot { bytes, identity }))
     }
 
     /// Writes one file through an individually atomic replacement.
@@ -252,22 +568,17 @@ impl ContractsStore {
     ///
     /// Returns an error if containment or symlink validation fails, parent
     /// creation fails, or the atomic file cannot be opened, written, or
-    /// committed.
+    /// committed. Cancellation is observed through the last checkpoint before
+    /// the destination rename. Once publication begins, the rename and parent
+    /// synchronization result is definitive and cannot be replaced by a late
+    /// cancellation request.
     pub(super) fn atomic_write(
         &self,
-        root: &ResolvedPath,
-        path: &Path,
+        destination: &CatalogLeaf,
         bytes: &[u8],
+        cancellation: &crate::context::ApplicationCancellation,
     ) -> Result<(), CliError> {
-        root.ensure_generated_path(path)?;
-        if let Some(parent) = path.parent() {
-            fs_err::create_dir_all(parent)?;
-        }
-
-        let mut output = AtomicWriteFile::open(path)?;
-        output.write_all(bytes)?;
-        output.commit()?;
-        Ok(())
+        ContractPublication::create(destination, cancellation)?.publish(bytes, cancellation)
     }
 
     fn is_manifest_atomic_temporary_name(name: &OsStr) -> bool {
@@ -277,6 +588,19 @@ impl ContractsStore {
                 suffix.len() == OwnershipManifest::ATOMIC_TEMPORARY_SUFFIX_LENGTH
                     && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
             })
+    }
+}
+
+impl FileSnapshot {
+    /// Returns bytes read through the opened capability handle.
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consumes the snapshot and returns identity derived from that same
+    /// opened handle.
+    pub(super) fn into_identity(self) -> same_file::Handle {
+        self.identity
     }
 }
 
@@ -312,18 +636,25 @@ mod tests {
     use assert_fs::prelude::*;
     use conkit_signature::{CatalogPath, FileCatalog};
 
-    use super::{ContractsStore, GeneratedContracts};
-    use crate::catalog::{PathRole, ResolvedPath};
+    use super::{ContractPublication, ContractsStore, GeneratedContracts, OwnershipManifest};
+    use crate::catalog::{CatalogReadLimitResource, CatalogReadLimits};
+    use crate::error::CliError;
 
     #[test]
     fn required_and_optional_reads_distinguish_missing_directory_and_file_roots() {
         let temp = assert_fs::TempDir::new().expect("temporary root");
         let missing = temp.child("missing");
         let store = ContractsStore::new(missing.path().to_path_buf());
-        assert!(store.read().is_err(), "required root must exist");
+        let cancellation = crate::context::ApplicationCancellation::new();
+        let mut required_budget = store.limits.begin(&cancellation);
+        assert!(
+            store.read_with_budget(&mut required_budget).is_err(),
+            "required root must exist"
+        );
+        let mut optional_budget = store.limits.begin(&cancellation);
         assert!(
             store
-                .read_optional()
+                .read_optional_with_budget(&mut optional_budget)
                 .expect("missing generation root")
                 .is_empty()
         );
@@ -342,17 +673,23 @@ mod tests {
             .child("main.yml")
             .write_str("root: ../src\n")
             .expect("combined document");
-        let catalog = ContractsStore::new(directory.path().to_path_buf())
-            .read_optional()
+        let existing_store = ContractsStore::new(directory.path().to_path_buf());
+        let mut budget = existing_store.limits.begin(&cancellation);
+        let catalog = existing_store
+            .read_optional_with_budget(&mut budget)
             .expect("existing root");
         assert_eq!(catalog.len(), 2, "all non-metadata files are retained");
 
         let file = temp.child("contracts-file");
         file.touch().expect("non-directory root");
-        let error = ContractsStore::new(file.path().to_path_buf())
-            .read_optional()
+        let store = ContractsStore::new(file.path().to_path_buf());
+        let mut budget = store.limits.begin(&cancellation);
+        let error = store
+            .read_optional_with_budget(&mut budget)
             .expect_err("file root");
         assert!(error.to_string().contains("is not a directory"));
+        drop(store);
+        drop(existing_store);
         temp.close().expect("close temporary root");
     }
 
@@ -385,8 +722,11 @@ mod tests {
             .write_str("manual\n")
             .expect("similarly named user directory");
 
-        let catalog = ContractsStore::new(contracts.path().to_path_buf())
-            .read()
+        let initial_store = ContractsStore::new(contracts.path().to_path_buf());
+        let cancellation = crate::context::ApplicationCancellation::new();
+        let mut budget = initial_store.limits.begin(&cancellation);
+        let catalog = initial_store
+            .read_with_budget(&mut budget)
             .expect("contracts catalog");
         assert_eq!(catalog.len(), 2);
         assert!(
@@ -404,12 +744,14 @@ mod tests {
             .child(".contract-kit/unknown")
             .touch()
             .expect("unknown metadata entry");
+        let store = ContractsStore::new(contracts.path().to_path_buf());
+        let mut budget = store.limits.begin(&cancellation);
         assert!(
-            ContractsStore::new(contracts.path().to_path_buf())
-                .read()
-                .is_err(),
+            store.read_with_budget(&mut budget).is_err(),
             "unknown reserved entries must fail before walking"
         );
+        drop(store);
+        drop(initial_store);
         temp.close().expect("close temporary root");
     }
 
@@ -425,21 +767,40 @@ mod tests {
         manifest.touch().expect("manifest");
 
         let store = ContractsStore::new(contracts.path().to_path_buf());
+        let cancellation = crate::context::ApplicationCancellation::new();
+        let mut budget = store.limits.begin(&cancellation);
         store
-            .validate_reserved_namespace()
+            .validate_reserved_namespace_with_budget(&mut budget)
             .expect("valid namespace");
         let unrecognized = metadata.child(".generated-files.json.short");
         unrecognized
             .touch()
             .expect("unrecognized temporary-shaped entry");
         store
-            .remove_abandoned_manifest_temporaries()
+            .remove_abandoned_manifest_temporaries_with_budget(&mut budget)
             .expect("temporary cleanup");
 
         recognized.assert(predicates::path::missing());
         unrecognized.assert(predicates::path::exists());
         manifest.assert(predicates::path::exists());
+        drop(store);
         temp.close().expect("close temporary root");
+    }
+
+    #[test]
+    fn manifest_atomic_temporary_names_remain_cleanup_compatible() {
+        let manifest = ContractPublication::temporary_name(
+            std::ffi::OsStr::new(OwnershipManifest::FILE_NAME),
+            0x12_3456,
+            0,
+        );
+        let contract =
+            ContractPublication::temporary_name(std::ffi::OsStr::new("main.yml"), 0x12_3456, 0);
+
+        assert!(ContractsStore::is_manifest_atomic_temporary_name(&manifest));
+        assert!(!ContractsStore::is_manifest_atomic_temporary_name(
+            &contract
+        ));
     }
 
     #[test]
@@ -448,27 +809,324 @@ mod tests {
         let contracts = temp.child("contracts");
         contracts.create_dir_all().expect("contracts root");
         let store = ContractsStore::new(contracts.path().to_path_buf());
-        let root = ResolvedPath::new(PathRole::Contracts, contracts.path().to_path_buf())
-            .expect("resolved root");
         let logical = CatalogPath::new("nested/main.yaml").expect("logical path");
         let destination = store
-            .validated_output_path(&root, &logical)
+            .generated_leaf(&logical)
             .expect("validated destination");
 
         store
-            .atomic_write(&root, &destination, b"version: 1\n")
+            .atomic_write(
+                &destination,
+                b"version: 1\n",
+                &crate::context::ApplicationCancellation::new(),
+            )
             .expect("atomic output");
 
         contracts.child("nested/main.yaml").assert("version: 1\n");
+        let entries = std::fs::read_dir(contracts.child("nested").path())
+            .expect("generated parent directory")
+            .map(|entry| entry.expect("generated parent entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [std::ffi::OsString::from("main.yaml")]);
         let reserved = CatalogPath::new(".CONTRACT-KIT/output.yml").expect("reserved path");
-        assert!(store.validated_output_path(&root, &reserved).is_err());
-        let outside = temp.child("outside.yml");
+        assert!(store.generated_leaf(&reserved).is_err());
+        drop(destination);
+        drop(store);
+        temp.close().expect("close temporary root");
+    }
+
+    #[test]
+    fn pre_canceled_atomic_write_preserves_destination_and_leaves_no_temporary() {
+        let temp = assert_fs::TempDir::new().expect("temporary root");
+        let contracts = temp.child("contracts");
+        contracts.create_dir_all().expect("contracts root");
+        contracts
+            .child("main.yml")
+            .write_str("before\n")
+            .expect("existing destination");
+        let store = ContractsStore::new(contracts.path().to_path_buf());
+        let destination = store
+            .generated_leaf(&CatalogPath::new("main.yml").expect("logical destination"))
+            .expect("generated destination");
+        let cancellation = crate::context::ApplicationCancellation::new();
+        cancellation.request();
+
+        let error = store
+            .atomic_write(&destination, b"after\n", &cancellation)
+            .expect_err("pre-canceled write must not publish");
+
+        assert!(matches!(error, CliError::OperationCanceled));
+        contracts.child("main.yml").assert("before\n");
+        let entries = std::fs::read_dir(contracts.path())
+            .expect("contracts directory")
+            .map(|entry| entry.expect("contracts entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [std::ffi::OsString::from("main.yml")]);
+
+        drop(destination);
+        drop(store);
+        temp.close().expect("close temporary root");
+    }
+
+    #[test]
+    fn cancellation_after_publication_open_aborts_and_removes_the_temporary() {
+        let temp = assert_fs::TempDir::new().expect("temporary root");
+        let contracts = temp.child("contracts");
+        contracts.create_dir_all().expect("contracts root");
+        contracts
+            .child("main.yml")
+            .write_str("before\n")
+            .expect("existing destination");
+        let store = ContractsStore::new(contracts.path().to_path_buf());
+        let destination = store
+            .generated_leaf(&CatalogPath::new("main.yml").expect("logical destination"))
+            .expect("generated destination");
+        let temporary = std::ffi::OsString::from(".publication-canceled.tmp");
+        let publication =
+            ContractPublication::open(&destination, temporary.clone()).expect("opened publication");
+        let cancellation = crate::context::ApplicationCancellation::new();
+        cancellation.request();
+
+        let error = publication
+            .publish(b"after\n", &cancellation)
+            .expect_err("cancellation after open must abort publication");
+
+        assert!(matches!(error, CliError::OperationCanceled));
+        contracts.child("main.yml").assert("before\n");
+        contracts
+            .child(std::path::Path::new(&temporary))
+            .assert(predicates::path::missing());
+        drop(destination);
+        drop(store);
+        temp.close().expect("close temporary root");
+    }
+
+    #[test]
+    fn failed_destination_rename_aborts_and_removes_the_temporary() {
+        let temp = assert_fs::TempDir::new().expect("temporary root");
+        let contracts = temp.child("contracts");
+        contracts
+            .child("main.yml")
+            .create_dir_all()
+            .expect("directory at destination name");
+        let store = ContractsStore::new(contracts.path().to_path_buf());
+        let destination = store
+            .generated_leaf(&CatalogPath::new("main.yml").expect("logical destination"))
+            .expect("generated destination");
+
+        store
+            .atomic_write(
+                &destination,
+                b"generated\n",
+                &crate::context::ApplicationCancellation::new(),
+            )
+            .expect_err("a file cannot replace the destination directory");
+
+        let entries = std::fs::read_dir(contracts.path())
+            .expect("contracts directory")
+            .map(|entry| entry.expect("contracts entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [std::ffi::OsString::from("main.yml")]);
+        contracts
+            .child("main.yml")
+            .assert(predicates::path::is_dir());
+        drop(destination);
+        drop(store);
+        temp.close().expect("close temporary root");
+    }
+
+    #[test]
+    fn dropping_an_unfinished_publication_performs_best_effort_cleanup() {
+        let temp = assert_fs::TempDir::new().expect("temporary root");
+        let contracts = temp.child("contracts");
+        contracts.create_dir_all().expect("contracts root");
+        let store = ContractsStore::new(contracts.path().to_path_buf());
+        let destination = store
+            .generated_leaf(&CatalogPath::new("main.yml").expect("logical destination"))
+            .expect("generated destination");
+        let temporary = std::ffi::OsString::from(".publication-drop.tmp");
+
+        let publication =
+            ContractPublication::open(&destination, temporary.clone()).expect("opened publication");
+        contracts
+            .child(std::path::Path::new(&temporary))
+            .assert(predicates::path::exists());
+        drop(publication);
+
+        contracts
+            .child(std::path::Path::new(&temporary))
+            .assert(predicates::path::missing());
+        drop(destination);
+        drop(store);
+        temp.close().expect("close temporary root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_abort_reports_atomic_temporary_cleanup_failure() {
+        let temp = assert_fs::TempDir::new().expect("temporary root");
+        let contracts = temp.child("contracts");
+        contracts.create_dir_all().expect("contracts root");
+        let store = ContractsStore::new(contracts.path().to_path_buf());
+        let destination = store
+            .generated_leaf(&CatalogPath::new("main.yml").expect("logical destination"))
+            .expect("generated destination");
+        let temporary = std::ffi::OsString::from(".publication-cleanup.tmp");
+        let publication =
+            ContractPublication::open(&destination, temporary.clone()).expect("opened publication");
+        let temporary_path = contracts.child(std::path::Path::new(&temporary));
+        let parked = contracts.child("parked-temporary");
+        std::fs::rename(temporary_path.path(), parked.path()).expect("park open temporary");
+        temporary_path
+            .create_dir_all()
+            .expect("replace temporary with directory");
+
+        let error = publication.abort(CliError::OperationCanceled);
+
         assert!(
-            store
-                .atomic_write(&root, outside.path(), b"outside\n")
-                .is_err()
+            error
+                .to_string()
+                .contains("operation canceled; atomic temporary cleanup also failed"),
+            "{error}"
         );
-        outside.assert(predicates::path::missing());
+        temporary_path.assert(predicates::path::is_dir());
+        parked.assert(predicates::path::exists());
+        drop(destination);
+        drop(store);
+        temp.close().expect("close temporary root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_uses_the_anchored_contracts_root_after_replacement() {
+        let temp = assert_fs::TempDir::new().expect("temporary root");
+        let contracts = temp.child("contracts");
+        let anchored = temp.child("anchored contracts");
+        contracts.create_dir_all().expect("contracts root");
+        contracts
+            .child("existing.yml")
+            .write_str("before\n")
+            .expect("existing contract");
+        let store = ContractsStore::new(contracts.path().to_path_buf());
+        let cancellation = crate::context::ApplicationCancellation::new();
+        let mut budget = store.limits.begin(&cancellation);
+        store
+            .read_with_budget(&mut budget)
+            .expect("reading anchors the contracts root");
+
+        std::fs::rename(contracts.path(), anchored.path()).expect("rename anchored root");
+        contracts
+            .create_dir_all()
+            .expect("replacement contracts root");
+        let destination = store
+            .generated_leaf(&CatalogPath::new("nested/main.yml").expect("logical path"))
+            .expect("anchored generated leaf");
+        store
+            .atomic_write(
+                &destination,
+                b"anchored\n",
+                &crate::context::ApplicationCancellation::new(),
+            )
+            .expect("capability-relative atomic write");
+
+        anchored.child("nested/main.yml").assert("anchored\n");
+        contracts
+            .child("nested/main.yml")
+            .assert(predicates::path::missing());
+        temp.close().expect("close temporary root");
+    }
+
+    #[test]
+    fn reconciliation_leaf_reads_accept_the_exact_limit_and_reject_one_more_byte() {
+        let exact = assert_fs::TempDir::new().expect("exact temporary root");
+        let exact_contracts = exact.child("contracts");
+        exact_contracts
+            .child("main.yml")
+            .write_binary(b"four")
+            .expect("exact-size generated output");
+        let exact_store = ContractsStore::new(exact_contracts.path().to_path_buf())
+            .with_limits(CatalogReadLimits::new(1, 4, 4));
+        let exact_leaf = exact_store
+            .generated_leaf(&CatalogPath::new("main.yml").expect("exact logical path"))
+            .expect("exact generated leaf");
+        let mut exact_budget =
+            exact_store.begin_reconciliation_read(&crate::context::ApplicationCancellation::new());
+        let exact_snapshot = exact_store
+            .read_leaf(&exact_leaf, &mut exact_budget)
+            .expect("exact-size read")
+            .expect("exact-size output exists");
+        assert_eq!(exact_snapshot.bytes(), b"four");
+
+        let excessive = assert_fs::TempDir::new().expect("excessive temporary root");
+        let excessive_contracts = excessive.child("contracts");
+        excessive_contracts
+            .child("main.yml")
+            .write_binary(b"five!")
+            .expect("oversized generated output");
+        let excessive_store = ContractsStore::new(excessive_contracts.path().to_path_buf())
+            .with_limits(CatalogReadLimits::new(1, 4, 4));
+        let excessive_leaf = excessive_store
+            .generated_leaf(&CatalogPath::new("main.yml").expect("excessive logical path"))
+            .expect("excessive generated leaf");
+        let mut excessive_budget = excessive_store
+            .begin_reconciliation_read(&crate::context::ApplicationCancellation::new());
+        let error = excessive_store
+            .read_leaf(&excessive_leaf, &mut excessive_budget)
+            .expect_err("one byte beyond the file limit must fail");
+        let CliError::CatalogReadLimit(error) = error else {
+            panic!("expected typed file-byte limit")
+        };
+        assert_eq!(error.resource, CatalogReadLimitResource::FileBytes);
+        assert_eq!(error.limit, 4);
+        assert_eq!(error.observed_at_least, 5);
+        assert_eq!(error.path, excessive_contracts.child("main.yml").path());
+
+        drop(exact_snapshot);
+        drop(exact_leaf);
+        drop(exact_store);
+        drop(excessive_leaf);
+        drop(excessive_store);
+        exact.close().expect("close exact temporary root");
+        excessive.close().expect("close excessive temporary root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_leaves_reject_symlink_ancestors_and_final_entries() {
+        use std::os::unix::fs::symlink;
+
+        let temp = assert_fs::TempDir::new().expect("temporary root");
+        let contracts = temp.child("contracts");
+        let outside = temp.child("outside");
+        contracts.create_dir_all().expect("contracts root");
+        outside.create_dir_all().expect("outside directory");
+        outside
+            .child("external.yml")
+            .write_binary(b"outside\n")
+            .expect("outside file");
+        symlink(outside.path(), contracts.child("linked").path()).expect("ancestor symlink");
+        symlink(
+            outside.child("external.yml").path(),
+            contracts.child("linked.yml").path(),
+        )
+        .expect("final symlink");
+        let store = ContractsStore::new(contracts.path().to_path_buf());
+
+        let ancestor_error = store
+            .generated_leaf(&CatalogPath::new("linked/main.yml").expect("ancestor logical path"))
+            .expect_err("a generated ancestor symlink must fail");
+        assert!(ancestor_error.to_string().contains("symbolic link"));
+
+        let final_leaf = store
+            .generated_leaf(&CatalogPath::new("linked.yml").expect("final logical path"))
+            .expect("final-name leaf");
+        let mut budget =
+            store.begin_reconciliation_read(&crate::context::ApplicationCancellation::new());
+        let final_error = store
+            .read_leaf(&final_leaf, &mut budget)
+            .expect_err("a generated final symlink must fail");
+        assert!(final_error.to_string().contains("symbolic link"));
+
         temp.close().expect("close temporary root");
     }
 
@@ -498,8 +1156,11 @@ mod tests {
         )
         .expect("file symlink");
 
-        let catalog = ContractsStore::new(contracts.path().to_path_buf())
-            .read()
+        let store = ContractsStore::new(contracts.path().to_path_buf());
+        let cancellation = crate::context::ApplicationCancellation::new();
+        let mut budget = store.limits.begin(&cancellation);
+        let catalog = store
+            .read_with_budget(&mut budget)
             .expect("contracts catalog");
 
         assert_eq!(catalog.len(), 1);
@@ -525,9 +1186,12 @@ mod tests {
             .expect("contract entry");
         let selected = temp.child("selected");
         symlink(actual.path(), selected.path()).expect("directory root symlink");
+        let selected_store = ContractsStore::new(selected.path().to_path_buf());
+        let cancellation = crate::context::ApplicationCancellation::new();
+        let mut budget = selected_store.limits.begin(&cancellation);
         assert_eq!(
-            ContractsStore::new(selected.path().to_path_buf())
-                .read_optional()
+            selected_store
+                .read_optional_with_budget(&mut budget)
                 .expect("directory root symlink")
                 .len(),
             1
@@ -535,9 +1199,11 @@ mod tests {
 
         let dangling = temp.child("dangling");
         symlink(temp.child("absent").path(), dangling.path()).expect("dangling root symlink");
+        let dangling_store = ContractsStore::new(dangling.path().to_path_buf());
+        let mut budget = dangling_store.limits.begin(&cancellation);
         assert!(
-            ContractsStore::new(dangling.path().to_path_buf())
-                .read_optional()
+            dangling_store
+                .read_optional_with_budget(&mut budget)
                 .is_err(),
             "only a lexically absent root is optional"
         );
@@ -561,5 +1227,99 @@ mod tests {
 
         assert_eq!(baseline.get(&baseline_path), Some(b"before\n".as_slice()));
         assert_eq!(documents.get(&document_path), Some(b"after\n".as_slice()));
+    }
+
+    #[test]
+    fn contract_reads_enforce_entry_file_and_total_limits_in_path_order() {
+        let temp = assert_fs::TempDir::new().expect("temporary root");
+        let contracts = temp.child("contracts");
+        contracts.create_dir_all().expect("contracts root");
+        contracts
+            .child("a.yml")
+            .write_binary(b"aaa")
+            .expect("a contract");
+        contracts
+            .child("b.yml")
+            .write_binary(b"bbb")
+            .expect("b contract");
+
+        let entry_store = ContractsStore::new(contracts.path().to_path_buf())
+            .with_limits(CatalogReadLimits::new(1, 64, 64));
+        let cancellation = crate::context::ApplicationCancellation::new();
+        let mut budget = entry_store.limits.begin(&cancellation);
+        let entry_error = entry_store
+            .read_with_budget(&mut budget)
+            .expect_err("the second sorted contract must exceed the entry budget");
+        let CliError::CatalogReadLimit(entry_error) = entry_error else {
+            panic!("expected typed entry limit")
+        };
+        assert_eq!(entry_error.resource, CatalogReadLimitResource::EntryCount);
+        assert_eq!(entry_error.observed_at_least, 2);
+        assert_eq!(entry_error.path, contracts.child("b.yml").path());
+
+        let file_store = ContractsStore::new(contracts.path().to_path_buf())
+            .with_limits(CatalogReadLimits::new(2, 64, 2));
+        let mut budget = file_store.limits.begin(&cancellation);
+        let file_error = file_store
+            .read_with_budget(&mut budget)
+            .expect_err("the first sorted contract must exceed per-file bytes");
+        let CliError::CatalogReadLimit(file_error) = file_error else {
+            panic!("expected typed file-byte limit")
+        };
+        assert_eq!(file_error.resource, CatalogReadLimitResource::FileBytes);
+        assert_eq!(file_error.observed_at_least, 3);
+        assert_eq!(file_error.path, contracts.child("a.yml").path());
+
+        let total_store = ContractsStore::new(contracts.path().to_path_buf())
+            .with_limits(CatalogReadLimits::new(2, 5, 64));
+        let mut budget = total_store.limits.begin(&cancellation);
+        let total_error = total_store
+            .read_with_budget(&mut budget)
+            .expect_err("the second sorted contract must exceed total bytes");
+        let CliError::CatalogReadLimit(total_error) = total_error else {
+            panic!("expected typed total-byte limit")
+        };
+        assert_eq!(total_error.resource, CatalogReadLimitResource::TotalBytes);
+        assert_eq!(total_error.limit, 5);
+        assert_eq!(total_error.observed_at_least, 6);
+        assert_eq!(total_error.path, contracts.child("b.yml").path());
+        drop(total_store);
+        drop(file_store);
+        drop(entry_store);
+        temp.close().expect("close temporary root");
+    }
+
+    #[test]
+    fn reserved_metadata_does_not_consume_contract_catalog_budgets() {
+        let temp = assert_fs::TempDir::new().expect("temporary root");
+        let contracts = temp.child("contracts");
+        contracts
+            .child(".contract-kit")
+            .create_dir_all()
+            .expect("metadata directory");
+        contracts
+            .child(".contract-kit/generated-files.json")
+            .write_binary(&[b'x'; 128])
+            .expect("large metadata file");
+        contracts
+            .child("main.yml")
+            .write_binary(b"four")
+            .expect("contract document");
+
+        let store = ContractsStore::new(contracts.path().to_path_buf())
+            .with_limits(CatalogReadLimits::new(1, 4, 4));
+        let cancellation = crate::context::ApplicationCancellation::new();
+        let mut budget = store.limits.begin(&cancellation);
+        let catalog = store
+            .read_with_budget(&mut budget)
+            .expect("reserved metadata is outside the contract catalog budget");
+
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(
+            catalog.get(&CatalogPath::new("main.yml").expect("document path")),
+            Some(&b"four"[..])
+        );
+        drop(store);
+        temp.close().expect("close temporary root");
     }
 }

@@ -1,145 +1,289 @@
 use crate::error::SketchContractKitError;
 use futures_channel::oneshot;
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// CPU work-pool configuration for [`SketchContractKit`](crate::SketchContractKit).
 ///
 /// Public operations return runtime-neutral futures: `conkit-sketch` does not select
 /// or depend on the async executor that polls them. CPU-heavy parsing,
-/// matching, semantic diffing, rendering, and generation run on a crate-owned
-/// Rayon pool. Each operation asynchronously waits for one root-admission
-/// permit, then submits its complete workflow. The permit moves into the Rayon
-/// closure and remains held while that job is queued or running. Completion is
-/// delivered through a runtime-neutral oneshot channel. A worker panic is
-/// forwarded by resuming the panic on the thread polling the future; ordinary
-/// failures remain typed operation errors.
+/// matching, semantic diffing, rendering, and generation run on the selected
+/// Rayon pool. Worker threads, active root operations, and queued root
+/// operations are independent budgets. A request which would exceed active
+/// plus pending admission returns a queue-full error immediately.
 ///
-/// [`WorkParallelism::Fixed`] uses its value as both the worker count and the
-/// maximum number of admitted root operations for that kit.
-/// [`WorkOptions::default`] selects [`WorkParallelism::RuntimeDefault`], for
-/// which both values use the worker count Rayon selected when the pool was
-/// built. Nested Rayon work within an admitted operation does not acquire
-/// another root permit.
-///
-/// Dropping a future before admission prevents its job from being submitted.
-/// Dropping it after submission but before execution allows the worker to skip
-/// the canceled job on a best-effort basis. Once finite CPU work has started,
-/// it runs to completion and its result may be discarded. A caller deadline
-/// therefore bounds how long the caller waits; it does not preempt CPU work.
-/// The admission bound also does not limit how many pending futures and owned
-/// catalogs callers may create, so high-concurrency hosts must impose their own
-/// request or task limit. Admission and worker scheduling make no FIFO or
-/// starvation guarantee. Operations transform owned in-memory catalogs and
-/// have no external side effects, so discarding a result cannot leave partial
-/// filesystem or network state.
+/// An admitted operation waits asynchronously for an active-operation permit,
+/// then submits its complete workflow. Both permits move into the Rayon closure
+/// and are released before completion becomes observable through the
+/// runtime-neutral oneshot channel. Dropping a queued future releases its
+/// admission permit. Dropping a submitted future signals cooperative
+/// cancellation; running work observes that signal at domain checkpoints.
+/// Worker panics resume on the polling thread, while recoverable failures remain
+/// typed operation errors. Admission and Rayon scheduling make no FIFO or
+/// starvation guarantee.
 ///
 /// # Examples
 ///
 /// ```
-/// use conkit_sketch::{SketchContractKit, WorkOptions, WorkParallelism};
+/// use conkit_sketch::{SketchContractKit, WorkOptions, WorkerPool};
 /// use std::num::NonZeroUsize;
 ///
 /// let kit = SketchContractKit::builder()
 ///     .with_work_options(WorkOptions {
-///         parallelism: WorkParallelism::Fixed(NonZeroUsize::MIN),
+///         pool: WorkerPool::Dedicated {
+///             worker_threads: NonZeroUsize::MIN,
+///         },
+///         max_in_flight_operations: NonZeroUsize::MIN,
+///         max_pending_operations: 0,
 ///     })
 ///     .build()?;
 /// # let _ = kit;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct WorkOptions {
-    /// Selects the worker count and per-kit root-operation admission capacity.
-    pub parallelism: WorkParallelism,
+    /// Selects a default, dedicated, or application-shared Rayon pool.
+    pub pool: WorkerPool,
+    /// Maximum root operations actively executing on the pool.
+    pub max_in_flight_operations: NonZeroUsize,
+    /// Maximum admitted root operations waiting for active capacity.
+    pub max_pending_operations: usize,
 }
 
 impl Default for WorkOptions {
     fn default() -> Self {
         Self {
-            parallelism: WorkParallelism::RuntimeDefault,
+            pool: WorkerPool::RuntimeDefault,
+            max_in_flight_operations: NonZeroUsize::MIN,
+            max_pending_operations: 0,
         }
     }
 }
 
-/// Worker-count and root-operation admission policy for the crate-owned CPU pool.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum WorkParallelism {
-    /// Let Rayon choose the worker count and use it as the admission capacity.
-    ///
-    /// This variant does not select an async runtime.
+/// Rayon worker-pool ownership policy.
+///
+/// # Examples
+///
+/// Reuse an application-owned pool instead of creating another worker set.
+///
+/// ```
+/// use conkit_sketch::{SketchContractKit, WorkOptions, WorkerPool};
+/// use rayon::ThreadPoolBuilder;
+/// use std::num::NonZeroUsize;
+/// use std::sync::Arc;
+///
+/// let shared = Arc::new(ThreadPoolBuilder::new().num_threads(1).build()?);
+/// let kit = SketchContractKit::builder()
+///     .with_work_options(WorkOptions {
+///         pool: WorkerPool::Shared {
+///             pool: Arc::clone(&shared),
+///         },
+///         max_in_flight_operations: NonZeroUsize::MIN,
+///         max_pending_operations: 1,
+///     })
+///     .build()?;
+///
+/// assert_eq!(shared.current_num_threads(), 1);
+/// # let _ = kit;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Clone)]
+pub enum WorkerPool {
+    /// Build a kit-owned pool using Rayon's platform default worker count.
     RuntimeDefault,
-    /// Use one explicit non-zero value for workers and admitted root operations.
-    Fixed(NonZeroUsize),
+    /// Build a kit-owned pool with an explicit worker count.
+    Dedicated {
+        /// Number of Rayon workers in the dedicated pool.
+        worker_threads: NonZeroUsize,
+    },
+    /// Reuse an application-owned pool without creating another worker set.
+    ///
+    /// The caller retains ownership and may inject the same pool into other
+    /// domain handles.
+    Shared {
+        /// Application-owned Rayon pool.
+        pool: Arc<ThreadPool>,
+    },
+}
+
+impl fmt::Debug for WorkerPool {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RuntimeDefault => formatter.write_str("RuntimeDefault"),
+            Self::Dedicated { worker_threads } => formatter
+                .debug_struct("Dedicated")
+                .field("worker_threads", worker_threads)
+                .finish(),
+            Self::Shared { pool } => formatter
+                .debug_struct("Shared")
+                .field("worker_threads", &pool.current_num_threads())
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct AsyncWorkPool {
     pool: Arc<ThreadPool>,
-    admission: Arc<async_lock::Semaphore>,
+    admitted: Arc<async_lock::Semaphore>,
+    running: Arc<async_lock::Semaphore>,
 }
 
 impl AsyncWorkPool {
     pub(crate) fn new(options: WorkOptions) -> Result<Self, SketchContractKitError> {
-        let mut builder = ThreadPoolBuilder::new();
+        let WorkOptions {
+            pool,
+            max_in_flight_operations,
+            max_pending_operations,
+        } = options;
+        let pool = match pool {
+            WorkerPool::RuntimeDefault => Arc::new(
+                ThreadPoolBuilder::new()
+                    .build()
+                    .map_err(|source| SketchContractKitError::worker_failed(source.to_string()))?,
+            ),
+            WorkerPool::Dedicated { worker_threads } => Arc::new(
+                ThreadPoolBuilder::new()
+                    .num_threads(worker_threads.get())
+                    .build()
+                    .map_err(|source| SketchContractKitError::worker_failed(source.to_string()))?,
+            ),
+            WorkerPool::Shared { pool } => pool,
+        };
+        let admitted_capacity = max_in_flight_operations
+            .get()
+            .checked_add(max_pending_operations)
+            .ok_or_else(SketchContractKitError::work_capacity_overflow)?;
 
-        if let WorkParallelism::Fixed(count) = options.parallelism {
-            builder = builder.num_threads(count.get());
-        }
-
-        let pool = Arc::new(
-            builder
-                .build()
-                .map_err(|source| SketchContractKitError::worker_failed(source.to_string()))?,
-        );
-        let admission = Arc::new(async_lock::Semaphore::new(pool.current_num_threads()));
-
-        Ok(Self { pool, admission })
+        Ok(Self {
+            pool,
+            admitted: Arc::new(async_lock::Semaphore::new(admitted_capacity)),
+            running: Arc::new(async_lock::Semaphore::new(max_in_flight_operations.get())),
+        })
     }
 
     pub(crate) async fn execute<T, F>(&self, job: F) -> Result<T, AsyncWorkError>
     where
         T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
+        F: FnOnce(CancellationProbe) -> T + Send + 'static,
     {
-        let permit = self.admission.acquire_arc().await;
+        let admitted = self
+            .admitted
+            .try_acquire_arc()
+            .ok_or(AsyncWorkError::QueueFull)?;
+        let cancellation = CancellationProbe::new();
+        let mut cancellation_guard = CancellationGuard::new(cancellation.clone());
+        let running = self.running.acquire_arc().await;
         let (sender, receiver) = oneshot::channel();
+        let worker_cancellation = cancellation.clone();
 
         self.pool.spawn(move || {
-            if sender.is_canceled() {
+            if sender.is_canceled() || worker_cancellation.is_cancelled() {
                 return;
             }
 
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-            // Release admission before making completion observable.
-            drop(permit);
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(worker_cancellation)));
+            drop(running);
+            drop(admitted);
             let _ = sender.send(outcome);
         });
 
         let outcome = receiver.await.map_err(|_| AsyncWorkError::WorkerDropped)?;
+        cancellation_guard.complete();
 
         Ok(outcome.unwrap_or_else(|payload| std::panic::resume_unwind(payload)))
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct CancellationProbe {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellationProbe {
+    const CHECKPOINT_INTERVAL: usize = 1_024;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn checkpoint(&self) -> Result<(), SketchContractKitError> {
+        if self.is_cancelled() {
+            Err(SketchContractKitError::operation_cancelled())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn checkpoint_at(&self, index: usize) -> Result<(), SketchContractKitError> {
+        if index.is_multiple_of(Self::CHECKPOINT_INTERVAL) {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+struct CancellationGuard {
+    probe: CancellationProbe,
+    armed: bool,
+}
+
+impl CancellationGuard {
+    fn new(probe: CancellationProbe) -> Self {
+        Self { probe, armed: true }
+    }
+
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.probe.cancel();
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AsyncWorkError {
+    #[error("work queue is full")]
+    QueueFull,
     #[error("background work did not complete")]
     WorkerDropped,
 }
 
 impl From<AsyncWorkError> for SketchContractKitError {
     fn from(error: AsyncWorkError) -> Self {
-        SketchContractKitError::worker_failed(error.to_string())
+        match error {
+            AsyncWorkError::QueueFull => SketchContractKitError::queue_full(),
+            AsyncWorkError::WorkerDropped => {
+                SketchContractKitError::worker_failed(error.to_string())
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AsyncWorkError, AsyncWorkPool, WorkOptions, WorkParallelism};
+    use super::{AsyncWorkError, AsyncWorkPool, WorkOptions, WorkerPool};
     use futures_channel::oneshot;
+    use rayon::prelude::*;
     use std::future::Future;
     use std::num::NonZeroUsize;
     use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
@@ -158,9 +302,23 @@ mod tests {
 
         fn fixed(worker_count: usize) -> AsyncWorkPool {
             AsyncWorkPool::new(WorkOptions {
-                parallelism: WorkParallelism::Fixed(
-                    NonZeroUsize::new(worker_count).expect("nonzero worker count"),
-                ),
+                pool: WorkerPool::Dedicated {
+                    worker_threads: NonZeroUsize::new(worker_count).expect("nonzero worker count"),
+                },
+                max_in_flight_operations: NonZeroUsize::new(worker_count)
+                    .expect("nonzero active count"),
+                max_pending_operations: 8,
+            })
+            .expect("pool should build")
+        }
+
+        fn configured(worker_count: usize, active: usize, pending: usize) -> AsyncWorkPool {
+            AsyncWorkPool::new(WorkOptions {
+                pool: WorkerPool::Dedicated {
+                    worker_threads: NonZeroUsize::new(worker_count).expect("nonzero worker count"),
+                },
+                max_in_flight_operations: NonZeroUsize::new(active).expect("nonzero active count"),
+                max_pending_operations: pending,
             })
             .expect("pool should build")
         }
@@ -353,18 +511,24 @@ mod tests {
     }
 
     #[test]
-    fn fixed_parallelism_builds_pool() {
+    fn dedicated_pool_builds_independently_from_operation_budgets() {
         let options = WorkOptions {
-            parallelism: WorkParallelism::Fixed(NonZeroUsize::new(2).expect("nonzero")),
+            pool: WorkerPool::Dedicated {
+                worker_threads: NonZeroUsize::new(2).expect("nonzero"),
+            },
+            max_in_flight_operations: NonZeroUsize::MIN,
+            max_pending_operations: 3,
         };
 
-        AsyncWorkPool::new(options).expect("pool should build");
+        let pool = AsyncWorkPool::new(options).expect("pool should build");
+        assert_eq!(pool.pool.current_num_threads(), 2);
+        assert!(pool.running.try_acquire_arc().is_some());
     }
 
     #[test]
     fn executed_job_returns_value() {
         let pool = AsyncWorkPool::new(WorkOptions::default()).expect("pool");
-        let actual = futures_executor::block_on(pool.execute(|| 42)).expect("work result");
+        let actual = futures_executor::block_on(pool.execute(|_| 42)).expect("work result");
 
         assert_eq!(actual, 42);
     }
@@ -375,16 +539,16 @@ mod tests {
         let polling_thread = thread::current().id();
 
         let worker_thread =
-            futures_executor::block_on(pool.execute(|| thread::current().id())).expect("work");
+            futures_executor::block_on(pool.execute(|_| thread::current().id())).expect("work");
 
         assert_ne!(worker_thread, polling_thread);
     }
 
     #[test]
-    fn fixed_one_bounds_admission() {
-        let pool = WorkTest::fixed(1);
+    fn active_capacity_is_independent_from_pending_capacity() {
+        let pool = WorkTest::configured(2, 1, 1);
         let (first_gate, first_job) = ExecutionGate::new();
-        let mut first = FutureProbe::new(pool.execute(move || {
+        let mut first = FutureProbe::new(pool.execute(move |_| {
             first_job.hold();
             1
         }));
@@ -392,35 +556,57 @@ mod tests {
         assert!(matches!(first.poll_once(), Poll::Pending));
         first_gate.wait_until_started();
         assert!(
-            pool.admission.try_acquire_arc().is_none(),
-            "running root work should hold the only admission permit"
+            pool.running.try_acquire_arc().is_none(),
+            "running root work should hold the only active permit"
         );
 
         let second_started = Arc::new(AtomicBool::new(false));
         let worker_started = Arc::clone(&second_started);
-        let mut second = FutureProbe::new(pool.execute(move || {
+        let mut second = FutureProbe::new(pool.execute(move |_| {
             worker_started.store(true, Ordering::SeqCst);
             2
         }));
 
         assert!(matches!(second.poll_once(), Poll::Pending));
         assert!(!second_started.load(Ordering::SeqCst));
+        assert!(
+            pool.admitted.try_acquire_arc().is_none(),
+            "one active and one pending operation should fill admission"
+        );
 
         first_gate.release();
         assert_eq!(first.complete().expect("first work"), 1);
         assert_eq!(second.complete().expect("second work"), 2);
         assert!(second_started.load(Ordering::SeqCst));
         assert!(
-            pool.admission.try_acquire_arc().is_some(),
+            pool.admitted.try_acquire_arc().is_some(),
             "completed root work should release the admission permit"
         );
+    }
+
+    #[test]
+    fn queue_full_is_returned_immediately_when_active_and_pending_are_full() {
+        let pool = WorkTest::configured(1, 1, 0);
+        let (gate, job) = ExecutionGate::new();
+        let mut running = FutureProbe::new(pool.execute(move |_| {
+            job.hold();
+        }));
+
+        assert!(matches!(running.poll_once(), Poll::Pending));
+        gate.wait_until_started();
+        let error = futures_executor::block_on(pool.execute(|_| ()))
+            .expect_err("a full queue must reject admission");
+        assert!(matches!(error, AsyncWorkError::QueueFull));
+
+        gate.release();
+        running.complete().expect("running operation");
     }
 
     #[test]
     fn dropping_admission_waiter_prevents_submission() {
         let pool = WorkTest::fixed(1);
         let (running_gate, running_job) = ExecutionGate::new();
-        let mut running = FutureProbe::new(pool.execute(move || {
+        let mut running = FutureProbe::new(pool.execute(move |_| {
             running_job.hold();
             1
         }));
@@ -430,7 +616,7 @@ mod tests {
 
         let canceled_started = Arc::new(AtomicBool::new(false));
         let worker_started = Arc::clone(&canceled_started);
-        let mut canceled = FutureProbe::new(pool.execute(move || {
+        let mut canceled = FutureProbe::new(pool.execute(move |_| {
             worker_started.store(true, Ordering::SeqCst);
             2
         }));
@@ -441,7 +627,7 @@ mod tests {
         assert_eq!(running.complete().expect("running work"), 1);
 
         let task_pool = pool.clone();
-        let reusable = OperationThread::start(async move { task_pool.execute(|| 3).await });
+        let reusable = OperationThread::start(async move { task_pool.execute(|_| 3).await });
         assert_eq!(reusable.finish().expect("reusable permit"), 3);
         assert!(!canceled_started.load(Ordering::SeqCst));
     }
@@ -455,7 +641,7 @@ mod tests {
 
         let canceled_started = Arc::new(AtomicBool::new(false));
         let worker_started = Arc::clone(&canceled_started);
-        let mut canceled = FutureProbe::new(pool.execute(move || {
+        let mut canceled = FutureProbe::new(pool.execute(move |_| {
             worker_started.store(true, Ordering::SeqCst);
             2
         }));
@@ -463,7 +649,7 @@ mod tests {
         drop(canceled);
 
         let task_pool = pool.clone();
-        let later = OperationThread::start(async move { task_pool.execute(|| 3).await });
+        let later = OperationThread::start(async move { task_pool.execute(|_| 3).await });
         raw_gate.release();
 
         assert_eq!(later.finish().expect("later operation"), 3);
@@ -475,7 +661,7 @@ mod tests {
         let pool = WorkTest::fixed(1);
         let (running_gate, running_job) = ExecutionGate::new();
         let (finished_sender, finished) = mpsc::sync_channel(1);
-        let mut running = FutureProbe::new(pool.execute(move || {
+        let mut running = FutureProbe::new(pool.execute(move |_| {
             running_job.hold();
             finished_sender.send(()).expect("test should await finish");
             1
@@ -487,7 +673,7 @@ mod tests {
 
         let next_started = Arc::new(AtomicBool::new(false));
         let worker_started = Arc::clone(&next_started);
-        let mut next = FutureProbe::new(pool.execute(move || {
+        let mut next = FutureProbe::new(pool.execute(move |_| {
             worker_started.store(true, Ordering::SeqCst);
             2
         }));
@@ -498,6 +684,69 @@ mod tests {
         WorkTest::receive(&finished, "started job should finish");
         assert_eq!(next.complete().expect("next operation"), 2);
         assert!(next_started.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn dropping_started_future_signals_cooperative_cancellation() {
+        let pool = WorkTest::fixed(1);
+        let (started_sender, started) = mpsc::sync_channel(1);
+        let (cancelled_sender, cancelled) = mpsc::sync_channel(1);
+        let mut operation = FutureProbe::new(pool.execute(move |probe| {
+            started_sender
+                .send(())
+                .expect("test should await operation start");
+            while !probe.is_cancelled() {
+                thread::yield_now();
+            }
+            probe
+                .checkpoint()
+                .expect_err("dropped operation must observe cancellation");
+            cancelled_sender
+                .send(())
+                .expect("test should await cancellation checkpoint");
+        }));
+
+        assert!(matches!(operation.poll_once(), Poll::Pending));
+        WorkTest::receive(&started, "operation should start");
+        drop(operation);
+        WorkTest::receive(&cancelled, "worker should observe cancellation");
+    }
+
+    #[test]
+    fn shared_configuration_reuses_the_application_pool() {
+        let shared = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("shared pool"),
+        );
+        let options = WorkOptions {
+            pool: WorkerPool::Shared {
+                pool: Arc::clone(&shared),
+            },
+            max_in_flight_operations: NonZeroUsize::MIN,
+            max_pending_operations: 0,
+        };
+        let first = AsyncWorkPool::new(options.clone()).expect("first kit pool");
+        let second = AsyncWorkPool::new(options).expect("second kit pool");
+
+        assert!(Arc::ptr_eq(&first.pool, &shared));
+        assert!(Arc::ptr_eq(&second.pool, &shared));
+        assert_eq!(
+            futures_executor::block_on(first.execute(|_| 20)).expect("first work")
+                + futures_executor::block_on(second.execute(|_| 22)).expect("second work"),
+            42
+        );
+    }
+
+    #[test]
+    fn one_worker_allows_nested_rayon_work_without_deadlock() {
+        let pool = WorkTest::configured(1, 1, 0);
+        let sum =
+            futures_executor::block_on(pool.execute(|_| (0_u64..100).into_par_iter().sum::<u64>()))
+                .expect("nested Rayon work");
+
+        assert_eq!(sum, 4_950);
     }
 
     #[test]
@@ -517,7 +766,7 @@ mod tests {
             let task_started = started_sender.clone();
             workers.push(OperationThread::start(async move {
                 task_pool
-                    .execute(move || {
+                    .execute(move |_| {
                         task_active.enter();
                         task_started
                             .send(operation_id)
@@ -563,7 +812,7 @@ mod tests {
         let polling_thread = thread::current().id();
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
-            futures_executor::block_on(pool.execute(|| -> () {
+            futures_executor::block_on(pool.execute(|_| -> () {
                 panic_any(thread::current().id());
             }))
         }))
@@ -575,7 +824,7 @@ mod tests {
         assert_eq!(thread::current().id(), polling_thread);
         assert_ne!(worker_thread, polling_thread);
         assert_eq!(
-            futures_executor::block_on(pool.execute(|| 42)).expect("pool should remain usable"),
+            futures_executor::block_on(pool.execute(|_| 42)).expect("pool should remain usable"),
             42
         );
     }

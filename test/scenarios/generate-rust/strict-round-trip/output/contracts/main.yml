@@ -1,27 +1,31 @@
+contract_version: 2
 root: ../../input/source
 files:
 - nested/extra.rs
 - nested/lib.rs
+extraction:
+  mode: rust_syntax_v2
+  profile: rust_api_v1
+  crates:
+  - id: scenario
+    root: nested/lib.rs
+    kind: library
 signatures:
-- explicit_rust_function:
-    file: nested/extra.rs
-    signature_type: function
-    name: explicit_rust
-    visibility: public
-    abi: Rust
-- extra_function:
-    file: nested/extra.rs
-    signature_type: function
-    name: extra
-    visibility: public
-    return_type: bool
 - answer_function:
+    crate_id: scenario
     file: nested/lib.rs
     signature_type: function
     name: answer
     visibility: public
     return_type: u8
+- extra_module:
+    crate_id: scenario
+    file: nested/lib.rs
+    signature_type: module
+    name: extra
+    visibility: private
 - declarationorder_struct:
+    crate_id: scenario
     file: nested/lib.rs
     signature_type: struct
     name: DeclarationOrder
@@ -36,10 +40,29 @@ signatures:
       middle:
         type: u32
         visibility: public
-    methods:
-    - signature_type: method
-      name: total
-      receiver: ref
-      visibility: public
-      return_type: u32
+    implementations:
+    - items:
+      - signature_type: method
+        name: total
+        receiver: ref
+        visibility: public
+        return_type: u32
+- explicit_rust_function:
+    crate_id: scenario
+    file: nested/extra.rs
+    signature_type: function
+    name: explicit_rust
+    module_path:
+    - extra
+    visibility: public
+    abi: Rust
+- extra_function:
+    crate_id: scenario
+    file: nested/extra.rs
+    signature_type: function
+    name: extra
+    module_path:
+    - extra
+    visibility: public
+    return_type: bool
 sketches: []

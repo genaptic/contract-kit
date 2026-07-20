@@ -14,6 +14,7 @@ Use this reference when choosing test levels, placing tests, or wiring live depe
 - [Use a dedicated e2e crate](#8-use-a-dedicated-workspace-crate-for-e2e)
 - [Make async tests deterministic](#9-make-async-tests-deterministic)
 - [Test enum-dispatch structure](#10-add-structural-tests-for-enum-dispatch-families)
+- [Test Contract Kit resource and cancellation boundaries](#test-contract-kit-resource-and-cancellation-boundaries)
 - [Review testing practices](#11-testing-dos-and-donts)
 - [Further reading](#further-reading)
 - [Read additional examples](#12-additional-merged-examples)
@@ -402,28 +403,49 @@ Wrap network or readiness waits in `tokio::time::timeout(...)` when a stuck test
 
 ## 10. Add structural tests for enum-dispatch families
 
-When a crate uses closed enum dispatch over implementation families such as
-contract parsers, signature matchers, sketch runners, or output emitters, test
-the structure directly:
+Contract Kit centralizes workspace structural and dependency policy in
+`conkit/tests/dependency_policy.rs`. Keep its source-backed dispatch checks
+focused on the two real contracts:
 
-- the implementation-agnostic `pub(crate)` trait exists
-- exported dispatchers use opaque public handles over private inner enums,
-  while crate-private dispatch enums may remain plain private enums
-- the public handle or private dispatcher enum implements that trait with
-  explicit `match` arms
-- every concrete implementation struct implements the trait
-- enum arms use receiver-method calls on trait-implementing payloads, not
-  `Trait::method(receiver, args)` dispatch-contract UFCS
-- public root handle methods may use `<Self as Trait>::method(self, ...)` only
-  to bridge into the handle's own private trait impl
-- concrete impl blocks live in the owning implementation subtree
-- shared contract modules do not name concrete implementation families
-- wildcard or catch-all arms are absent from implementation-family dispatch
-- macro-generated dispatch, `async_trait`, compatibility shims, and stale
-  restoration TODO markers are absent
+- `Command` implements the native async `AppCommand` trait and exhaustively
+  delegates each CLI variant to its concrete command with receiver-style
+  `execute` calls.
+- The private `RustExtractionBackend` trait has the required extraction
+  operations, `RustBackend` exhaustively routes `SyntaxBackend` and
+  `CompilerBackend`, and each concrete impl stays in its owning backend
+  subtree.
 
-These tests complement behavioral tests. They make deletion of the parity
-contract fail immediately instead of relying on reviewer memory.
+Those checks should reject wildcard/catch-all family dispatch,
+dispatch-contract UFCS, macro-generated replacement, misplaced concrete impls,
+and `async_trait` where the native private contract is expected. Do not apply
+the pattern indiscriminately: `SketchContractKit` is a direct concrete owner
+and should not be forced behind a trait or inner enum.
+
+Keep workspace-wide source and manifest policy in this one integration test.
+Do not restore parallel source scanners in `conkit-signature` or
+`conkit-sketch`; domain tests should exercise behavior and public boundaries
+instead of duplicating repository topology policy.
+
+### Test Contract Kit resource and cancellation boundaries
+
+Use focused unit, public-API, and scenario tests to cover:
+
+- nominal signature and sketch limits at catalog input, maintained-YAML
+  parsing, language extraction/matching, diagnostic or evidence accumulation,
+  and rendered output boundaries
+- direct domain revalidation even when the CLI already applied bounded
+  filesystem catalog reads
+- independent active and pending admission, including maximum-active behavior
+  and immediate queue-full rejection
+- dropping admitted queued work before submission, proving its body does not
+  run and admission becomes reusable
+- dropping running work, proving the cooperative cancellation probe is set and
+  observed at a domain checkpoint
+- retaining running permits until the worker finishes and releasing active and
+  admission permits before completion is observable
+
+Coordinate concurrency tests with channels, manual future polling, and bounded
+completion guards rather than sleeps or production test seams.
 
 ## 11. Testing dos and don'ts
 
@@ -432,7 +454,10 @@ contract fail immediately instead of relying on reviewer memory.
 - test behavior at the narrowest useful level
 - keep unit tests local and fast
 - use real dependencies in integration/e2e tests
-- guard enum-dispatch trait contracts with structural tests
+- guard the actual `AppCommand` and `RustExtractionBackend` contracts with the
+  centralized structural policy test
+- test limits, admission, cancellation, and completion ordering at their
+  owning boundaries
 - add doctests for public API examples
 - add binary smoke tests for CLI behavior
 - keep e2e tests at the actual system boundary
@@ -440,7 +465,10 @@ contract fail immediately instead of relying on reviewer memory.
 ### Don't
 
 - mock infrastructure you do not own in integration tests
-- replace enum-dispatch structural tests with macro-generated checks
+- replace structural tests with macro-generated checks
+- duplicate workspace source-policy scanners in domain crates
+- require enum-dispatch topology from direct owners such as
+  `SketchContractKit`
 - use networked resources in unit tests
 - place whole-system tests inside unrelated domain crates
 - rely on arbitrary sleeps for async coordination

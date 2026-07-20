@@ -41,6 +41,19 @@ spawned tasks, cancellation, or graceful shutdown.
    cleanup.
 8. Use native `async fn` in private traits when dynamic dispatch and old MSRV
    support are not required.
+9. In Contract Kit, keep one application-owned Rayon pool shared by the two
+   domain kits while each domain independently bounds active and pending root
+   operations. Worker count is not an admission limit. The CLI configures one
+   active operation and zero pending operations per domain, so saturation is
+   rejected immediately. Dropping queued work releases admission without
+   running it; dropping running work signals cooperative cancellation and
+   retains permits until the worker finishes. Release active and admission
+   permits before waking completion. Keep process cancellation in `conkit`:
+   race command execution at the application boundary and pass the same signal
+   to CLI-owned compiler work.
+10. Keep domain futures executor-neutral and perform the production sync/async
+    bridge once at the `conkit` application boundary. Do not add an internal
+    domain `block_on` or a second runtime boundary.
 
 ## Output Rules
 
@@ -53,6 +66,8 @@ spawned tasks, cancellation, or graceful shutdown.
   blocking work. Do not use it for long-running worker loops or persistent
   sync-engine adapters.
 - Treat `block_on` as valid only at sync entry points, not inside async code.
+- For Contract Kit production code, keep the one `block_on` at the application
+  boundary and none inside either domain crate.
 - Treat `block_in_place` as exceptional, multi-thread-runtime-only, and
   non-cancellable.
 - Do not add `async_trait` for closed private enum-dispatch traits; redesign if

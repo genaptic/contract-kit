@@ -1,5 +1,4 @@
-pub(crate) mod alpha;
-mod gamma;
+mod extra;
 
 pub fn answer() -> u16 {
     43

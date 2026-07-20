@@ -14,7 +14,7 @@ body:
     attributes:
       label: Contract Kit version
       description: Provide the release version or source commit.
-      placeholder: 0.0.1 or commit SHA
+      placeholder: 0.1.0 or commit SHA
     validations:
       required: true
 

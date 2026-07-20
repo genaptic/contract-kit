@@ -2,24 +2,27 @@
 //!
 //! Domain work finishes before this module is entered. Reconciliation then
 //! holds the generation lock while it recovers any interrupted journal,
-//! validates the exact generation baseline, preflights every mutation, and
-//! coordinates individually atomic file replacements with version-3
-//! ownership state.
+//! validates the exact generation baseline, preflights and reserves every
+//! mutation, coordinates individually atomic file replacements, compensates
+//! failed progress, and verifies final version-3 ownership state.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsStr;
-use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::fs::{File, TryLockError};
+use std::io::ErrorKind;
+use std::path::PathBuf;
 
 use conkit_signature::{CatalogPath, FileCatalog};
 
+use super::CatalogReadBudget;
 use super::ownership::{
     ContentDigest, OwnedCatalog, OwnedFile, OwnershipJournal, OwnershipManifest, ReservationMarker,
     VersionProbe,
 };
-use super::path::{PathRole, PortableCatalogPathKey, ResolvedPath};
-use super::store::{ContractsStore, ExistingOutputPolicy, GeneratedContracts, GenerationReceipt};
+use super::path::{CatalogLeaf, PortableCatalogPathKey};
+use super::store::{
+    ContractsStore, ExistingOutputPolicy, FileSnapshot, GeneratedContracts, GenerationReceipt,
+};
+use crate::context::ApplicationCancellation;
 use crate::contracts::ContractDocumentPath;
 use crate::error::CliError;
 
@@ -36,10 +39,9 @@ pub(super) struct GenerationLock {
 
 /// One validated document requested by a completed domain generation.
 struct GeneratedOutput {
-    document: ContractDocumentPath,
-    destination: PathBuf,
+    owned: OwnedFile,
+    file: CatalogLeaf,
     bytes: Vec<u8>,
-    digest: ContentDigest,
 }
 
 /// On-disk bytes expected immediately before one generated write.
@@ -57,21 +59,28 @@ enum OutputMutation {
     },
     Remove {
         owned: OwnedFile,
-        destination: PathBuf,
+        file: CatalogLeaf,
     },
 }
 
 /// Digest-bound reservation cleanup performed during rollback or recovery.
 struct Reservation {
-    destination: PathBuf,
+    file: CatalogLeaf,
     marker: Vec<u8>,
+}
+
+/// Existing generated names indexed by identity derived from their already-
+/// opened file handles.
+struct HostIdentities {
+    values: HashMap<same_file::Handle, PathBuf>,
 }
 
 /// One locked, fully preflighted ownership reconciliation.
 pub(super) struct CatalogReconciliation<'store> {
     store: &'store ContractsStore,
-    root: ResolvedPath,
+    ownership: CatalogLeaf,
     _lock: GenerationLock,
+    budget: CatalogReadBudget,
     generation: u64,
     before: OwnedCatalog,
     after: OwnedCatalog,
@@ -80,29 +89,32 @@ pub(super) struct CatalogReconciliation<'store> {
 }
 
 impl ContractsStore {
-    /// Recovers an interrupted generated-document update before layout parsing.
-    ///
-    /// Missing or committed ownership requires no lock and creates no metadata.
+    /// Recovers interrupted ownership through the caller's operation ledger.
     ///
     /// # Errors
     ///
-    /// Returns an error if the reserved namespace or ownership state is invalid,
-    /// the generation lock cannot be acquired, or recovery and persistence fail.
-    pub(crate) fn recover_interrupted_generation(&self) -> Result<(), CliError> {
-        self.validate_reserved_namespace()?;
-        let needs_recovery = OwnershipDocument::load(self)?.is_updating();
+    /// Returns an error on cancellation, catalog-budget or filesystem failure,
+    /// invalid reserved metadata or ownership state, lock contention, or when
+    /// the interrupted outputs cannot be reconciled with either journal state.
+    pub(crate) fn recover_interrupted_generation_with_budget(
+        &self,
+        budget: &mut CatalogReadBudget,
+    ) -> Result<(), CliError> {
+        budget.checkpoint()?;
+        self.validate_reserved_namespace_with_budget(budget)?;
+        let needs_recovery = OwnershipDocument::load(self, budget)?.is_updating();
         if !needs_recovery {
             return Ok(());
         }
 
-        let root = ResolvedPath::new(PathRole::Contracts, self.path().to_path_buf())?;
-        let _lock = GenerationLock::acquire(self, &root)?;
-        self.remove_abandoned_manifest_temporaries()?;
-        self.validate_reserved_namespace()?;
+        budget.checkpoint()?;
+        let _lock = GenerationLock::acquire(self)?;
+        self.remove_abandoned_manifest_temporaries_with_budget(budget)?;
+        self.validate_reserved_namespace_with_budget(budget)?;
 
-        let ownership = OwnershipDocument::load(self)?;
+        let ownership = OwnershipDocument::load(self, budget)?;
         if ownership.is_updating() {
-            let _ = ownership.recover(self, &root)?;
+            let _ = ownership.recover(self, budget)?;
         }
 
         Ok(())
@@ -110,17 +122,22 @@ impl ContractsStore {
 }
 
 impl OwnershipDocument {
-    fn load(store: &ContractsStore) -> Result<Self, CliError> {
+    fn load(store: &ContractsStore, budget: &mut CatalogReadBudget) -> Result<Self, CliError> {
         let path = OwnershipManifest::path(store.path());
-        let bytes = match fs_err::read(&path) {
-            Ok(bytes) => bytes,
-            Err(source) if source.kind() == ErrorKind::NotFound => return Ok(Self::Missing),
-            Err(source) => return Err(CliError::Io(source)),
+        let Some(file) = store.existing_ownership_leaf()? else {
+            return Ok(Self::Missing);
         };
-        let probe = VersionProbe::from_bytes(&path, &bytes)?;
+        let Some(snapshot) = store.read_leaf(&file, budget)? else {
+            return Ok(Self::Missing);
+        };
+        let probe = VersionProbe::from_bytes(&path, snapshot.bytes(), budget.cancellation())?;
 
         if probe.version() == OwnershipManifest::VERSION {
-            Ok(Self::Current(OwnershipManifest::from_bytes(&path, &bytes)?))
+            Ok(Self::Current(OwnershipManifest::from_bytes(
+                &path,
+                snapshot.bytes(),
+                budget.cancellation(),
+            )?))
         } else {
             Err(CliError::InvalidGeneratedOwnership {
                 path,
@@ -136,7 +153,7 @@ impl OwnershipDocument {
     fn recover(
         self,
         store: &ContractsStore,
-        root: &ResolvedPath,
+        budget: &mut CatalogReadBudget,
     ) -> Result<(u64, OwnedCatalog), CliError> {
         match self {
             Self::Missing => Ok((0, OwnedCatalog::default())),
@@ -146,43 +163,35 @@ impl OwnershipDocument {
                     generation,
                     before,
                     after,
-                } => Self::recover_updating(store, root, generation, before, after),
+                } => Self::recover_updating(store, budget, generation, before, after),
             },
         }
     }
 
     fn recover_updating(
         store: &ContractsStore,
-        root: &ResolvedPath,
+        budget: &mut CatalogReadBudget,
         generation: u64,
         before: OwnedCatalog,
         after: OwnedCatalog,
     ) -> Result<(u64, OwnedCatalog), CliError> {
-        let paths = before
-            .entries()
-            .map(|file| file.path().to_owned())
-            .chain(after.entries().map(|file| file.path().to_owned()))
-            .collect::<BTreeSet<_>>();
+        let mut paths = BTreeSet::new();
+        for file in before.entries().chain(after.entries()) {
+            budget.checkpoint()?;
+            paths.insert(file.path().clone());
+        }
         let mut recovered_files = Vec::new();
         let mut reservations = Vec::new();
 
-        for value in paths {
-            let previous = before.find(&value);
-            let next = after.find(&value);
-            let logical =
-                CatalogPath::new(value).map_err(|source| CliError::InvalidGeneratedOwnership {
-                    path: OwnershipManifest::path(store.path()),
-                    message: source.to_string(),
-                })?;
-            let destination = store.validated_output_path(root, &logical)?;
+        for logical in paths {
+            budget.checkpoint()?;
+            let previous = before.find(&logical);
+            let next = after.find(&logical);
+            let file = store.generated_leaf(&logical)?;
 
-            match fs_err::symlink_metadata(&destination) {
-                Ok(metadata) if !metadata.file_type().is_file() => {
-                    return Err(CliError::GeneratedOutputNotFile { path: destination });
-                }
-                Ok(_) => {
-                    let bytes = fs_err::read(&destination)?;
-                    let digest = ContentDigest::of(&bytes);
+            match store.read_leaf(&file, budget)? {
+                Some(snapshot) => {
+                    let digest = ContentDigest::of(snapshot.bytes(), budget.cancellation())?;
                     if let Some(file) = next
                         && digest == *file.digest()
                     {
@@ -191,37 +200,48 @@ impl OwnershipDocument {
                         && digest == *file.digest()
                     {
                         recovered_files.push(file.clone());
-                    } else if let Some(file) = next
-                        && bytes == ReservationMarker::new(generation, file).to_bytes()?
-                    {
-                        reservations.push(Reservation::new(destination, bytes));
-                        if let Some(file) = previous {
-                            recovered_files.push(file.clone());
+                    } else if let Some(next_file) = next {
+                        let marker = ReservationMarker::new(generation, next_file)
+                            .to_bytes(budget.cancellation())?;
+                        if snapshot.bytes() == marker {
+                            reservations.push(Reservation::new(file, marker));
+                            if let Some(previous_file) = previous {
+                                recovered_files.push(previous_file.clone());
+                            }
+                        } else {
+                            return Err(CliError::GeneratedOwnershipRecoveryConflict {
+                                path: file.display_path().to_path_buf(),
+                            });
                         }
                     } else {
                         return Err(CliError::GeneratedOwnershipRecoveryConflict {
-                            path: destination,
+                            path: file.display_path().to_path_buf(),
                         });
                     }
                 }
-                Err(source) if source.kind() == ErrorKind::NotFound => {
+                None => {
                     if let (Some(_), Some(file)) = (previous, next) {
                         recovered_files.push(file.clone());
                     }
                 }
-                Err(source) => return Err(CliError::Io(source)),
             }
         }
 
         let recovered = OwnedCatalog::from_files(recovered_files);
         let ownership_path = OwnershipManifest::path(store.path());
-        recovered.validate(&ownership_path)?;
+        recovered.validate(&ownership_path, budget.cancellation())?;
         for reservation in reservations {
-            reservation.remove_if_unchanged()?;
+            budget.checkpoint()?;
+            reservation.remove_if_unchanged(store, budget)?;
         }
 
         let committed = OwnershipManifest::committed(generation, recovered.clone());
-        store.atomic_write(root, &ownership_path, &committed.to_bytes(&ownership_path)?)?;
+        let ownership = store.ownership_leaf_for_write()?;
+        store.atomic_write(
+            &ownership,
+            &committed.to_bytes(&ownership_path, budget.cancellation())?,
+            budget.cancellation(),
+        )?;
 
         Ok((generation, recovered))
     }
@@ -231,19 +251,10 @@ impl GenerationLock {
     /// File name recognized by contracts-store namespace validation.
     pub(super) const FILE_NAME: &'static str = "generation.lock";
 
-    fn acquire(store: &ContractsStore, root: &ResolvedPath) -> Result<Self, CliError> {
-        let directory = store.path().join(OwnershipManifest::DIRECTORY);
-        root.ensure_generated_path(&directory)?;
-        fs_err::create_dir_all(&directory)?;
-
-        let path = directory.join(Self::FILE_NAME);
-        root.ensure_generated_path(&path)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+    fn acquire(store: &ContractsStore) -> Result<Self, CliError> {
+        let lock = store.generation_lock_leaf()?;
+        let path = lock.display_path().to_path_buf();
+        let file = lock.open_lock_file()?;
         match file.try_lock() {
             Ok(()) => Ok(Self { _file: file }),
             Err(TryLockError::WouldBlock) => Err(CliError::GenerationInProgress { path }),
@@ -255,15 +266,16 @@ impl GenerationLock {
 impl GeneratedOutput {
     fn collect(
         store: &ContractsStore,
-        root: &ResolvedPath,
         catalog: FileCatalog,
+        budget: &CatalogReadBudget,
     ) -> Result<Vec<Self>, CliError> {
         let manifest = OwnershipManifest::path(store.path());
         let mut keys = BTreeMap::<PortableCatalogPathKey, String>::new();
         let mut outputs = Vec::with_capacity(catalog.len());
 
         for (logical, bytes) in catalog.into_entries() {
-            let document = ContractDocumentPath::try_from(logical.clone()).map_err(|_| {
+            budget.checkpoint()?;
+            ContractDocumentPath::try_from(logical.clone()).map_err(|_| {
                 CliError::InvalidGeneratedOwnership {
                     path: manifest.clone(),
                     message: format!(
@@ -278,11 +290,11 @@ impl GeneratedOutput {
                     second: logical.as_str().to_owned(),
                 });
             }
-            let destination = store.validated_output_path(root, &logical)?;
+            let file = store.generated_leaf(&logical)?;
+            let digest = ContentDigest::of(&bytes, budget.cancellation())?;
             outputs.push(Self {
-                document,
-                destination,
-                digest: ContentDigest::of(&bytes),
+                owned: OwnedFile::new(logical, digest),
+                file,
                 bytes,
             });
         }
@@ -291,51 +303,69 @@ impl GeneratedOutput {
     }
 
     fn logical(&self) -> &CatalogPath {
-        self.document.as_catalog_path()
+        self.owned.path()
     }
 
-    fn owned_file(&self) -> OwnedFile {
-        OwnedFile::new(self.logical().as_str().to_owned(), self.digest.clone())
+    fn digest(&self) -> &ContentDigest {
+        self.owned.digest()
     }
 
-    fn marker(&self, generation: u64) -> Result<Vec<u8>, CliError> {
-        ReservationMarker::new(generation, &self.owned_file()).to_bytes()
+    fn marker(
+        &self,
+        generation: u64,
+        cancellation: &ApplicationCancellation,
+    ) -> Result<Vec<u8>, CliError> {
+        ReservationMarker::new(generation, &self.owned).to_bytes(cancellation)
     }
 
-    fn validate_host_spelling(&self, root: &Path) -> Result<(), CliError> {
-        let mut directory = root.to_path_buf();
-        for component in self.logical().as_str().split('/') {
-            let entries = match fs_err::read_dir(&directory) {
-                Ok(entries) => entries,
-                Err(source) if source.kind() == ErrorKind::NotFound => return Ok(()),
-                Err(source) => return Err(CliError::Io(source)),
+    fn validate_host_spellings(
+        outputs: &[Self],
+        budget: &mut CatalogReadBudget,
+    ) -> Result<(), CliError> {
+        let Some(first) = outputs.first() else {
+            return Ok(());
+        };
+        let mut requested = BTreeMap::<String, String>::new();
+        for output in outputs {
+            budget.checkpoint()?;
+            let logical = output.logical().as_str().to_owned();
+            requested.insert(logical.to_ascii_lowercase(), logical);
+        }
+        let mut conflicts = BTreeMap::<String, std::ffi::OsString>::new();
+        for name in first.file.sorted_sibling_names(budget)? {
+            budget.checkpoint()?;
+            let Some(name_text) = name.to_str() else {
+                continue;
             };
-            let expected = OsStr::new(component);
-            let mut exact = None;
-            for entry in entries {
-                let entry = entry?;
-                let name = entry.file_name();
-                if name.eq_ignore_ascii_case(expected) && name != expected {
-                    return Err(CliError::PortableGeneratedPathCollision {
-                        first: entry.path().display().to_string(),
-                        second: self.logical().as_str().to_owned(),
-                    });
-                }
-                if name == expected {
-                    exact = Some(entry.path());
-                }
+            let key = name_text.to_ascii_lowercase();
+            if requested
+                .get(&key)
+                .is_some_and(|logical| logical != name_text)
+            {
+                conflicts.entry(key).or_insert(name);
             }
-            let Some(path) = exact else {
-                return Ok(());
-            };
-            directory = path;
+        }
+        for output in outputs {
+            budget.checkpoint()?;
+            let key = output.logical().as_str().to_ascii_lowercase();
+            if let Some(name) = conflicts.get(&key) {
+                return Err(CliError::PortableGeneratedPathCollision {
+                    first: output
+                        .file
+                        .display_path()
+                        .with_file_name(name)
+                        .display()
+                        .to_string(),
+                    second: output.logical().as_str().to_owned(),
+                });
+            }
         }
         Ok(())
     }
 }
 
 impl OutputMutation {
-    fn reserve(&mut self, root: &ResolvedPath, generation: u64) -> Result<(), CliError> {
+    fn reserve(&mut self, generation: u64, budget: &CatalogReadBudget) -> Result<(), CliError> {
         let Self::Write { output, expected } = self else {
             return Ok(());
         };
@@ -343,103 +373,71 @@ impl OutputMutation {
             return Ok(());
         }
 
-        root.ensure_generated_path(&output.destination)?;
-        if let Some(parent) = output.destination.parent() {
-            fs_err::create_dir_all(parent)?;
-        }
-        root.ensure_generated_path(&output.destination)?;
-        let marker = output.marker(generation)?;
-        let mut file = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&output.destination)
-        {
-            Ok(file) => file,
-            Err(source) if source.kind() == ErrorKind::AlreadyExists => {
+        let marker = output.marker(generation, budget.cancellation())?;
+        match output.file.write_new_synced(&marker) {
+            Ok(()) => {}
+            Err(CliError::Io(source)) if source.kind() == ErrorKind::AlreadyExists => {
                 return Err(CliError::UnownedGeneratedOutput {
-                    path: output.destination.clone(),
+                    path: output.file.display_path().to_path_buf(),
                 });
             }
-            Err(source) => return Err(CliError::Io(source)),
-        };
+            Err(source) => return Err(source),
+        }
         *expected = DestinationExpectation::Reservation;
-        file.write_all(&marker)?;
-        file.sync_all()?;
         Ok(())
     }
 
     fn apply(
         &self,
         store: &ContractsStore,
-        root: &ResolvedPath,
+        budget: &mut CatalogReadBudget,
         generation: u64,
     ) -> Result<(), CliError> {
+        budget.checkpoint()?;
         match self {
             Self::Write { output, expected } => {
-                output.verify(expected, generation)?;
-                store.atomic_write(root, &output.destination, &output.bytes)
+                output.verify(store, budget, expected, generation)?;
+                store.atomic_write(&output.file, &output.bytes, budget.cancellation())
             }
-            Self::Remove { owned, destination } => {
-                Self::remove_owned(store, root, owned, destination)
-            }
+            Self::Remove { owned, file } => Self::remove_owned(store, budget, owned, file),
         }
     }
 
     fn remove_owned(
         store: &ContractsStore,
-        root: &ResolvedPath,
+        budget: &mut CatalogReadBudget,
         owned: &OwnedFile,
-        destination: &Path,
+        file: &CatalogLeaf,
     ) -> Result<(), CliError> {
-        root.ensure_generated_path(destination)?;
-        match fs_err::symlink_metadata(destination) {
-            Ok(metadata) if !metadata.file_type().is_file() => {
-                return Err(CliError::GeneratedOutputNotFile {
-                    path: destination.to_path_buf(),
-                });
-            }
-            Ok(_) => {
-                if ContentDigest::of(&fs_err::read(destination)?) != *owned.digest() {
-                    return Err(CliError::ModifiedGeneratedOutput {
-                        path: destination.to_path_buf(),
-                    });
-                }
-                fs_err::remove_file(destination)?;
-            }
-            Err(source) if source.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(source) => return Err(CliError::Io(source)),
+        let Some(snapshot) = store.read_leaf(file, budget)? else {
+            return Ok(());
+        };
+        if ContentDigest::of(snapshot.bytes(), budget.cancellation())? != *owned.digest() {
+            return Err(CliError::ModifiedGeneratedOutput {
+                path: file.display_path().to_path_buf(),
+            });
         }
-
-        let mut directory = destination.parent();
-        while let Some(candidate) = directory {
-            if candidate == store.path() || candidate.ends_with(OwnershipManifest::DIRECTORY) {
-                break;
-            }
-            match fs_err::remove_dir(candidate) {
-                Ok(()) => directory = candidate.parent(),
-                Err(source)
-                    if matches!(
-                        source.kind(),
-                        ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
-                    ) =>
-                {
-                    break;
-                }
-                Err(source) => return Err(CliError::Io(source)),
-            }
-        }
-
-        Ok(())
+        drop(snapshot);
+        // Ownership is restricted to direct-root combined documents, so no
+        // generated parent-directory cleanup is necessary. This final
+        // digest-check-plus-remove sequence is capability-relative, though the
+        // filesystem does not provide an atomic unlink-if-same primitive.
+        budget.checkpoint()?;
+        file.remove_file()
     }
 
-    fn reservation(&self, generation: u64) -> Result<Option<Reservation>, CliError> {
+    fn reservation(
+        &self,
+        generation: u64,
+        budget: &CatalogReadBudget,
+    ) -> Result<Option<Reservation>, CliError> {
         match self {
             Self::Write {
                 output,
                 expected: DestinationExpectation::Reservation,
             } => Ok(Some(Reservation::new(
-                output.destination.clone(),
-                output.marker(generation)?,
+                output.file.try_clone()?,
+                output.marker(generation, budget.cancellation())?,
             ))),
             Self::Write { .. } | Self::Remove { .. } => Ok(None),
         }
@@ -447,50 +445,77 @@ impl OutputMutation {
 }
 
 impl GeneratedOutput {
-    fn verify(&self, expected: &DestinationExpectation, generation: u64) -> Result<(), CliError> {
-        let bytes = match fs_err::read(&self.destination) {
-            Ok(bytes) => bytes,
-            Err(source) if source.kind() == ErrorKind::NotFound => {
-                return Err(CliError::GeneratedOwnershipRecoveryConflict {
-                    path: self.destination.clone(),
-                });
-            }
-            Err(source) => return Err(CliError::Io(source)),
+    fn verify(
+        &self,
+        store: &ContractsStore,
+        budget: &mut CatalogReadBudget,
+        expected: &DestinationExpectation,
+        generation: u64,
+    ) -> Result<(), CliError> {
+        let Some(snapshot) = store.read_leaf(&self.file, budget)? else {
+            return Err(CliError::GeneratedOwnershipRecoveryConflict {
+                path: self.file.display_path().to_path_buf(),
+            });
         };
         let matches = match expected {
             DestinationExpectation::Missing => false,
-            DestinationExpectation::Digest(digest) => ContentDigest::of(&bytes) == *digest,
-            DestinationExpectation::Reservation => bytes == self.marker(generation)?,
+            DestinationExpectation::Digest(digest) => {
+                ContentDigest::of(snapshot.bytes(), budget.cancellation())? == *digest
+            }
+            DestinationExpectation::Reservation => {
+                snapshot.bytes() == self.marker(generation, budget.cancellation())?
+            }
         };
         if matches {
             Ok(())
         } else {
             Err(CliError::GeneratedOwnershipRecoveryConflict {
-                path: self.destination.clone(),
+                path: self.file.display_path().to_path_buf(),
             })
         }
     }
 }
 
 impl Reservation {
-    fn new(destination: PathBuf, marker: Vec<u8>) -> Self {
+    fn new(file: CatalogLeaf, marker: Vec<u8>) -> Self {
+        Self { file, marker }
+    }
+
+    fn remove_if_unchanged(
+        self,
+        store: &ContractsStore,
+        budget: &mut CatalogReadBudget,
+    ) -> Result<(), CliError> {
+        match store.read_leaf(&self.file, budget)? {
+            Some(snapshot) if snapshot.bytes() == self.marker => {
+                drop(snapshot);
+                budget.checkpoint()?;
+                self.file.remove_file()?;
+                Ok(())
+            }
+            None => Ok(()),
+            Some(_) => Err(CliError::GeneratedOwnershipRecoveryConflict {
+                path: self.file.display_path().to_path_buf(),
+            }),
+        }
+    }
+}
+
+impl HostIdentities {
+    fn new() -> Self {
         Self {
-            destination,
-            marker,
+            values: HashMap::new(),
         }
     }
 
-    fn remove_if_unchanged(self) -> Result<(), CliError> {
-        match fs_err::read(&self.destination) {
-            Ok(bytes) if bytes == self.marker => {
-                fs_err::remove_file(self.destination)?;
-                Ok(())
-            }
-            Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
-            Ok(_) => Err(CliError::GeneratedOwnershipRecoveryConflict {
-                path: self.destination,
-            }),
-            Err(source) => Err(CliError::Io(source)),
+    fn insert(&mut self, snapshot: FileSnapshot, path: PathBuf) -> Result<(), CliError> {
+        if let Some(first) = self.values.insert(snapshot.into_identity(), path.clone()) {
+            Err(CliError::GeneratedOutputAlias {
+                first,
+                second: path,
+            })
+        } else {
+            Ok(())
         }
     }
 }
@@ -507,46 +532,51 @@ impl<'store> CatalogReconciliation<'store> {
         store: &'store ContractsStore,
         generated: GeneratedContracts,
         policy: ExistingOutputPolicy,
+        mut budget: CatalogReadBudget,
     ) -> Result<Self, CliError> {
+        budget.checkpoint()?;
         let (baseline, catalog) = generated.into_parts();
-        store.validate_reserved_namespace()?;
-        let root = ResolvedPath::new(PathRole::Contracts, store.path().to_path_buf())?;
-        let generation_lock = GenerationLock::acquire(store, &root)?;
-        store.remove_abandoned_manifest_temporaries()?;
-        store.validate_reserved_namespace()?;
+        store.validate_reserved_namespace_with_budget(&mut budget)?;
+        let generation_lock = GenerationLock::acquire(store)?;
+        store.remove_abandoned_manifest_temporaries_with_budget(&mut budget)?;
+        store.validate_reserved_namespace_with_budget(&mut budget)?;
 
         let ownership_path = OwnershipManifest::path(store.path());
         let (previous_generation, before) =
-            OwnershipDocument::load(store)?.recover(store, &root)?;
-        let current = store.read()?;
+            OwnershipDocument::load(store, &mut budget)?.recover(store, &mut budget)?;
+        let current = store.read_with_budget(&mut budget)?;
         if current != baseline {
             return Err(CliError::GenerationInputChanged {
                 path: store.path().to_path_buf(),
             });
         }
 
-        let outputs = GeneratedOutput::collect(store, &root, catalog)?;
-        let after =
-            OwnedCatalog::from_files(outputs.iter().map(GeneratedOutput::owned_file).collect());
-        after.validate(&ownership_path)?;
-        before.validate_transition(&after, &ownership_path)?;
+        let outputs = GeneratedOutput::collect(store, catalog, &budget)?;
+        let mut owned_outputs = Vec::with_capacity(outputs.len());
         for output in &outputs {
-            output.validate_host_spelling(store.path())?;
+            budget.checkpoint()?;
+            owned_outputs.push(output.owned.clone());
         }
+        let after = OwnedCatalog::from_files(owned_outputs);
+        after.validate(&ownership_path, budget.cancellation())?;
+        before.validate_transition(&after, budget.cancellation())?;
+        GeneratedOutput::validate_host_spellings(&outputs, &mut budget)?;
 
         let generation = previous_generation.checked_add(1).ok_or_else(|| {
             CliError::InvalidGeneratedOwnership {
-                path: ownership_path,
+                path: ownership_path.clone(),
                 message: "ownership generation is exhausted".to_owned(),
             }
         })?;
         let (mutations, adopted_count) =
-            Self::preflight(store, &root, &before, &after, outputs, policy)?;
+            Self::preflight(store, &mut budget, &before, &after, outputs, policy)?;
+        let ownership = store.ownership_leaf_for_write()?;
 
         Ok(Self {
             store,
-            root,
+            ownership,
             _lock: generation_lock,
+            budget,
             generation,
             before,
             after,
@@ -557,7 +587,7 @@ impl<'store> CatalogReconciliation<'store> {
 
     fn preflight(
         store: &ContractsStore,
-        root: &ResolvedPath,
+        budget: &mut CatalogReadBudget,
         before: &OwnedCatalog,
         after: &OwnedCatalog,
         outputs: Vec<GeneratedOutput>,
@@ -565,88 +595,58 @@ impl<'store> CatalogReconciliation<'store> {
     ) -> Result<(Vec<OutputMutation>, usize), CliError> {
         let mut mutations = Vec::new();
         let mut adopted_count = 0;
-        let mut existing = Vec::new();
+        let mut identities = HostIdentities::new();
 
         for output in outputs {
-            let previous = before.find(output.logical().as_str());
-            match fs_err::symlink_metadata(&output.destination) {
-                Ok(metadata) if !metadata.file_type().is_file() => {
-                    return Err(CliError::GeneratedOutputNotFile {
-                        path: output.destination,
-                    });
-                }
-                Ok(_) => {
-                    existing.push(output.destination.clone());
-                    let disk_digest = ContentDigest::of(&fs_err::read(&output.destination)?);
+            budget.checkpoint()?;
+            let previous = before.find(output.logical());
+            match store.read_leaf(&output.file, budget)? {
+                Some(snapshot) => {
+                    let path = output.file.display_path().to_path_buf();
+                    let disk_digest = ContentDigest::of(snapshot.bytes(), budget.cancellation())?;
+                    identities.insert(snapshot, path.clone())?;
                     if let Some(previous) = previous {
                         if disk_digest != *previous.digest() {
-                            return Err(CliError::ModifiedGeneratedOutput {
-                                path: output.destination,
-                            });
+                            return Err(CliError::ModifiedGeneratedOutput { path });
                         }
-                        if disk_digest != output.digest {
+                        if disk_digest != *output.digest() {
                             mutations.push(OutputMutation::Write {
                                 output,
                                 expected: DestinationExpectation::Digest(disk_digest),
                             });
                         }
                     } else if policy == ExistingOutputPolicy::AdoptMatching
-                        && disk_digest == output.digest
+                        && disk_digest == *output.digest()
                     {
                         adopted_count += 1;
                     } else {
-                        return Err(CliError::UnownedGeneratedOutput {
-                            path: output.destination,
-                        });
+                        return Err(CliError::UnownedGeneratedOutput { path });
                     }
                 }
-                Err(source) if source.kind() == ErrorKind::NotFound => {
+                None => {
                     mutations.push(OutputMutation::Write {
                         output,
                         expected: DestinationExpectation::Missing,
                     });
                 }
-                Err(source) => return Err(CliError::Io(source)),
             }
         }
 
-        for owned in before
-            .entries()
-            .filter(|owned| after.find(owned.path()).is_none())
-        {
-            let logical = CatalogPath::new(owned.path().to_owned()).map_err(|source| {
-                CliError::InvalidGeneratedOwnership {
-                    path: OwnershipManifest::path(store.path()),
-                    message: source.to_string(),
-                }
-            })?;
-            let destination = store.validated_output_path(root, &logical)?;
-            match fs_err::symlink_metadata(&destination) {
-                Ok(metadata) if !metadata.file_type().is_file() => {
-                    return Err(CliError::GeneratedOutputNotFile { path: destination });
-                }
-                Ok(_) => {
-                    if ContentDigest::of(&fs_err::read(&destination)?) != *owned.digest() {
-                        return Err(CliError::ModifiedGeneratedOutput { path: destination });
-                    }
-                    existing.push(destination.clone());
-                    mutations.push(OutputMutation::Remove {
-                        owned: owned.clone(),
-                        destination,
-                    });
-                }
-                Err(source) if source.kind() == ErrorKind::NotFound => {}
-                Err(source) => return Err(CliError::Io(source)),
+        for owned in before.entries() {
+            budget.checkpoint()?;
+            if after.find(owned.path()).is_some() {
+                continue;
             }
-        }
-
-        let mut identities = HashMap::<same_file::Handle, PathBuf>::new();
-        for path in existing {
-            let identity = same_file::Handle::from_path(&path)?;
-            if let Some(first) = identities.insert(identity, path.clone()) {
-                return Err(CliError::GeneratedOutputAlias {
-                    first,
-                    second: path,
+            let file = store.generated_leaf(owned.path())?;
+            if let Some(snapshot) = store.read_leaf(&file, budget)? {
+                let path = file.display_path().to_path_buf();
+                if ContentDigest::of(snapshot.bytes(), budget.cancellation())? != *owned.digest() {
+                    return Err(CliError::ModifiedGeneratedOutput { path });
+                }
+                identities.insert(snapshot, path)?;
+                mutations.push(OutputMutation::Remove {
+                    owned: owned.clone(),
+                    file,
                 });
             }
         }
@@ -662,17 +662,18 @@ impl<'store> CatalogReconciliation<'store> {
     /// reservation or mutation, post-write verification, or reservation
     /// rollback fails.
     pub(super) fn apply(mut self) -> Result<GenerationReceipt, CliError> {
+        self.budget.checkpoint()?;
         let ownership_path = OwnershipManifest::path(self.store.path());
         let updating =
             OwnershipManifest::updating(self.generation, self.before.clone(), self.after.clone());
         self.store.atomic_write(
-            &self.root,
-            &ownership_path,
-            &updating.to_bytes(&ownership_path)?,
+            &self.ownership,
+            &updating.to_bytes(&ownership_path, self.budget.cancellation())?,
+            self.budget.cancellation(),
         )?;
 
         if let Err(source) = self.reserve_outputs() {
-            return match self.rollback_reservations(&ownership_path) {
+            return match self.rollback_reservations() {
                 Ok(()) => Err(source),
                 Err(rollback) => Err(CliError::GeneratedOwnershipRollback {
                     path: ownership_path,
@@ -682,15 +683,15 @@ impl<'store> CatalogReconciliation<'store> {
         }
 
         for mutation in &self.mutations {
-            mutation.apply(self.store, &self.root, self.generation)?;
+            mutation.apply(self.store, &mut self.budget, self.generation)?;
         }
         self.verify_after_outputs()?;
 
         let committed = OwnershipManifest::committed(self.generation, self.after);
         self.store.atomic_write(
-            &self.root,
-            &ownership_path,
-            &committed.to_bytes(&ownership_path)?,
+            &self.ownership,
+            &committed.to_bytes(&ownership_path, self.budget.cancellation())?,
+            self.budget.cancellation(),
         )?;
 
         Ok(GenerationReceipt::new(self.adopted_count))
@@ -698,47 +699,45 @@ impl<'store> CatalogReconciliation<'store> {
 
     fn reserve_outputs(&mut self) -> Result<(), CliError> {
         for mutation in &mut self.mutations {
-            mutation.reserve(&self.root, self.generation)?;
+            self.budget.checkpoint()?;
+            mutation.reserve(self.generation, &self.budget)?;
         }
         Ok(())
     }
 
-    fn rollback_reservations(&self, ownership_path: &Path) -> Result<(), CliError> {
+    fn rollback_reservations(&mut self) -> Result<(), CliError> {
+        // Cleanup has its own bounded ledger and neutral cancellation source:
+        // an exhausted or canceled forward operation must not strand markers.
+        let cleanup_cancellation = ApplicationCancellation::new();
+        let mut cleanup_budget = self.store.begin_reconciliation_read(&cleanup_cancellation);
         for mutation in &self.mutations {
-            if let Some(reservation) = mutation.reservation(self.generation)? {
-                reservation.remove_if_unchanged()?;
+            if let Some(reservation) = mutation.reservation(self.generation, &cleanup_budget)? {
+                reservation.remove_if_unchanged(self.store, &mut cleanup_budget)?;
             }
         }
 
+        let ownership_path = OwnershipManifest::path(self.store.path());
         let restored = OwnershipManifest::committed(self.generation, self.before.clone());
         self.store.atomic_write(
-            &self.root,
-            ownership_path,
-            &restored.to_bytes(ownership_path)?,
+            &self.ownership,
+            &restored.to_bytes(&ownership_path, &cleanup_cancellation)?,
+            &cleanup_cancellation,
         )
     }
 
-    fn verify_after_outputs(&self) -> Result<(), CliError> {
+    fn verify_after_outputs(&mut self) -> Result<(), CliError> {
         for owned in self.after.entries() {
-            let logical = CatalogPath::new(owned.path().to_owned()).map_err(|source| {
-                CliError::InvalidGeneratedOwnership {
-                    path: OwnershipManifest::path(self.store.path()),
-                    message: source.to_string(),
-                }
-            })?;
-            let destination = self.store.validated_output_path(&self.root, &logical)?;
-            match fs_err::symlink_metadata(&destination) {
-                Ok(metadata) if !metadata.file_type().is_file() => {
-                    return Err(CliError::GeneratedOutputNotFile { path: destination });
-                }
-                Ok(_) if ContentDigest::of(&fs_err::read(&destination)?) != *owned.digest() => {
-                    return Err(CliError::GeneratedOwnershipRecoveryConflict { path: destination });
-                }
-                Ok(_) => {}
-                Err(source) if source.kind() == ErrorKind::NotFound => {
-                    return Err(CliError::GeneratedOwnershipRecoveryConflict { path: destination });
-                }
-                Err(source) => return Err(CliError::Io(source)),
+            self.budget.checkpoint()?;
+            let file = self.store.generated_leaf(owned.path())?;
+            let Some(snapshot) = self.store.read_leaf(&file, &mut self.budget)? else {
+                return Err(CliError::GeneratedOwnershipRecoveryConflict {
+                    path: file.display_path().to_path_buf(),
+                });
+            };
+            if ContentDigest::of(snapshot.bytes(), self.budget.cancellation())? != *owned.digest() {
+                return Err(CliError::GeneratedOwnershipRecoveryConflict {
+                    path: file.display_path().to_path_buf(),
+                });
             }
         }
         Ok(())
@@ -757,29 +756,42 @@ mod tests {
         ReservationMarker,
     };
     use crate::catalog::{
-        ContractsStore, ExistingOutputPolicy, GeneratedContracts, PathRole, ResolvedPath,
+        CatalogReadBudget, CatalogReadLimitResource, CatalogReadLimits, ContractsStore,
+        ExistingOutputPolicy, GeneratedContracts, GenerationReceipt,
     };
     use crate::error::CliError;
 
     struct ReconciliationFixture {
-        _temp: TempDir,
-        contracts: ChildPath,
         store: ContractsStore,
+        contracts: ChildPath,
+        _temp: TempDir,
     }
 
     impl ReconciliationFixture {
+        fn cancellation() -> crate::context::ApplicationCancellation {
+            crate::context::ApplicationCancellation::new()
+        }
+
+        fn digest(bytes: &[u8]) -> ContentDigest {
+            ContentDigest::of(bytes, &Self::cancellation()).expect("content digest")
+        }
+
         fn new() -> Self {
             let temp = TempDir::new().expect("temporary root");
             let contracts = temp.child("contracts");
             let store = ContractsStore::new(contracts.path().to_path_buf());
             Self {
-                _temp: temp,
-                contracts,
                 store,
+                contracts,
+                _temp: temp,
             }
         }
 
-        fn generation(&self, entries: &[(&str, &[u8])]) -> GeneratedContracts {
+        fn budget(&self) -> CatalogReadBudget {
+            self.store.begin_reconciliation_read(&Self::cancellation())
+        }
+
+        fn generation(&self, entries: &[(&str, &[u8])]) -> (GeneratedContracts, CatalogReadBudget) {
             let mut files = FileCatalog::new();
             for (path, bytes) in entries {
                 files
@@ -789,8 +801,28 @@ mod tests {
                     )
                     .expect("unique generated path");
             }
-            let baseline = self.store.read_optional().expect("generation baseline");
-            GeneratedContracts::new(baseline, files)
+            let mut budget = self.budget();
+            let baseline = self
+                .store
+                .read_optional_with_budget(&mut budget)
+                .expect("generation baseline");
+            (GeneratedContracts::new(baseline, files), budget)
+        }
+
+        fn apply_generation(
+            &self,
+            entries: &[(&str, &[u8])],
+            policy: ExistingOutputPolicy,
+        ) -> Result<GenerationReceipt, CliError> {
+            let (generated, budget) = self.generation(entries);
+            self.store
+                .write_generated_with_budget(generated, policy, budget)
+        }
+
+        fn recover(&self) -> Result<(), CliError> {
+            let mut budget = self.budget();
+            self.store
+                .recover_interrupted_generation_with_budget(&mut budget)
         }
 
         fn committed_catalog(&self) -> (u64, OwnedCatalog) {
@@ -798,6 +830,7 @@ mod tests {
             let manifest = OwnershipManifest::from_bytes(
                 &path,
                 &fs_err::read(&path).expect("ownership bytes"),
+                &Self::cancellation(),
             )
             .expect("ownership manifest");
             match manifest.into_journal() {
@@ -812,7 +845,9 @@ mod tests {
                 .expect("metadata directory");
             fs_err::write(
                 &path,
-                manifest.to_bytes(&path).expect("manifest serialization"),
+                manifest
+                    .to_bytes(&path, &Self::cancellation())
+                    .expect("manifest serialization"),
             )
             .expect("write ownership manifest");
         }
@@ -839,13 +874,66 @@ mod tests {
     }
 
     #[test]
+    fn canceled_reconciliation_does_not_create_outputs_or_ownership() {
+        let fixture = ReconciliationFixture::new();
+        let cancellation = crate::context::ApplicationCancellation::new();
+        cancellation.request();
+        let budget = CatalogReadLimits::default().begin(&cancellation);
+
+        let (generated, _) = fixture.generation(&[("main.yml", b"generated\n")]);
+        let error = fixture
+            .store
+            .write_generated_with_budget(generated, ExistingOutputPolicy::Reject, budget)
+            .expect_err("pre-canceled reconciliation must stop before mutation");
+
+        assert!(matches!(error, CliError::OperationCanceled));
+        fixture
+            .contracts
+            .child("main.yml")
+            .assert(predicates::path::missing());
+        assert!(!OwnershipManifest::path(fixture.store.path()).exists());
+    }
+
+    #[test]
+    fn rollback_uses_neutral_cancellation_after_forward_operation_is_canceled() {
+        let fixture = ReconciliationFixture::new();
+        let (generated, budget) = fixture.generation(&[("main.yml", b"generated\n")]);
+        let mut reconciliation = CatalogReconciliation::new(
+            &fixture.store,
+            generated,
+            ExistingOutputPolicy::Reject,
+            budget,
+        )
+        .expect("preflight reconciliation");
+        reconciliation
+            .reserve_outputs()
+            .expect("reserve missing output");
+        fixture
+            .contracts
+            .child("main.yml")
+            .assert(predicates::path::exists());
+
+        reconciliation.budget.cancellation().request();
+        reconciliation
+            .rollback_reservations()
+            .expect("neutral rollback ignores forward cancellation");
+
+        fixture
+            .contracts
+            .child("main.yml")
+            .assert(predicates::path::missing());
+        let (generation, files) = fixture.committed_catalog();
+        assert_eq!(generation, 1);
+        assert_eq!(files.entries().count(), 0);
+    }
+
+    #[test]
     fn generated_catalog_accepts_direct_mixed_case_yaml_documents() {
         let fixture = ReconciliationFixture::new();
 
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("first.YML", b"first\n"), ("second.YaMl", b"second\n")]),
+            .apply_generation(
+                &[("first.YML", b"first\n"), ("second.YaMl", b"second\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect("direct mixed-case YAML documents");
@@ -860,7 +948,11 @@ mod tests {
             .assert(b"second\n" as &[u8]);
         let (_, owned) = fixture.committed_catalog();
         assert_eq!(
-            owned.entries().map(OwnedFile::path).collect::<Vec<_>>(),
+            owned
+                .entries()
+                .map(OwnedFile::path)
+                .map(CatalogPath::as_str)
+                .collect::<Vec<_>>(),
             ["first.YML", "second.YaMl"],
         );
     }
@@ -870,9 +962,8 @@ mod tests {
         let fixture = ReconciliationFixture::new();
 
         let error = fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("manual.txt", b"generated\n")]),
+            .apply_generation(
+                &[("manual.txt", b"generated\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect_err("non-YAML generated path must fail");
@@ -898,9 +989,8 @@ mod tests {
         let fixture = ReconciliationFixture::new();
 
         let error = fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("Lib.yaml", b"first\n"), ("lib.yaml", b"second\n")]),
+            .apply_generation(
+                &[("Lib.yaml", b"first\n"), ("lib.yaml", b"second\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect_err("case-equivalent generated paths must fail");
@@ -929,11 +1019,7 @@ mod tests {
         let fixture = ReconciliationFixture::new();
 
         let error = fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("CON.yml", b"generated\n")]),
-                ExistingOutputPolicy::Reject,
-            )
+            .apply_generation(&[("CON.yml", b"generated\n")], ExistingOutputPolicy::Reject)
             .expect_err("nonportable generated component must fail");
 
         assert!(error.to_string().contains("Windows reserved device name"));
@@ -951,8 +1037,7 @@ mod tests {
     fn recovery_probe_does_not_create_metadata_for_missing_or_committed_ownership() {
         let missing = ReconciliationFixture::new();
         missing
-            .store
-            .recover_interrupted_generation()
+            .recover()
             .expect("missing ownership needs no recovery");
         missing
             .contracts
@@ -965,8 +1050,7 @@ mod tests {
         let before = fs_err::read(&ownership_path).expect("committed ownership bytes");
 
         committed
-            .store
-            .recover_interrupted_generation()
+            .recover()
             .expect("committed ownership needs no recovery");
 
         assert_eq!(
@@ -1000,9 +1084,8 @@ mod tests {
                 .expect("existing output");
 
             let error = fixture
-                .store
-                .write_generated(
-                    fixture.generation(&[("main.yml", b"generated\n")]),
+                .apply_generation(
+                    &[("main.yml", b"generated\n")],
                     ExistingOutputPolicy::AdoptMatching,
                 )
                 .expect_err("obsolete ownership must not be migrated");
@@ -1030,9 +1113,8 @@ mod tests {
             .expect("manual host entry");
 
         let error = fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("manual.yaml", b"generated\n")]),
+            .apply_generation(
+                &[("manual.yaml", b"generated\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect_err("portable host spelling collision must fail");
@@ -1056,11 +1138,7 @@ mod tests {
     fn temporal_ascii_case_change_is_rejected_without_mutation() {
         let fixture = ReconciliationFixture::new();
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("Lib.yaml", b"old\n")]),
-                ExistingOutputPolicy::Reject,
-            )
+            .apply_generation(&[("Lib.yaml", b"old\n")], ExistingOutputPolicy::Reject)
             .expect("initial generation");
         let ownership = fixture
             .contracts
@@ -1068,11 +1146,7 @@ mod tests {
         let ownership_before = fs_err::read(ownership.path()).expect("ownership bytes");
 
         let error = fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("lib.yaml", b"new\n")]),
-                ExistingOutputPolicy::Reject,
-            )
+            .apply_generation(&[("lib.yaml", b"new\n")], ExistingOutputPolicy::Reject)
             .expect_err("case-only transition must fail");
 
         fixture
@@ -1090,9 +1164,8 @@ mod tests {
     fn modified_current_and_stale_outputs_fail_before_current_writes() {
         let fixture = ReconciliationFixture::new();
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"old\n"), ("stale.yaml", b"stale\n")]),
+            .apply_generation(
+                &[("current.yaml", b"old\n"), ("stale.yaml", b"stale\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect("initial generation");
@@ -1107,11 +1180,7 @@ mod tests {
             .expect("modify stale output");
 
         let error = fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"new\n")]),
-                ExistingOutputPolicy::Reject,
-            )
+            .apply_generation(&[("current.yaml", b"new\n")], ExistingOutputPolicy::Reject)
             .expect_err("modified stale output must fail preflight");
         assert!(error.to_string().contains("modified outside"));
         fixture
@@ -1138,11 +1207,7 @@ mod tests {
             .write_binary(b"manual current\n")
             .expect("modify current output");
         let error = fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"new\n")]),
-                ExistingOutputPolicy::Reject,
-            )
+            .apply_generation(&[("current.yaml", b"new\n")], ExistingOutputPolicy::Reject)
             .expect_err("modified current output must fail preflight");
         assert!(error.to_string().contains("modified outside"));
         fixture
@@ -1163,9 +1228,8 @@ mod tests {
     fn stale_directory_fails_preflight_before_current_write() {
         let fixture = ReconciliationFixture::new();
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"old\n"), ("stale.yaml", b"stale\n")]),
+            .apply_generation(
+                &[("current.yaml", b"old\n"), ("stale.yaml", b"stale\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect("initial generation");
@@ -1182,11 +1246,7 @@ mod tests {
             .expect("stale directory");
 
         let error = fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"new\n")]),
-                ExistingOutputPolicy::Reject,
-            )
+            .apply_generation(&[("current.yaml", b"new\n")], ExistingOutputPolicy::Reject)
             .expect_err("stale directory must fail preflight");
         assert!(error.to_string().contains("not a file"));
         fixture
@@ -1207,9 +1267,8 @@ mod tests {
     fn missing_stale_output_is_dropped_while_current_output_commits() {
         let fixture = ReconciliationFixture::new();
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"old\n"), ("stale.yaml", b"stale\n")]),
+            .apply_generation(
+                &[("current.yaml", b"old\n"), ("stale.yaml", b"stale\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect("initial generation");
@@ -1217,11 +1276,7 @@ mod tests {
             .expect("remove stale output");
 
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"new\n")]),
-                ExistingOutputPolicy::Reject,
-            )
+            .apply_generation(&[("current.yaml", b"new\n")], ExistingOutputPolicy::Reject)
             .expect("missing stale output does not block reconciliation");
 
         fixture
@@ -1234,7 +1289,11 @@ mod tests {
             .assert(predicates::path::missing());
         let (_, owned) = fixture.committed_catalog();
         assert_eq!(
-            owned.entries().map(OwnedFile::path).collect::<Vec<_>>(),
+            owned
+                .entries()
+                .map(OwnedFile::path)
+                .map(CatalogPath::as_str)
+                .collect::<Vec<_>>(),
             ["current.yaml"],
         );
     }
@@ -1247,9 +1306,8 @@ mod tests {
 
         let fixture = ReconciliationFixture::new();
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"old\n"), ("stale.yaml", b"stale\n")]),
+            .apply_generation(
+                &[("current.yaml", b"old\n"), ("stale.yaml", b"stale\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect("initial generation");
@@ -1263,11 +1321,7 @@ mod tests {
             .expect("bind stale socket");
 
         let error = fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"new\n")]),
-                ExistingOutputPolicy::Reject,
-            )
+            .apply_generation(&[("current.yaml", b"new\n")], ExistingOutputPolicy::Reject)
             .expect_err("stale socket must fail preflight");
         assert!(error.to_string().contains("not a file"));
         fixture
@@ -1291,9 +1345,8 @@ mod tests {
     fn interrupted_update_recovers_partial_writes_reservation_and_stale_deletion() {
         let fixture = ReconciliationFixture::new();
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"old\n"), ("stale.yaml", b"stale\n")]),
+            .apply_generation(
+                &[("current.yaml", b"old\n"), ("stale.yaml", b"stale\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect("initial generation");
@@ -1301,10 +1354,13 @@ mod tests {
         let generation = previous_generation + 1;
         let after = OwnedCatalog::from_files(vec![
             OwnedFile::new(
-                "current.yaml".to_owned(),
-                ContentDigest::of(b"partially written\n"),
+                CatalogPath::new("current.yaml").expect("current owned path"),
+                ReconciliationFixture::digest(b"partially written\n"),
             ),
-            OwnedFile::new("new.yaml".to_owned(), ContentDigest::of(b"planned new\n")),
+            OwnedFile::new(
+                CatalogPath::new("new.yaml").expect("new owned path"),
+                ReconciliationFixture::digest(b"planned new\n"),
+            ),
         ]);
         fixture.write_manifest(&OwnershipManifest::updating(
             generation,
@@ -1318,12 +1374,12 @@ mod tests {
             .expect("partial current write");
         fs_err::remove_file(fixture.contracts.child("stale.yaml").path())
             .expect("completed stale deletion");
-        let marker = ReservationMarker::new(
-            generation,
-            after.find("new.yaml").expect("planned new ownership"),
-        )
-        .to_bytes()
-        .expect("reservation marker");
+        let planned = after
+            .find(&CatalogPath::new("new.yaml").expect("new owned path"))
+            .expect("planned new ownership");
+        let marker = ReservationMarker::new(generation, planned)
+            .to_bytes(&ReconciliationFixture::cancellation())
+            .expect("reservation marker");
         fixture
             .contracts
             .child("new.yaml")
@@ -1331,24 +1387,22 @@ mod tests {
             .expect("reserved destination");
 
         let error = fixture
-            .store
-            .write_generated(
-                fixture.generation(&[
+            .apply_generation(
+                &[
                     ("current.yaml", b"latest source\n"),
                     ("new.yaml", b"planned new\n"),
-                ]),
+                ],
                 ExistingOutputPolicy::Reject,
             )
             .expect_err("recovery must invalidate the partial catalog snapshot");
         assert!(error.to_string().contains("contracts changed"));
 
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[
+            .apply_generation(
+                &[
                     ("current.yaml", b"latest source\n"),
                     ("new.yaml", b"planned new\n"),
-                ]),
+                ],
                 ExistingOutputPolicy::Reject,
             )
             .expect("generation retries from the recovered catalog");
@@ -1374,18 +1428,14 @@ mod tests {
     fn interrupted_new_output_with_external_bytes_stays_unowned() {
         let fixture = ReconciliationFixture::new();
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"old\n")]),
-                ExistingOutputPolicy::Reject,
-            )
+            .apply_generation(&[("current.yaml", b"old\n")], ExistingOutputPolicy::Reject)
             .expect("initial generation");
         let (previous_generation, before) = fixture.committed_catalog();
         let generation = previous_generation + 1;
         let mut after_files = before.entries().cloned().collect::<Vec<_>>();
         after_files.push(OwnedFile::new(
-            "new.yaml".to_owned(),
-            ContentDigest::of(b"planned\n"),
+            CatalogPath::new("new.yaml").expect("new owned path"),
+            ReconciliationFixture::digest(b"planned\n"),
         ));
         fixture.write_manifest(&OwnershipManifest::updating(
             generation,
@@ -1403,9 +1453,8 @@ mod tests {
         let ownership_before = fs_err::read(ownership.path()).expect("updating manifest");
 
         let error = fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"old\n"), ("new.yaml", b"planned\n")]),
+            .apply_generation(
+                &[("current.yaml", b"old\n"), ("new.yaml", b"planned\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect_err("unexpected external bytes must stop recovery");
@@ -1424,14 +1473,11 @@ mod tests {
     #[test]
     fn concurrent_writer_lock_fails_fast() {
         let fixture = ReconciliationFixture::new();
-        let root = ResolvedPath::new(PathRole::Contracts, fixture.contracts.path().to_path_buf())
-            .expect("resolved contracts root");
-        let _lock = GenerationLock::acquire(&fixture.store, &root).expect("first writer lock");
+        let _lock = GenerationLock::acquire(&fixture.store).expect("first writer lock");
 
         let error = fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"generated\n")]),
+            .apply_generation(
+                &[("current.yaml", b"generated\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect_err("second writer must fail fast");
@@ -1447,22 +1493,200 @@ mod tests {
             .assert(predicates::path::missing());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn preflighted_reconciliation_stays_on_the_anchored_root_after_path_replacement() {
+        let fixture = ReconciliationFixture::new();
+        fixture
+            .apply_generation(&[("main.yml", b"before\n")], ExistingOutputPolicy::Reject)
+            .expect("initial generation");
+        let (generated, budget) =
+            fixture.generation(&[("main.yml", b"after\n"), ("new.yml", b"new\n")]);
+        let reconciliation = CatalogReconciliation::new(
+            &fixture.store,
+            generated,
+            ExistingOutputPolicy::Reject,
+            budget,
+        )
+        .expect("anchored reconciliation");
+        let anchored = fixture._temp.child("anchored contracts");
+
+        std::fs::rename(fixture.contracts.path(), anchored.path())
+            .expect("move the anchored contracts root");
+        fixture
+            .contracts
+            .create_dir_all()
+            .expect("replacement contracts root");
+        fixture
+            .contracts
+            .child("main.yml")
+            .write_binary(b"replacement\n")
+            .expect("replacement document");
+
+        reconciliation
+            .apply()
+            .expect("reconciliation must stay capability-relative");
+
+        anchored.child("main.yml").assert(b"after\n" as &[u8]);
+        anchored.child("new.yml").assert(b"new\n" as &[u8]);
+        anchored
+            .child(".contract-kit/generated-files.json")
+            .assert(predicates::path::exists());
+        fixture
+            .contracts
+            .child("main.yml")
+            .assert(b"replacement\n" as &[u8]);
+        fixture
+            .contracts
+            .child("new.yml")
+            .assert(predicates::path::missing());
+        fixture
+            .contracts
+            .child(".contract-kit")
+            .assert(predicates::path::missing());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflighted_reconciliation_ignores_a_selected_root_symlink_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temporary root");
+        let original = temp.child("original contracts");
+        let replacement = temp.child("replacement contracts");
+        let selected = temp.child("selected contracts");
+        original.create_dir_all().expect("original contracts root");
+        replacement
+            .create_dir_all()
+            .expect("replacement contracts root");
+        symlink(original.path(), selected.path()).expect("selected root symlink");
+        let store = ContractsStore::new(selected.path().to_path_buf());
+
+        let mut initial_documents = FileCatalog::new();
+        initial_documents
+            .insert(
+                CatalogPath::new("main.yml").expect("initial logical path"),
+                b"before\n".to_vec(),
+            )
+            .expect("initial document");
+        let cancellation = crate::context::ApplicationCancellation::new();
+        let mut initial_budget = store.begin_reconciliation_read(&cancellation);
+        let initial = GeneratedContracts::new(
+            store
+                .read_optional_with_budget(&mut initial_budget)
+                .expect("initial baseline"),
+            initial_documents,
+        );
+        store
+            .write_generated_with_budget(initial, ExistingOutputPolicy::Reject, initial_budget)
+            .expect("initial generation");
+        let mut next_documents = FileCatalog::new();
+        next_documents
+            .insert(
+                CatalogPath::new("main.yml").expect("updated logical path"),
+                b"after\n".to_vec(),
+            )
+            .expect("updated document");
+        next_documents
+            .insert(
+                CatalogPath::new("new.yml").expect("new logical path"),
+                b"new\n".to_vec(),
+            )
+            .expect("new document");
+        let mut next_budget = store.begin_reconciliation_read(&cancellation);
+        let baseline = store
+            .read_with_budget(&mut next_budget)
+            .expect("updated baseline");
+        let reconciliation = CatalogReconciliation::new(
+            &store,
+            GeneratedContracts::new(baseline, next_documents),
+            ExistingOutputPolicy::Reject,
+            next_budget,
+        )
+        .expect("anchored reconciliation");
+
+        std::fs::remove_file(selected.path()).expect("remove selected root symlink");
+        symlink(replacement.path(), selected.path()).expect("retarget selected root symlink");
+        replacement
+            .child("main.yml")
+            .write_binary(b"replacement\n")
+            .expect("replacement document");
+
+        reconciliation
+            .apply()
+            .expect("reconciliation must ignore symlink retargeting");
+
+        original.child("main.yml").assert(b"after\n" as &[u8]);
+        original.child("new.yml").assert(b"new\n" as &[u8]);
+        replacement
+            .child("main.yml")
+            .assert(b"replacement\n" as &[u8]);
+        replacement
+            .child("new.yml")
+            .assert(predicates::path::missing());
+        replacement
+            .child(".contract-kit")
+            .assert(predicates::path::missing());
+    }
+
+    #[test]
+    fn ownership_reads_accept_the_exact_limit_and_reject_one_more_byte() {
+        let exact = ReconciliationFixture::new();
+        let manifest = OwnershipManifest::committed(1, OwnedCatalog::default());
+        let path = OwnershipManifest::path(exact.store.path());
+        let bytes = manifest
+            .to_bytes(&path, &ReconciliationFixture::cancellation())
+            .expect("ownership bytes");
+        exact.write_manifest(&manifest);
+        let byte_limit = u64::try_from(bytes.len()).expect("ownership length fits u64");
+        let exact_store = ContractsStore::new(exact.contracts.path().to_path_buf())
+            .with_limits(CatalogReadLimits::new(1, byte_limit, byte_limit));
+        let cancellation = crate::context::ApplicationCancellation::new();
+        let mut budget = exact_store.begin_reconciliation_read(&cancellation);
+        exact_store
+            .recover_interrupted_generation_with_budget(&mut budget)
+            .expect("exact-size ownership manifest");
+
+        let excessive = ReconciliationFixture::new();
+        excessive.write_manifest(&manifest);
+        let excessive_store = ContractsStore::new(excessive.contracts.path().to_path_buf())
+            .with_limits(CatalogReadLimits::new(
+                1,
+                byte_limit.saturating_sub(1),
+                byte_limit.saturating_sub(1),
+            ));
+        let mut budget = excessive_store.begin_reconciliation_read(&cancellation);
+        let error = excessive_store
+            .recover_interrupted_generation_with_budget(&mut budget)
+            .expect_err("one byte beyond the ownership limit must fail");
+        let CliError::CatalogReadLimit(error) = error else {
+            panic!("expected typed file-byte limit")
+        };
+        assert_eq!(error.resource, CatalogReadLimitResource::FileBytes);
+        assert_eq!(error.limit, byte_limit - 1);
+        assert_eq!(error.observed_at_least, byte_limit);
+        assert_eq!(
+            error.path,
+            excessive
+                .contracts
+                .child(".contract-kit/generated-files.json")
+                .path()
+        );
+    }
+
     #[test]
     fn stale_generation_cannot_overwrite_newer_combined_document() {
         let fixture = ReconciliationFixture::new();
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("main.yml", b"initial\n")]),
-                ExistingOutputPolicy::Reject,
-            )
+            .apply_generation(&[("main.yml", b"initial\n")], ExistingOutputPolicy::Reject)
             .expect("initial generation");
 
-        let stale = fixture.generation(&[("main.yml", b"stale signature update\n")]);
-        let newer = fixture.generation(&[("main.yml", b"newer sketch update\n")]);
+        let (stale, stale_budget) =
+            fixture.generation(&[("main.yml", b"stale signature update\n")]);
+        let (newer, newer_budget) = fixture.generation(&[("main.yml", b"newer sketch update\n")]);
         fixture
             .store
-            .write_generated(newer, ExistingOutputPolicy::Reject)
+            .write_generated_with_budget(newer, ExistingOutputPolicy::Reject, newer_budget)
             .expect("newer generation");
         let ownership = fixture
             .contracts
@@ -1471,7 +1695,7 @@ mod tests {
 
         let error = fixture
             .store
-            .write_generated(stale, ExistingOutputPolicy::Reject)
+            .write_generated_with_budget(stale, ExistingOutputPolicy::Reject, stale_budget)
             .expect_err("stale generation must not overwrite newer bytes");
 
         assert!(error.to_string().contains("contracts changed"));
@@ -1489,18 +1713,15 @@ mod tests {
     fn stale_generation_is_rejected_before_requested_output_preflight() {
         let fixture = ReconciliationFixture::new();
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("main.yml", b"initial\n")]),
-                ExistingOutputPolicy::Reject,
-            )
+            .apply_generation(&[("main.yml", b"initial\n")], ExistingOutputPolicy::Reject)
             .expect("initial generation");
 
-        let stale = fixture.generation(&[(".contract-kit/blocked.yml", b"must not be written\n")]);
-        let newer = fixture.generation(&[("main.yml", b"newer sketch update\n")]);
+        let (stale, stale_budget) =
+            fixture.generation(&[(".contract-kit/blocked.yml", b"must not be written\n")]);
+        let (newer, newer_budget) = fixture.generation(&[("main.yml", b"newer sketch update\n")]);
         fixture
             .store
-            .write_generated(newer, ExistingOutputPolicy::Reject)
+            .write_generated_with_budget(newer, ExistingOutputPolicy::Reject, newer_budget)
             .expect("newer generation");
         let ownership = fixture
             .contracts
@@ -1509,7 +1730,7 @@ mod tests {
 
         let error = fixture
             .store
-            .write_generated(stale, ExistingOutputPolicy::Reject)
+            .write_generated_with_budget(stale, ExistingOutputPolicy::Reject, stale_budget)
             .expect_err("stale input must win before requested-output preflight");
 
         assert!(matches!(error, CliError::GenerationInputChanged { .. }));
@@ -1531,7 +1752,7 @@ mod tests {
     #[test]
     fn empty_generation_baseline_rejects_a_newly_populated_catalog() {
         let fixture = ReconciliationFixture::new();
-        let generated = fixture.generation(&[("main.yml", b"generated\n")]);
+        let (generated, budget) = fixture.generation(&[("main.yml", b"generated\n")]);
         fixture
             .contracts
             .child("manual.yml")
@@ -1540,7 +1761,7 @@ mod tests {
 
         let error = fixture
             .store
-            .write_generated(generated, ExistingOutputPolicy::Reject)
+            .write_generated_with_budget(generated, ExistingOutputPolicy::Reject, budget)
             .expect_err("a populated catalog must invalidate an empty baseline");
 
         assert!(matches!(error, CliError::GenerationInputChanged { .. }));
@@ -1563,13 +1784,9 @@ mod tests {
     fn generation_baseline_rejects_a_later_manual_contract_edit() {
         let fixture = ReconciliationFixture::new();
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("main.yml", b"initial\n")]),
-                ExistingOutputPolicy::Reject,
-            )
+            .apply_generation(&[("main.yml", b"initial\n")], ExistingOutputPolicy::Reject)
             .expect("initial generation");
-        let generated = fixture.generation(&[("main.yml", b"updated\n")]);
+        let (generated, budget) = fixture.generation(&[("main.yml", b"updated\n")]);
         let ownership = fixture
             .contracts
             .child(".contract-kit/generated-files.json");
@@ -1582,7 +1799,7 @@ mod tests {
 
         let error = fixture
             .store
-            .write_generated(generated, ExistingOutputPolicy::Reject)
+            .write_generated_with_budget(generated, ExistingOutputPolicy::Reject, budget)
             .expect_err("a manual edit must invalidate the captured baseline");
 
         assert!(matches!(error, CliError::GenerationInputChanged { .. }));
@@ -1600,11 +1817,11 @@ mod tests {
     #[test]
     fn unchanged_generation_baseline_commits_normally() {
         let fixture = ReconciliationFixture::new();
-        let generated = fixture.generation(&[("main.yml", b"generated\n")]);
+        let (generated, budget) = fixture.generation(&[("main.yml", b"generated\n")]);
 
         fixture
             .store
-            .write_generated(generated, ExistingOutputPolicy::Reject)
+            .write_generated_with_budget(generated, ExistingOutputPolicy::Reject, budget)
             .expect("unchanged baseline generation");
 
         fixture
@@ -1621,9 +1838,8 @@ mod tests {
     fn abandoned_manifest_atomic_temporary_is_removed_under_the_lock() {
         let fixture = ReconciliationFixture::new();
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"generated\n")]),
+            .apply_generation(
+                &[("current.yaml", b"generated\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect("initial generation");
@@ -1635,9 +1851,8 @@ mod tests {
             .expect("abandoned atomic temporary");
 
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"generated\n")]),
+            .apply_generation(
+                &[("current.yaml", b"generated\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect("generation should clean the reserved temporary");
@@ -1652,10 +1867,12 @@ mod tests {
     #[test]
     fn reservation_collision_rolls_back_without_overwriting_external_file() {
         let fixture = ReconciliationFixture::new();
+        let (generated, budget) = fixture.generation(&[("new.yaml", b"generated\n")]);
         let reconciliation = CatalogReconciliation::new(
             &fixture.store,
-            fixture.generation(&[("new.yaml", b"generated\n")]),
+            generated,
             ExistingOutputPolicy::Reject,
+            budget,
         )
         .expect("preflight missing destination");
         fixture
@@ -1686,10 +1903,12 @@ mod tests {
             .child("adopt.yaml")
             .write_binary(b"matching\n")
             .expect("matching legacy output");
+        let (generated, budget) = fixture.generation(&[("adopt.yaml", b"matching\n")]);
         let reconciliation = CatalogReconciliation::new(
             &fixture.store,
-            fixture.generation(&[("adopt.yaml", b"matching\n")]),
+            generated,
             ExistingOutputPolicy::AdoptMatching,
+            budget,
         )
         .expect("matching adoption preflight");
         fixture
@@ -1717,14 +1936,12 @@ mod tests {
         assert!(manifest.contains(r#""state": "updating""#));
     }
 
-    #[cfg(unix)]
     #[test]
     fn hard_linked_owned_outputs_are_rejected_as_host_aliases() {
         let fixture = ReconciliationFixture::new();
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("a.yaml", b"same\n"), ("b.yaml", b"same\n")]),
+            .apply_generation(
+                &[("a.yaml", b"same\n"), ("b.yaml", b"same\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect("initial generation");
@@ -1741,9 +1958,8 @@ mod tests {
         .expect("hard link outputs");
 
         let error = fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("a.yaml", b"same\n"), ("b.yaml", b"same\n")]),
+            .apply_generation(
+                &[("a.yaml", b"same\n"), ("b.yaml", b"same\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect_err("host aliases must fail preflight");
@@ -1755,14 +1971,12 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn requested_and_stale_outputs_are_rejected_when_they_alias() {
         let fixture = ReconciliationFixture::new();
         fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"same\n"), ("stale.yaml", b"same\n")]),
+            .apply_generation(
+                &[("current.yaml", b"same\n"), ("stale.yaml", b"same\n")],
                 ExistingOutputPolicy::Reject,
             )
             .expect("initial generation");
@@ -1779,11 +1993,7 @@ mod tests {
         .expect("alias stale output to requested output");
 
         let error = fixture
-            .store
-            .write_generated(
-                fixture.generation(&[("current.yaml", b"same\n")]),
-                ExistingOutputPolicy::Reject,
-            )
+            .apply_generation(&[("current.yaml", b"same\n")], ExistingOutputPolicy::Reject)
             .expect_err("requested-to-stale alias must fail preflight");
 
         assert!(error.to_string().contains("same host file"));

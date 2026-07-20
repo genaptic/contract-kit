@@ -22,13 +22,13 @@ validation commands here.
 - Use `$use-rust-best-practices-core` for any Rust planning, editing, review,
   debugging, or validation task in this crate.
 - Add `$use-rust-best-practices-architecture` when changing crate boundaries,
-  modules, public APIs, private dispatch, or test placement.
+  modules, public APIs, direct operation composition, or test placement.
 - Add `$use-rust-best-practices-testing` when changing unit tests, integration
-  tests, boundary scanners, doctests, or validation strategy.
+  tests, workspace boundary policy, doctests, or validation strategy.
 - Add `$use-rust-best-practices-async` before changing public async methods,
   work-pool behavior, CPU scheduling, or the sync/async boundary.
-- Add `$use-rust-best-practices-abstractions` before changing the private
-  backend trait, error shape, dispatcher, or other polymorphic boundaries.
+- Add `$use-rust-best-practices-abstractions` before changing concrete owner
+  boundaries, error shapes, or introducing any polymorphic boundary.
 - Add `$rust-code-structuring-best-practices` before changing structs, enums,
   builders, repeated data groups, receiver-method ownership, or standalone
   helper placement.
@@ -63,12 +63,10 @@ validation commands here.
   deserializable, and comparable when they cross the API boundary.
 - Preserve deterministic `FileCatalog` ordering, duplicate-insert rejection,
   and construction-time plus serde-time `CatalogPath` validation.
-- Keep `SketchContractKit` opaque over its private inner enum. The public
-  handle and every concrete backend payload must implement the same private
-  `SketchContractKitBackend` trait.
-- Keep backend dispatch explicit and exhaustive. Call receiver methods in
-  variant arms, do not use wildcard arms or macro-generated dispatch, and
-  reserve `<Self as Trait>::method(self, ...)` for public-handle bridges.
+- Keep `SketchContractKit` opaque over its private work-pool and limit owners.
+  Public receiver methods submit each complete domain operation directly;
+  do not add a backend trait or inner dispatch enum without a second concrete
+  implementation that proves the abstraction is needed.
 - Keep `SketchContractKitError` as the builder/check/generate/diff error
   boundary.
   Keep `FileCatalogError` as the separately exported error for public catalog
@@ -82,9 +80,11 @@ validation commands here.
   semantics in [ARCHITECTURE.md](ARCHITECTURE.md) as the current behavior
   contract. Update that guide and focused tests whenever those semantics
   change.
-- Keep `SketchContractDocuments` as the single parsed combined-document owner
-  for validation and generation. Do not add a parallel YAML representation or
-  a second parse.
+- Keep `SketchContractDocuments` as the single typed mandatory-v2 combined-
+  document owner for validation and generation. Sketch entries are one-entry
+  ID maps with nested `file`, `signature`, `signature_type`, `matching`, and
+  `code` bodies; add no flattened compatibility branch or parallel YAML
+  representation. Physical path/index locators are operational, not semantic.
 - Keep contract validity failures as operation errors. Do not silently
   downgrade malformed YAML, unknown fields, duplicate IDs, invalid or missing
   fields, invalid paths, orphan or ambiguous links, kind mismatches, or empty
@@ -99,18 +99,26 @@ validation commands here.
   remain part of the normalized snippet and are semantic.
 - Keep report rendering byte-only. Report modules return catalog entries;
   callers choose persistence paths and storage mechanisms.
-- Do not change `Warning`, `Default`, or `Strict` behavior without changing
-  their tests and the architecture description in the same work.
+- Do not change `Enforce` or `Warning` behavior without changing their tests
+  and the architecture description in the same work. Matching strictness
+  remains contract-owned rather than check-mode-owned.
 
 ## Generation Guardrails
 
 - Refresh only sketches already linked from signatures in existing combined
-  documents. Require one neutral seed for every explicit link and validate its
-  document, ID, signature type, source file, and nonempty code.
+  documents. Full refresh requires one neutral seed for every explicit link;
+  partial refresh targets only supplied IDs. Both validate document, ID,
+  signature type, source file, and nonempty code, reject unknown/duplicate
+  seeds, and preserve unspecified sketches exactly.
 - Keep generation byte-only. It returns contract catalogs and never creates
   directories, writes local files, prints output, or performs CLI merging.
-- Preserve `root`, `files`, `signatures`, signature-owned links, sketch IDs,
-  and sketch signature types while replacing only linked sketch code.
+- Preserve `root`, `files`, signature-owned extraction/signatures/links,
+  sketch IDs, nested link facts, and matching policy while replacing only a
+  targeted nested sketch's code.
+- Return original bytes without loading the lossless syntax tree for exact
+  semantic no-ops. For changes, preserve scalar presentation where valid,
+  fail closed for unsafe alias/anchor mutations, and semantically reparse the
+  complete edited document before returning bytes.
 - Render only targeted root documents. Preserve untargeted root-document bytes
   and nested or non-YAML passthrough entries byte-for-byte.
 - Treat changes to combined-document fields, link direction, IDs, or entry
@@ -125,20 +133,17 @@ validation commands here.
   must remain `Send + 'static`. Do not promise that a method future borrowing a
   local kit is itself `'static`.
 - Use exactly one `AsyncWorkPool::execute` call around each complete top-level
-  operation. Await an owned semaphore permit asynchronously, submit the job to
-  the private Rayon pool, move the permit into the closure, and return the
+  operation. Attempt active-plus-pending admission immediately, await active
+  capacity asynchronously, submit to the selected Rayon pool, and return the
   outcome through a futures oneshot channel.
-- Derive root-operation admission from the built worker count:
-  `WorkParallelism::Fixed(n)` sets both budgets to `n`, while
-  `RuntimeDefault` uses Rayon's selected count. Do not add another public
-  `WorkOptions` field.
-- Preserve drop semantics: dropping before admission prevents submission;
-  cancellation of a submitted but not-yet-started job is a best-effort skip;
-  finite work which has started runs to completion and may discard its result.
-  A host timeout bounds waiting, not CPU execution.
-- Keep the permit with queued and running work. Hosts must independently bound
-  the pending tasks and owned catalogs they create. Do not promise FIFO or
-  starvation freedom.
+- Keep `WorkerPool`, `max_in_flight_operations`, and
+  `max_pending_operations` independent. Shared pools remain application-owned;
+  neither domain creates another worker set when one is injected.
+- Preserve drop semantics: queued cancellation releases admission; submitted
+  cancellation sets the cooperative probe; running work stops at checkpoints
+  between source, parsing, matching/diagnostic, and render groups. Do not use
+  unsafe thread termination or promise FIFO/starvation freedom.
+- Release admitted and running permits before making completion observable.
 - Catch worker-job panics only to forward them through the oneshot outcome and
   resume unwinding on the polling thread. Keep recoverable failures typed.
   Domain operations remain side-effect-free transformations of owned catalogs,
@@ -154,42 +159,58 @@ validation commands here.
   order, generated entry order, or rendered bytes.
 - Normalize each contract `SketchSnippet` at construction and reuse its cached
   normalized value for matching and semantic comparison.
+- Enforce `SketchLimits` at the catalog boundary and again while parsing YAML,
+  validating IDs/snippets, normalizing referenced sources, accumulating
+  correctness diagnostics, and inserting returned bytes. Overall diagnostic
+  exhaustion is an operation error; only explicitly bounded evidence truncates.
 - Keep production modules identical in test and non-test builds. Test-only
   support belongs inside local `#[cfg(test)] mod tests` blocks or under
   `conkit-sketch/tests`, never in test-gated production impls or imports.
 
 ## Internal Ownership Rules
 
-- `api.rs` owns public DTOs, builder and handle wiring, private backend
-  dispatch, check/generate/diff composition, and top-level async work
-  submission.
+- `api.rs` owns public DTOs, builder and handle wiring, direct
+  request-owned check/diff composition, and top-level async work submission;
+  `generate.rs` owns `GenerateRequest::run`, seed-set admission, uniqueness and
+  coverage validation, generated-code validation, and seed orchestration.
 - `files.rs` and `work.rs` own the catalog/path boundary and runtime-neutral
   CPU bridge respectively.
-- `contract.rs` owns parsed documents, original-byte passthrough, contract
-  validation, targeted refresh/rendering, and ID-based semantic diffing;
-  `normalize.rs`, `matcher.rs`, and `inventory.rs` own normalization, matching,
+- Keep `contract.rs` as the parsed-contract facade. Its `model`, `document`,
+  `resolve`, `diff`, and `edit` children own the canonical collection and
+  per-contract seed agreement, parsing, signature-link agreement, ordered
+  comparison and versioned digests, and the verified edit lifecycle;
+  `contract/edit/scalar.rs` alone owns scalar presentation and encoding.
+- Keep `limits.rs` as the nominal public limit facade. Its `catalog`, `yaml`,
+  `matching`, and `output` children own catalog admission, transactional YAML
+  accounting, matching/evidence ceilings, and diagnostic/scratch/returned
+  output accounting respectively. Shared private charge and numeric-conversion
+  mechanics remain facade-owned; do not share nominal types across crates.
+- `normalize.rs`, `matcher.rs`, and `inventory.rs` own normalization, matching,
   diagnostics, counts, and check modes.
-- `generate.rs` owns seed validation and generation orchestration, while
-  `report.rs` renders returned report bytes. Neither may gain filesystem or
-  presentation responsibilities.
+- `report.rs` renders borrowed domain report views into returned bytes. It and
+  `generate.rs` must not gain filesystem or CLI presentation responsibilities.
 - Keep the complete descriptive module map in
   [ARCHITECTURE.md](ARCHITECTURE.md) rather than duplicating it here.
 
 ## Testing Expectations
 
 - Keep unit tests beside the private behavior they exercise.
-- Keep public API, async behavior, serialization, and source-boundary scanners
-  under `conkit-sketch/tests`.
-- Keep compile-time direct-future and owning-spawn `Send` contracts in
-  `tests/public_api.rs`; retain the executor-neutral behavioral tests there.
+- Keep public API behavior, serialization, and async contracts under the one
+  `tests/public_api.rs` integration-crate root and its focused
+  `public_api/{support,async_contract,boundaries,workflows}.rs` children. Do not
+  put source scanners or private source-spelling assertions in those children.
+- Keep compile-time direct-future and owning-spawn `Send` contracts in the
+  async-contract child; retain representative executor-neutral workflows in
+  the workflow child.
 - Keep deterministic admission, pre-start and post-start cancellation, maximum
   active-work, panic-forwarding, and worker-loss tests in the local `work.rs`
   test module. Coordinate them with channels, atomics, manual polling, real
   wake notifications, and bounded receive guards—never sleeps or production
   test seams.
-- Preserve boundary coverage rejecting `conkit_signature::`, `clap`, Tokio,
-  `async_trait`, filesystem IO, process exits, OS-path DTOs, and production
-  `#[cfg(test)]` shims.
+- Preserve workspace boundary coverage rejecting `conkit_signature::`, `clap`,
+  Tokio, `async_trait`, filesystem IO, process exits, OS-path DTOs, and
+  production `#[cfg(test)]` shims through the centralized `syn` AST policy in
+  `conkit/tests/dependency_policy.rs`.
 - Cover contract validity separately from match diagnostics. Cover linked
   refresh, deterministic output, all check modes, malformed source bytes, and
   generated-contract round trips at the narrowest useful test level.

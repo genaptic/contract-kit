@@ -1,5 +1,7 @@
-use crate::languages::rust::types::base_type::{BaseCanonical, BaseType};
-use crate::languages::rust::types::callable_type::{RustMethod, RustMethodCanonical};
+use crate::SignatureContractKitError;
+use crate::languages::rust::types::attributes::RustAttributes;
+use crate::languages::rust::types::base_type::BaseType;
+use crate::languages::rust::types::declaration::RustIdentifier;
 use crate::languages::rust::types::primitive_types::{RustGenericMetadata, RustType, Visibility};
 use serde::Serialize;
 
@@ -8,15 +10,28 @@ pub(crate) struct StructField {
     name: Option<String>,
     visibility: Visibility,
     field_type: RustType,
+    attributes: RustAttributes,
 }
 
 impl StructField {
-    pub(crate) fn new(name: Option<String>, visibility: Visibility, field_type: RustType) -> Self {
-        Self {
+    pub(crate) fn new(
+        name: Option<String>,
+        visibility: Visibility,
+        field_type: RustType,
+        attributes: RustAttributes,
+    ) -> Result<Self, SignatureContractKitError> {
+        let name = name
+            .map(|name| {
+                RustIdentifier::new(name, "struct field name").map(|name| name.as_str().to_owned())
+            })
+            .transpose()?;
+
+        Ok(Self {
             name,
             visibility,
             field_type,
-        }
+            attributes,
+        })
     }
 
     pub(crate) fn name(&self) -> Option<&str> {
@@ -30,14 +45,17 @@ impl StructField {
     pub(crate) fn field_type(&self) -> &RustType {
         &self.field_type
     }
+
+    pub(crate) fn attributes(&self) -> &RustAttributes {
+        &self.attributes
+    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct StructType {
     base: BaseType,
     generics: RustGenericMetadata,
     fields: Vec<StructField>,
-    methods: Vec<RustMethod>,
 }
 
 impl StructType {
@@ -46,7 +64,6 @@ impl StructType {
             base,
             generics: RustGenericMetadata::default(),
             fields: Vec::new(),
-            methods: Vec::new(),
         }
     }
 
@@ -72,28 +89,62 @@ impl StructType {
         &self.fields
     }
 
-    pub(crate) fn methods(&self) -> &[RustMethod] {
-        &self.methods
-    }
-
-    pub(in crate::languages::rust) fn canonical_form(&self) -> StructCanonical {
-        StructCanonical {
-            base: self.base.canonical_form(),
-            generics: self.generics.clone(),
-            fields: self.fields.clone(),
-            methods: self
-                .methods
-                .iter()
-                .map(RustMethod::canonical_form)
-                .collect(),
-        }
+    pub(crate) fn requires_capability_warning(&self) -> bool {
+        self.base.attributes().requires_capability_warning()
+            || self.generics.requires_capability_warning()
+            || self.fields.iter().any(|field| {
+                field.attributes().requires_capability_warning()
+                    || field.field_type().requires_capability_warning()
+            })
     }
 }
 
-#[derive(Serialize)]
-pub(in crate::languages::rust) struct StructCanonical {
-    base: BaseCanonical,
-    generics: RustGenericMetadata,
-    fields: Vec<StructField>,
-    methods: Vec<RustMethodCanonical>,
+#[cfg(test)]
+mod tests {
+    use super::StructField;
+    use crate::languages::rust::types::attributes::RustAttributes;
+    use crate::languages::rust::types::primitive_types::{RustType, Visibility};
+
+    struct FieldFixture;
+
+    impl FieldFixture {
+        fn named(name: &str) -> Result<StructField, crate::SignatureContractKitError> {
+            StructField::new(
+                Some(name.to_owned()),
+                Visibility::Private,
+                RustType::Bool,
+                RustAttributes::default(),
+            )
+        }
+    }
+
+    #[test]
+    fn struct_fields_accept_canonical_named_and_unnamed_forms() {
+        let named = FieldFixture::named("type").expect("canonical semantic identifier");
+        let unnamed = StructField::new(
+            None,
+            Visibility::Private,
+            RustType::Bool,
+            RustAttributes::default(),
+        )
+        .expect("tuple field");
+
+        assert_eq!(named.name(), Some("type"));
+        assert_eq!(unnamed.name(), None);
+    }
+
+    #[test]
+    fn struct_fields_reject_invalid_names_before_entering_the_model() {
+        for name in [
+            "",
+            " value",
+            "value ",
+            "r#type",
+            "not-an-ident",
+            "line\nbreak",
+        ] {
+            let error = FieldFixture::named(name).expect_err("invalid field name must fail");
+            assert!(error.to_string().contains("struct field name"));
+        }
+    }
 }
