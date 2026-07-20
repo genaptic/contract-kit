@@ -1303,6 +1303,37 @@ sketches: []
 }
 
 #[test]
+fn yaml_generic_defaults_survive_syn_three_tuple_containers() {
+    let template = r#"contract_version: 2
+root: ../src
+files: [lib.rs]
+extraction: { mode: rust_syntax_v2, profile: rust_api_v1, crates: [{ id: sample, root: lib.rs, kind: library }] }
+signatures:
+  - packet_struct:
+      crate_id: sample
+      file: lib.rs
+      signature_type: struct
+      name: Packet
+      visibility: public
+      generics: ['T = TYPE_DEFAULT', 'const N: usize = CONST_DEFAULT']
+sketches: []
+"#;
+    let contract = |type_default: &str, const_default: &str| {
+        let yaml = template
+            .replace("TYPE_DEFAULT", type_default)
+            .replace("CONST_DEFAULT", const_default);
+        contract_inventory(catalog_with("main.yml", yaml.as_bytes()))
+            .expect("generic-default contract")
+            .source_shape_digest(&crate::work::CancellationProbe::new())
+            .expect("generic-default source-shape digest")
+    };
+
+    let baseline = contract("String", "4");
+    assert_ne!(baseline, contract("Vec<u8>", "4"));
+    assert_ne!(baseline, contract("String", "8"));
+}
+
+#[test]
 fn typed_method_receivers_resolve_method_generic_parameters() {
     let bytes = br#"contract_version: 2
 root: ../src

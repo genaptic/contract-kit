@@ -59,7 +59,7 @@ impl RustTypeConverter {
             syn::Type::Tuple(tuple) => self.convert_tuple(tuple),
             syn::Type::Never(_) => Ok(RustType::Never),
             syn::Type::Ptr(pointer) => self.convert_raw_pointer(pointer),
-            syn::Type::BareFn(function_pointer) => self.convert_function_pointer(function_pointer),
+            syn::Type::FnPtr(function_pointer) => self.convert_function_pointer(function_pointer),
             syn::Type::TraitObject(trait_object) => self.convert_trait_object(trait_object),
             syn::Type::ImplTrait(impl_trait) => self.convert_impl_trait(impl_trait),
             syn::Type::Infer(_) => Ok(RustType::Inferred),
@@ -161,14 +161,14 @@ impl RustTypeConverter {
         pointer: syn::TypePtr,
     ) -> Result<RustType, SignatureContractKitError> {
         Ok(RustType::RawPointer(RustRawPointerType::new(
-            pointer.mutability.is_some(),
+            matches!(pointer.mutability, syn::PointerMutability::Mut(_)),
             self.convert_type(*pointer.elem)?,
         )))
     }
 
     fn convert_function_pointer(
         &self,
-        function_pointer: syn::TypeBareFn,
+        function_pointer: syn::TypeFnPtr,
     ) -> Result<RustType, SignatureContractKitError> {
         let mut lifetimes = Vec::new();
         if let Some(bound_lifetimes) = function_pointer.lifetimes {
@@ -216,7 +216,7 @@ impl RustTypeConverter {
 
     fn convert_function_pointer_variadic(
         &self,
-        variadic: Option<&syn::BareVariadic>,
+        variadic: Option<&syn::FnPtrVariadic>,
     ) -> Result<Option<RustFunctionPointerVariadic>, SignatureContractKitError> {
         variadic
             .map(|variadic| {
@@ -358,10 +358,15 @@ mod tests {
     fn converts_pointer_trait_and_impl_types() {
         let fixture = TypeFixture::default();
 
-        assert!(matches!(
-            fixture.convert("*const u8"),
-            RustType::RawPointer(_)
-        ));
+        let RustType::RawPointer(const_pointer) = fixture.convert("*const u8") else {
+            panic!("const raw pointer");
+        };
+        let RustType::RawPointer(mutable_pointer) = fixture.convert("*mut u8") else {
+            panic!("mutable raw pointer");
+        };
+        assert!(!const_pointer.mutable());
+        assert!(mutable_pointer.mutable());
+        assert_eq!(const_pointer.pointee_type(), mutable_pointer.pointee_type());
         assert!(matches!(
             fixture.convert("fn(u8) -> bool"),
             RustType::FunctionPointer(_)

@@ -1180,33 +1180,35 @@ impl RustYamlMethodInput {
             ));
         }
 
-        if receiver.colon_token.is_some() {
-            let receiver_type =
-                RustYamlTypeText::from_text(receiver.ty.to_token_stream().to_string())
-                    .parse(context, cancellation)
-                    .map_err(|source| {
-                        if source.limit_exceeded().is_some() || source.is_operation_canceled() {
-                            source
-                        } else {
-                            SignatureContractKitError::parse_failed(
-                                catalog_name,
-                                format!("invalid typed Rust method receiver: {source}"),
-                            )
-                        }
-                    })?;
-            return Ok(RustReceiver::typed(
-                receiver.mutability.is_some(),
-                receiver_type,
-            ));
-        }
-
-        Ok(match receiver.reference {
-            Some((_, lifetime)) => RustReceiver::reference(
+        let receiver_mutable = receiver.mutability.is_some();
+        #[allow(unreachable_patterns)]
+        match receiver.kind {
+            syn::ReceiverKind::Value => Ok(RustReceiver::value(receiver_mutable)),
+            syn::ReceiverKind::Reference(_, lifetime, mutability) => Ok(RustReceiver::reference(
                 lifetime.map(|lifetime| lifetime.to_token_stream().to_string()),
-                receiver.mutability.is_some(),
-            ),
-            None => RustReceiver::value(receiver.mutability.is_some()),
-        })
+                mutability.is_some(),
+            )),
+            syn::ReceiverKind::Typed(_, receiver_type) => {
+                let receiver_type =
+                    RustYamlTypeText::from_text(receiver_type.to_token_stream().to_string())
+                        .parse(context, cancellation)
+                        .map_err(|source| {
+                            if source.limit_exceeded().is_some() || source.is_operation_canceled() {
+                                source
+                            } else {
+                                SignatureContractKitError::parse_failed(
+                                    catalog_name,
+                                    format!("invalid typed Rust method receiver: {source}"),
+                                )
+                            }
+                        })?;
+                Ok(RustReceiver::typed(receiver_mutable, receiver_type))
+            }
+            _ => Err(SignatureContractKitError::parse_failed(
+                catalog_name,
+                "unsupported future Rust method receiver",
+            )),
+        }
     }
 }
 
