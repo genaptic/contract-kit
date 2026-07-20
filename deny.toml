@@ -60,6 +60,12 @@ deny = [
     { crate = "yaml-edit", deny-multiple-versions = true, reason = "lossless YAML edits must use one concrete-syntax-tree implementation" },
     { crate = "serde_yaml", reason = "the archived parser is replaced by serde-saphyr plus yaml-edit" },
 ]
+# Contract Kit's runtime syntax model uses Syn 3. Syn 2 remains isolated as an
+# implementation detail of clap_derive and zerocopy-derive proc macros until
+# those upstream packages migrate; keep this exception scoped to Syn's 2.x line.
+skip = [
+    { crate = "syn:>=2,<3", reason = "Syn 2 is isolated inside clap_derive and zerocopy-derive proc macros, not Contract Kit's runtime syntax model" },
+]
 
 [bans.workspace-dependencies]
 duplicates = "deny"

@@ -627,7 +627,7 @@ impl DispatchPolicy {
         ));
         assert!(native_trait, "native AppCommand trait");
         let method = command.items.iter().find_map(|item| match item {
-            syn::Item::Impl(item) if item.trait_.as_ref().is_some_and(|(_, path, _)| path.segments.last().is_some_and(|part| part.ident == "AppCommand"))
+            syn::Item::Impl(item) if item.trait_.as_ref().is_some_and(|(path, _)| path.segments.last().is_some_and(|part| part.ident == "AppCommand"))
                 && matches!(item.self_ty.as_ref(), syn::Type::Path(path) if path.path.segments.last().is_some_and(|part| part.ident == "Command"))
                 && !item.attrs.iter().any(|attr| attr.path().segments.last().is_some_and(|part| part.ident == "async_trait")) =>
                 item.items.iter().find_map(|member| match member {
@@ -649,9 +649,9 @@ impl DispatchPolicy {
     fn execute_signature(signature: &syn::Signature) -> bool {
         let mut inputs = signature.inputs.iter();
         let receiver = matches!(inputs.next(), Some(syn::FnArg::Receiver(receiver))
-            if receiver.reference.is_some()
-                && receiver.mutability.is_none()
-                && receiver.colon_token.is_none());
+            if receiver.mutability.is_none()
+                && matches!(&receiver.kind, syn::ReceiverKind::Reference(_, _, mutability)
+                    if mutability.is_none()));
         let context = matches!(inputs.next(), Some(syn::FnArg::Typed(context))
             if matches!(context.pat.as_ref(), syn::Pat::Ident(name)
                     if name.ident == "context"
@@ -670,9 +670,16 @@ impl DispatchPolicy {
     }
 
     fn arm(&mut self, arm: &syn::Arm) {
-        let syn::Pat::TupleStruct(pattern) = &arm.pat else {
+        let (pattern, guard) = match &arm.pat {
+            syn::Pat::Guard(guard) => (guard.pat.as_ref(), Some(guard.guard.as_ref())),
+            pattern => (pattern, None),
+        };
+        let syn::Pat::TupleStruct(pattern) = pattern else {
             self.violations
                 .push("wildcard/catch-all dispatch arm".to_owned());
+            if let Some(guard) = guard {
+                self.visit_expr(guard);
+            }
             self.visit_expr(&arm.body);
             return;
         };
@@ -700,7 +707,7 @@ impl DispatchPolicy {
         };
         self.binding = Some(binding.ident.to_string());
         self.delegations = 0;
-        if let Some((_, guard)) = &arm.guard {
+        if let Some(guard) = guard {
             self.visit_expr(guard);
         }
         self.visit_expr(&arm.body);
@@ -708,7 +715,7 @@ impl DispatchPolicy {
             || binding.by_ref.is_some()
             || binding.mutability.is_some()
             || binding.subpat.is_some()
-            || arm.guard.is_some()
+            || guard.is_some()
             || self.delegations != 1
         {
             self.violations
@@ -790,7 +797,8 @@ impl RustBackendTopology {
                 method.default.is_none()
                     && method.sig.asyncness.is_none()
                     && matches!(method.sig.inputs.first(), Some(syn::FnArg::Receiver(receiver))
-                        if receiver.colon_token.is_none())
+                        if matches!(&receiver.kind,
+                            syn::ReceiverKind::Value | syn::ReceiverKind::Reference(..)))
             );
         }
 
@@ -832,7 +840,7 @@ impl RustBackendTopology {
     fn assert_impl(file: &syn::File, owner: &str, dispatch: bool) {
         let mut implementations = file.items.iter().filter_map(|item| match item {
             syn::Item::Impl(item)
-                if item.trait_.as_ref().is_some_and(|(_, path, _)| {
+                if item.trait_.as_ref().is_some_and(|(path, _)| {
                     path.segments
                         .last()
                         .is_some_and(|part| part.ident == "RustExtractionBackend")
@@ -874,7 +882,6 @@ impl RustBackendTopology {
                 pattern.path.segments.len() == 2
                     && pattern.path.segments[0].ident == "Self"
                     && pattern.elems.len() == 1
-                    && arm.guard.is_none()
             );
             let syn::Pat::Ident(binding) = &pattern.elems[0] else {
                 panic!("backend arm must bind its payload");

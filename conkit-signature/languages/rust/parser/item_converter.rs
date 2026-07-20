@@ -310,7 +310,8 @@ impl RustItemConverter {
         diagnostics: &mut RustCapabilityDiagnostics<'_>,
     ) -> Result<RustConvertedDeclaration, SignatureContractKitError> {
         self.cancellation.checkpoint()?;
-        let implemented_trait = self.convert_implemented_trait(item.trait_.as_ref())?;
+        let implemented_trait =
+            self.convert_implemented_trait(&item.modifiers, item.trait_.as_ref())?;
         let semantic_name = owner.id().render();
         let owner_generics = self.generic_type_names(context, &item.generics)?;
         let associated =
@@ -318,7 +319,10 @@ impl RustItemConverter {
         let declaration = RustDeclaration::Implementation(
             ImplementationType::new(owner)
                 .with_implemented_trait(implemented_trait)
-                .with_qualifiers(item.defaultness.is_some(), item.unsafety.is_some())
+                .with_qualifiers(
+                    item.modifiers.defaultness.is_some(),
+                    item.unsafety.is_some(),
+                )
                 .with_generic_metadata(self.convert_generics(context, &item.generics)?)
                 .with_attributes(self.convert_attributes(context, &item.attrs)?)
                 .with_items(associated),
@@ -432,15 +436,12 @@ impl RustItemConverter {
         item: &syn::ItemTrait,
         diagnostics: &mut RustCapabilityDiagnostics<'_>,
     ) -> Result<RustItemConversion, SignatureContractKitError> {
-        if item.restriction.is_some() {
-            return context.unsupported_syntax("restricted trait declaration", item.span());
-        }
         let name = RustModulePath::semantic_ident(&item.ident);
         let owner_generics = self.generic_type_names(context, &item.generics)?;
         let associated =
             self.convert_trait_items(context, &owner_generics, &item.items, diagnostics)?;
         let trait_type = TraitType::new(self.base_type(context, &name, &item.vis, &item.attrs)?)
-            .with_qualifiers(item.unsafety.is_some(), item.auto_token.is_some())
+            .with_qualifiers(item.unsafety.is_some(), item.modifiers.auto_token.is_some())
             .with_generic_metadata(self.convert_generics(context, &item.generics)?)
             .with_supertraits(
                 item.supertraits
@@ -827,7 +828,7 @@ impl RustItemConverter {
                 item.ty.clone(),
             )?,
             Some(RustSyntaxText::from_expression(&item.expr)),
-            item.defaultness.is_some(),
+            item.modifiers.defaultness.is_some(),
             self.convert_attributes(context, &item.attrs)?,
         )
     }
@@ -872,7 +873,7 @@ impl RustItemConverter {
             self.convert_generics(context, &item.generics)?,
             Vec::new(),
             Some(self.convert_type(context, &type_converter, item.ty.clone())?),
-            item.defaultness.is_some(),
+            item.modifiers.defaultness.is_some(),
             self.convert_attributes(context, &item.attrs)?,
         )
     }
@@ -920,7 +921,7 @@ impl RustItemConverter {
                         .convert_visibility(item.vis.clone(), context.module_id())?,
                     item.attrs.as_slice(),
                     true,
-                    item.defaultness.is_some(),
+                    item.modifiers.defaultness.is_some(),
                 ),
             };
         let name = RustModulePath::semantic_ident(&signature.ident);
@@ -1068,7 +1069,7 @@ impl RustItemConverter {
             signature: RustCallableSignature::builder()
                 .with_const(signature.constness.is_some())
                 .with_async(signature.asyncness.is_some())
-                .with_unsafe(signature.unsafety.is_some())
+                .with_unsafe(matches!(signature.safety, syn::Safety::Unsafe(_)))
                 .with_abi(self.convert_abi(signature.abi.as_ref()))
                 .with_variadic(self.convert_variadic(context, signature.variadic.as_ref())?)
                 .with_generics(self.convert_generics(context, &signature.generics)?)
@@ -1090,29 +1091,32 @@ impl RustItemConverter {
         receiver: &syn::Receiver,
         type_converter: &RustTypeConverter,
     ) -> Result<RustReceiver, SignatureContractKitError> {
-        if receiver.colon_token.is_some() {
-            return Ok(RustReceiver::typed(
-                receiver.mutability.is_some(),
-                self.convert_type(context, type_converter, (*receiver.ty).clone())?,
-            ));
-        }
-
-        Ok(match &receiver.reference {
-            Some((_, lifetime)) => RustReceiver::reference(
+        #[allow(unreachable_patterns)]
+        match &receiver.kind {
+            syn::ReceiverKind::Value => Ok(RustReceiver::value(receiver.mutability.is_some())),
+            syn::ReceiverKind::Reference(_, lifetime, mutability) => Ok(RustReceiver::reference(
                 lifetime.as_ref().map(|lifetime| self.tokens(lifetime)),
+                mutability.is_some(),
+            )),
+            syn::ReceiverKind::Typed(_, receiver_type) => Ok(RustReceiver::typed(
                 receiver.mutability.is_some(),
-            ),
-            None => RustReceiver::value(receiver.mutability.is_some()),
-        })
+                self.convert_type(context, type_converter, (**receiver_type).clone())?,
+            )),
+            _ => context.unsupported_syntax("future method receiver", receiver.span()),
+        }
     }
 
     fn convert_implemented_trait(
         &self,
-        implemented_trait: Option<&(Option<syn::Token![!]>, syn::Path, syn::Token![for])>,
+        modifiers: &syn::ImplModifiers,
+        implemented_trait: Option<&(syn::Path, syn::Token![for])>,
     ) -> Result<RustImplementedTrait, SignatureContractKitError> {
-        match implemented_trait {
-            None => Ok(RustImplementedTrait::Inherent),
-            Some((polarity, path, _)) => RustImplementedTrait::for_trait(
+        match (implemented_trait, &modifiers.polarity) {
+            (None, None) => Ok(RustImplementedTrait::Inherent),
+            (None, Some(_)) => Err(SignatureContractKitError::conversion_failed(
+                "unsupported Rust syntax negative inherent implementation",
+            )),
+            (Some((path, _)), polarity) => RustImplementedTrait::for_trait(
                 self.tokens(path),
                 if polarity.is_some() {
                     RustImplPolarity::Negative
@@ -1177,7 +1181,10 @@ impl RustItemConverter {
                         .iter()
                         .map(|bound| self.tokens(bound))
                         .collect(),
-                    parameter.default.as_ref().map(|value| self.tokens(value)),
+                    parameter
+                        .default
+                        .as_ref()
+                        .map(|(_, value)| self.tokens(value)),
                 )
                 .with_attributes(self.convert_attributes(context, &parameter.attrs)?),
                 syn::GenericParam::Lifetime(parameter) => RustGenericParameter::lifetime_parameter(
@@ -1192,7 +1199,10 @@ impl RustItemConverter {
                 syn::GenericParam::Const(parameter) => RustGenericParameter::const_parameter(
                     RustModulePath::semantic_ident(&parameter.ident),
                     self.tokens(&parameter.ty),
-                    parameter.default.as_ref().map(|value| self.tokens(value)),
+                    parameter
+                        .default
+                        .as_ref()
+                        .map(|(_, value)| self.tokens(value)),
                 )
                 .with_attributes(self.convert_attributes(context, &parameter.attrs)?),
                 unsupported => {
@@ -1390,8 +1400,10 @@ mod tests {
     use crate::languages::rust::types::declaration::{
         RustDeclaration, RustForeignItem, RustItemKind,
     };
-    use crate::languages::rust::types::impl_type::RustImplementationOwner;
-    use crate::languages::rust::types::primitive_types::Visibility;
+    use crate::languages::rust::types::impl_type::{
+        RustImplPolarity, RustImplementationOwner, RustImplementedTrait,
+    };
+    use crate::languages::rust::types::primitive_types::{RustGenericParameter, Visibility};
 
     struct ConverterFixture {
         sources: RustSourceCatalog,
@@ -1593,6 +1605,70 @@ mod tests {
             panic!("typed receiver type path");
         };
         assert_eq!(path.source_syntax(), "Box < Self >");
+    }
+
+    #[test]
+    fn generic_defaults_survive_syn_three_tuple_containers() {
+        let fixture = ConverterFixture::in_module(&[]);
+        let RustDeclaration::Structure(structure) = fixture.declaration(syn::parse_quote! {
+            pub struct Packet<T = String, const N: usize = 4>([T; N]);
+        }) else {
+            panic!("structure declaration");
+        };
+
+        assert!(matches!(
+            &structure.generics().parameters()[0],
+            RustGenericParameter::Type {
+                name,
+                default: Some(default),
+                ..
+            } if name == "T" && default == "String"
+        ));
+        assert!(matches!(
+            &structure.generics().parameters()[1],
+            RustGenericParameter::Const {
+                name,
+                parameter_type,
+                default: Some(default),
+                ..
+            } if name == "N" && parameter_type == "usize" && default == "4"
+        ));
+    }
+
+    #[test]
+    fn impl_modifiers_preserve_specialization_and_negative_polarity() {
+        let fixture = ConverterFixture::in_module(&[]);
+        let RustDeclaration::Implementation(specialized) = fixture.declaration(syn::parse_quote! {
+            default impl Service for Handler {
+                default const LIMIT: usize = 4;
+                default type Output = String;
+                default fn execute(&self) {}
+            }
+        }) else {
+            panic!("specialized implementation declaration");
+        };
+
+        assert!(specialized.is_default());
+        assert!(specialized.items().iter().all(|item| match item {
+            RustAssociatedItem::Constant(constant) => constant.is_specialization_default(),
+            RustAssociatedItem::Type(associated_type) => {
+                associated_type.is_specialization_default()
+            }
+            RustAssociatedItem::Method(method) => method.is_specialization_default(),
+        }));
+
+        let RustDeclaration::Implementation(negative) = fixture.declaration(syn::parse_quote! {
+            impl !Send for Handler {}
+        }) else {
+            panic!("negative implementation declaration");
+        };
+        assert!(matches!(
+            negative.implemented_trait(),
+            RustImplementedTrait::Trait {
+                polarity: RustImplPolarity::Negative,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2730,6 +2806,12 @@ mod tests {
     fn verbatim_syntax_fails_with_file_module_and_syntax_evidence() {
         let fixture = ConverterFixture::in_module(&["framework"]);
         let cases = [
+            (
+                syn::parse_str::<syn::Item>("pub impl(crate) trait Restricted {}").expect(
+                    "Syn 3 must retain an implementation-restricted trait as verbatim syntax",
+                ),
+                "verbatim item",
+            ),
             (
                 syn::Item::Verbatim(quote::quote!(future_item)),
                 "verbatim item",

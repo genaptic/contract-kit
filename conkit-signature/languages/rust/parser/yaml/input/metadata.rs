@@ -690,7 +690,7 @@ impl RustYamlParsedGenericParameter {
                     parameter
                         .default
                         .as_ref()
-                        .map(|value| RustYamlTokenText::new(value).render()),
+                        .map(|(_, value)| RustYamlTokenText::new(value).render()),
                 )
             }
             syn::GenericParam::Lifetime(parameter) => {
@@ -707,7 +707,7 @@ impl RustYamlParsedGenericParameter {
                 parameter
                     .default
                     .as_ref()
-                    .map(|value| RustYamlTokenText::new(value).render()),
+                    .map(|(_, value)| RustYamlTokenText::new(value).render()),
             ),
         })
     }
